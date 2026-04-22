@@ -1,0 +1,13 @@
+[package]
+name = "vix-picker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nucleo-matcher.workspace = true
+ignore.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+anyhow.workspace = true

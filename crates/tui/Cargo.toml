@@ -1,0 +1,16 @@
+[package]
+name = "vix-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vix-core = { path = "../core" }
+vix-syntax = { path = "../syntax" }
+vix-picker = { path = "../picker" }
+vix-lsp = { path = "../lsp" }
+ratatui.workspace = true
+crossterm.workspace = true
+regex.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "vix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vix"
+path = "src/main.rs"
+
+[dependencies]
+vix-core = { path = "../core" }
+vix-tui = { path = "../tui" }
+anyhow.workspace = true
