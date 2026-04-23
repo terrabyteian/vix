@@ -7,7 +7,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
-repository = "https://github.com/ian/vix"
+repository = "https://github.com/terrabyteian/vix"
 
 [workspace.dependencies]
 ropey = "1.6"

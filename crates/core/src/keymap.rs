@@ -48,6 +48,10 @@ pub enum Action {
     LspGotoDefinition,
     /// `gA` — LSP code actions at cursor.
     LspCodeAction,
+    /// `go` (and `Ctrl-O`) — walk back through the jump list.
+    JumpBack,
+    /// `gi` (and `Ctrl-I` / Tab) — walk forward through the jump list.
+    JumpForward,
     /// Do nothing — consumed keys for a partial sequence.
     Pending,
     /// Key was not recognized in this context.
@@ -152,6 +156,8 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
             'g' => { state.reset(); return Action::Move(Motion::BufferStart, n); }
             'd' => { state.reset(); return Action::LspGotoDefinition; }
             'A' => { state.reset(); return Action::LspCodeAction; }
+            'o' => { state.reset(); return Action::JumpBack; }
+            'i' => { state.reset(); return Action::JumpForward; }
             'u' => {
                 // `gu` is an operator awaiting a motion.
                 state.prefix = None;

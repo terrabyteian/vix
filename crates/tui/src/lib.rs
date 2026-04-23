@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use vix_core::{
     apply_motion, compile_search, find_all_in_lines, find_backward, find_forward,
     handle_normal_char, text_object_range, Action, Buffer, Case, Change, FindDirection, FindKind,
-    History, InsertPos, Mode, Motion, NormalKeyState, PendingOp, RepeatAction, SearchDirection,
-    Selection, Transaction,
+    History, InsertPos, JumpEntry, JumpList, Mode, Motion, NormalKeyState, PendingOp, RepeatAction,
+    SearchDirection, Selection, Transaction,
 };
 use vix_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents, Location, MarkedString, Uri};
 use vix_lsp::{parse_response, path_to_uri, server_for_path, uri_to_path, LspClient, RequestId, ServerEvent};
@@ -121,6 +121,9 @@ pub struct Editor {
     pending_code_actions: Vec<vix_lsp::lsp_types::CodeActionOrCommand>,
     /// Transient flash overlay after a yank — (range, expires_at).
     yank_flash: Option<(std::ops::Range<usize>, Instant)>,
+    /// Jump-list ring for `Ctrl-O` / `Ctrl-I`. Entries are keyed by path + line
+    /// + col so they survive buffer-index reshuffles and edits.
+    jumps: JumpList,
 }
 
 /// What we asked for — lets us interpret the response when it arrives.
@@ -186,6 +189,7 @@ enum PickerKind {
     Symbols,
     Buffers,
     CodeActions,
+    Jumps,
 }
 
 #[derive(Clone)]
@@ -207,6 +211,8 @@ enum PickerValue {
     BufferIndex(usize),
     /// Index into `Editor::pending_code_actions`.
     CodeAction(usize),
+    /// Index into the jump list's current entries (oldest = 0).
+    JumpIndex(usize),
 }
 
 /// Render label for the buffer picker: "[1] path   [+]".
@@ -276,6 +282,7 @@ impl Editor {
             completion_popup: None,
             pending_code_actions: Vec::new(),
             yank_flash: None,
+            jumps: JumpList::default(),
         }
     }
 
@@ -486,6 +493,13 @@ impl Editor {
             self.msg = "lsp: non-file target".into();
             return;
         };
+        // Record the departure even if we're jumping within the same buffer,
+        // so `Ctrl-O` returns to the call site after `gd`.
+        let same_buf = self.buffer.path().map(|p| p == path.as_path()).unwrap_or(false);
+        if same_buf {
+            self.push_jump();
+        }
+        // `open_path` already records departure when switching buffers.
         self.open_path(&path);
         let line = loc.range.start.line as usize;
         let ch = loc.range.start.character as usize;
@@ -876,14 +890,22 @@ impl Editor {
             .position(|b| b.buffer.path() == Some(path))
         {
             let save = &mut self.other_buffers[pos];
-            apply_text_edits_to_buffer(&mut save.buffer, edits);
+            let mut tx = Transaction::new();
+            tx.sel_before = Some(save.sel);
+            apply_text_edits_to_buffer_tx(&mut save.buffer, edits, &mut tx);
             save.sel = save.sel.clamped(&save.buffer);
+            tx.sel_after = Some(save.sel);
+            if !tx.is_empty() {
+                save.history.commit(tx);
+            }
             return true;
         }
-        // Not loaded: read, edit, write.
+        // Not loaded: read, edit, write. No history to commit to — the
+        // Transaction is built and discarded.
         match Buffer::load(path) {
             Ok(mut buf) => {
-                apply_text_edits_to_buffer(&mut buf, edits);
+                let mut throwaway = Transaction::new();
+                apply_text_edits_to_buffer_tx(&mut buf, edits, &mut throwaway);
                 if let Err(e) = buf.save() {
                     errors.push(format!("write {}: {e}", path.display()));
                     return false;
@@ -940,37 +962,23 @@ impl Editor {
     /// applied bottom-up (by start position) so earlier offsets stay valid.
     /// Note: `character` is treated as a char index, not UTF-16 code units —
     /// fine for the all-ASCII source files we typically format.
+    ///
+    /// The whole batch is recorded as a single `Transaction` committed to
+    /// `self.history` — so `u` undoes the entire LSP edit in one step. We
+    /// deliberately do NOT touch `self.last_change`: LSP edits must not
+    /// pollute `.` repeat (Vim's rule; see plan doc trap #2).
     fn apply_text_edits(&mut self, edits: &[vix_lsp::lsp_types::TextEdit]) {
         if edits.is_empty() { return; }
-        let mut sorted: Vec<_> = edits.iter().collect();
-        sorted.sort_by(|a, b| {
-            let ak = (a.range.start.line, a.range.start.character);
-            let bk = (b.range.start.line, b.range.start.character);
-            bk.cmp(&ak) // descending
-        });
-        for e in sorted {
-            let start_line = e.range.start.line as usize;
-            let end_line = e.range.end.line as usize;
-            let total_lines = self.buffer.len_lines();
-            let start_line = start_line.min(total_lines);
-            let end_line = end_line.min(total_lines);
-            let start_char = self.buffer.line_to_char(start_line)
-                + (e.range.start.character as usize)
-                    .min(self.buffer.line_len_chars(start_line));
-            let end_char = self.buffer.line_to_char(end_line)
-                + (e.range.end.character as usize)
-                    .min(self.buffer.line_len_chars(end_line));
-            if start_char <= end_char && end_char <= self.buffer.len_chars() {
-                if start_char < end_char {
-                    self.buffer.remove_range(start_char..end_char);
-                }
-                if !e.new_text.is_empty() {
-                    self.buffer.insert_str(start_char, &e.new_text);
-                }
-            }
-        }
+        let sel_before = self.sel;
+        let mut tx = Transaction::new();
+        tx.sel_before = Some(sel_before);
+        apply_text_edits_to_buffer_tx(&mut self.buffer, edits, &mut tx);
         // Cursor may now be past EOF; clamp.
         self.sel = self.sel.clamped(&self.buffer);
+        tx.sel_after = Some(self.sel);
+        if !tx.is_empty() {
+            self.history.commit(tx);
+        }
     }
 
     /// Open the file finder picker rooted at the current working directory.
@@ -1147,13 +1155,20 @@ impl Editor {
                 self.sel = Selection::at(ch).clamped(&self.buffer);
             }
             PickerValue::BufferOffset(ch) => {
+                self.push_jump();
                 self.sel = Selection::at(ch).clamped(&self.buffer);
             }
             PickerValue::BufferIndex(idx) => {
+                if idx != 0 {
+                    self.push_jump();
+                }
                 self.switch_to_buffer(idx);
             }
             PickerValue::CodeAction(idx) => {
                 self.apply_code_action(idx);
+            }
+            PickerValue::JumpIndex(idx) => {
+                self.apply_jump_pick(idx);
             }
         }
     }
@@ -1162,6 +1177,16 @@ impl Editor {
     /// previous active buffer is parked, including if it has unsaved edits
     /// — Vim-style `hidden`.
     fn open_path(&mut self, path: &std::path::Path) {
+        // Record departure on any switch / load — but not when the target is
+        // already the active buffer.
+        let same_as_active = self
+            .buffer
+            .path()
+            .map(|p| p == path)
+            .unwrap_or(false);
+        if !same_as_active {
+            self.push_jump();
+        }
         if let Some(idx) = self.buffer_index_by_path(path) {
             self.switch_to_buffer(idx);
             self.msg = format!("switched to \"{}\"", path.display());
@@ -1296,6 +1321,7 @@ impl Editor {
             self.msg = "E86: Only one buffer".into();
             return;
         }
+        self.push_jump();
         // The "next" buffer is conceptually the oldest parked one (FIFO).
         self.switch_to_buffer(1);
     }
@@ -1306,6 +1332,7 @@ impl Editor {
             self.msg = "E86: Only one buffer".into();
             return;
         }
+        self.push_jump();
         let last = self.other_buffers.len();
         self.switch_to_buffer(last);
     }
@@ -1329,6 +1356,84 @@ impl Editor {
         self.buffer.dirty() || self.other_buffers.iter().any(|b| b.buffer.dirty())
     }
 
+    /// Capture the current cursor position as a jump-list entry.
+    fn current_jump_entry(&self) -> JumpEntry {
+        let (line, col) = self.buffer.char_to_line_col(self.sel.head);
+        JumpEntry {
+            path: self.buffer.path().map(|p| p.to_path_buf()),
+            line,
+            col,
+        }
+    }
+
+    /// Push the *current* cursor position onto the jump list. Call this
+    /// immediately before a "big jump" action — buffer switch, gg/G, search,
+    /// goto-definition, etc.
+    fn push_jump(&mut self) {
+        self.jumps.push(self.current_jump_entry());
+    }
+
+    /// Move the active buffer + cursor to the entry. If the target lives in a
+    /// different buffer (or an on-disk file not currently open), we switch or
+    /// load it. Returns false if the buffer couldn't be located or loaded.
+    fn goto_jump_entry(&mut self, entry: JumpEntry) -> bool {
+        let same_buffer = match (&entry.path, self.buffer.path()) {
+            (Some(p), Some(cur)) => p.as_path() == cur,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_buffer {
+            if let Some(path) = entry.path.as_ref() {
+                if let Some(idx) = self.buffer_index_by_path(path) {
+                    if idx != 0 {
+                        self.switch_to_buffer(idx);
+                    }
+                } else if path.exists() {
+                    match Buffer::load(path) {
+                        Ok(buf) => self.add_or_switch_buffer(buf),
+                        Err(e) => {
+                            self.msg = format!("jump: {e}");
+                            return false;
+                        }
+                    }
+                } else {
+                    self.msg = format!("jump: {} is gone", path.display());
+                    return false;
+                }
+            } else {
+                // entry points at the unnamed buffer but we're somewhere else
+                self.msg = "jump: origin buffer is gone".into();
+                return false;
+            }
+        }
+        let line = entry.line.min(self.buffer.len_lines().saturating_sub(1));
+        let line_start = self.buffer.line_to_char(line);
+        let col = entry.col.min(self.buffer.line_len_chars(line));
+        self.sel = Selection::at(line_start + col).clamped(&self.buffer);
+        true
+    }
+
+    /// `Ctrl-O` — step back through the jump list.
+    fn jump_back(&mut self) {
+        let current = self.current_jump_entry();
+        match self.jumps.back(current) {
+            Some(e) => {
+                if !self.goto_jump_entry(e) { /* msg set in callee */ }
+            }
+            None => self.msg = "at top of jump list".into(),
+        }
+    }
+
+    /// `Ctrl-I` / Tab — step forward.
+    fn jump_forward(&mut self) {
+        match self.jumps.forward() {
+            Some(e) => {
+                if !self.goto_jump_entry(e) { /* msg set in callee */ }
+            }
+            None => self.msg = "at bottom of jump list".into(),
+        }
+    }
+
     /// `:b <spec>` — switch to buffer matching `spec`. Numeric = 1-based
     /// index; non-numeric = substring match over buffer paths.
     fn switch_buffer_by_spec(&mut self, spec: &str) {
@@ -1336,6 +1441,9 @@ impl Editor {
             if n == 0 || n > self.buffer_count() {
                 self.msg = format!("E86: buffer {n} not found");
                 return;
+            }
+            if n != 1 {
+                self.push_jump();
             }
             self.switch_to_buffer(n - 1);
             return;
@@ -1348,12 +1456,79 @@ impl Editor {
         for (i, b) in self.other_buffers.iter().enumerate() {
             if let Some(p) = b.buffer.path() {
                 if p.to_string_lossy().contains(spec) {
+                    self.push_jump();
                     self.switch_to_buffer(i + 1);
                     return;
                 }
             }
         }
         self.msg = format!("E86: no buffer matching \"{spec}\"");
+    }
+
+    /// `:jumps` — open a picker listing jump-list entries. Selection jumps to
+    /// that entry. Informational column shows `>` next to the current position.
+    fn open_jumps_picker(&mut self) {
+        if self.jumps.is_empty() {
+            self.msg = "jump list is empty".into();
+            return;
+        }
+        let pos = self.jumps.pos();
+        let entries: Vec<(usize, JumpEntry)> =
+            self.jumps.entries().cloned().enumerate().collect();
+        let mut items: Vec<PickerItem> = Vec::with_capacity(entries.len());
+        for (i, e) in entries.iter() {
+            let marker = if *i == pos { '>' } else { ' ' };
+            let path = e
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "[No Name]".into());
+            let label = format!("{}  {:>3}  L{}:{}  {}", marker, i + 1, e.line + 1, e.col + 1, path);
+            items.push(PickerItem {
+                display: label.clone(),
+                value: PickerValue::JumpIndex(*i),
+                haystack: Utf32String::from(label.as_str()),
+            });
+        }
+        let mut p = Picker {
+            kind: PickerKind::Jumps,
+            query: String::new(),
+            items,
+            matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+        };
+        p.rescore();
+        self.picker = Some(p);
+    }
+
+    /// Consume a `:jumps`-picker selection: jump to `entries[idx]` and update
+    /// the internal `pos` so subsequent Ctrl-O/I walk from there. We walk the
+    /// jump list by calling `back`/`forward` until pos matches — cheap enough
+    /// for the 100-entry cap.
+    fn apply_jump_pick(&mut self, idx: usize) {
+        let cur = self.jumps.pos();
+        if idx == cur {
+            return;
+        }
+        if idx < cur {
+            for _ in idx..cur {
+                let c = self.current_jump_entry();
+                if let Some(e) = self.jumps.back(c) {
+                    if !self.goto_jump_entry(e) {
+                        return;
+                    }
+                }
+            }
+        } else {
+            for _ in cur..idx {
+                if let Some(e) = self.jumps.forward() {
+                    if !self.goto_jump_entry(e) {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// Open the buffer picker: lists all live buffers for fuzzy selection.
@@ -1518,6 +1693,7 @@ impl Editor {
             "Files" => { self.open_files_picker(); }
             "Symbols" => { self.open_symbols_picker(); }
             "Buffers" | "ls" => { self.open_buffers_picker(); }
+            "jumps" => { self.open_jumps_picker(); }
             "bn" | "bnext" => { self.next_buffer(); }
             "bp" | "bprev" | "bprevious" => { self.prev_buffer(); }
             "bd" | "bdelete" => { self.close_buffer(false); }
@@ -1647,6 +1823,10 @@ impl Editor {
                 if let Motion::FindChar(c, dir, kind) = m {
                     self.last_find = Some((c, dir, kind));
                 }
+                // gg / G / nG are jump-listed.
+                if matches!(m, Motion::BufferStart | Motion::BufferEnd) {
+                    self.push_jump();
+                }
                 let new_sel = apply_motion(&self.buffer, self.sel, m, n);
                 if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
                     // Extend: keep anchor, move head only.
@@ -1732,8 +1912,8 @@ impl Editor {
                 self.cmdline_prompt = match dir { SearchDirection::Forward => '/', SearchDirection::Backward => '?' };
                 self.mode = Mode::Command;
             }
-            Action::SearchRepeat(dir) => { self.search_repeat(dir); }
-            Action::WordSearchUnder(dir) => { self.word_search_under(dir); }
+            Action::SearchRepeat(dir) => { self.push_jump(); self.search_repeat(dir); }
+            Action::WordSearchUnder(dir) => { self.push_jump(); self.word_search_under(dir); }
             Action::ToggleCase(n) => {
                 let start = self.sel.head;
                 let end = (start + n.max(1)).min(self.buffer.len_chars());
@@ -1761,6 +1941,8 @@ impl Editor {
             Action::LspHover => { self.request_hover(); }
             Action::LspGotoDefinition => { self.request_definition(); }
             Action::LspCodeAction => { self.run_code_action(); }
+            Action::JumpBack => { self.jump_back(); }
+            Action::JumpForward => { self.jump_forward(); }
             Action::Pending | Action::Unhandled => {}
         }
     }
@@ -2136,6 +2318,23 @@ impl Editor {
             return;
         }
 
+        // Ctrl-O / Ctrl-I (or Tab) in Normal mode: jump list back / forward.
+        if self.mode == Mode::Normal
+            && k.modifiers.contains(KeyModifiers::CONTROL)
+            && k.code == KeyCode::Char('o')
+        {
+            self.jump_back();
+            return;
+        }
+        if self.mode == Mode::Normal
+            && (k.code == KeyCode::Tab
+                || (k.modifiers.contains(KeyModifiers::CONTROL)
+                    && k.code == KeyCode::Char('i')))
+        {
+            self.jump_forward();
+            return;
+        }
+
         match self.mode {
             Mode::Normal => {
                 if let KeyCode::Char(c) = k.code {
@@ -2248,8 +2447,8 @@ impl Editor {
                     self.mode = Mode::Normal;
                     self.cmdline_prompt = ':';
                     match prompt {
-                        '/' => self.do_search(&cmd, SearchDirection::Forward),
-                        '?' => self.do_search(&cmd, SearchDirection::Backward),
+                        '/' => { self.push_jump(); self.do_search(&cmd, SearchDirection::Forward); }
+                        '?' => { self.push_jump(); self.do_search(&cmd, SearchDirection::Backward); }
                         _ => self.run_ex(&cmd),
                     }
                 }
@@ -2319,7 +2518,15 @@ fn hover_text(h: &Hover) -> String {
 /// Apply a slice of LSP `TextEdit`s to an arbitrary buffer. Mirrors
 /// `Editor::apply_text_edits` but works on buffers not owned by `Editor`
 /// (used when applying rename edits to parked or on-disk buffers).
-fn apply_text_edits_to_buffer(buf: &mut Buffer, edits: &[vix_lsp::lsp_types::TextEdit]) {
+/// Apply LSP edits to `buf`, optionally recording each primitive edit into
+/// `tx` (for history / undo). Pass `&mut Transaction::new()` and discard if
+/// you don't want history tracking (e.g. when writing an on-disk file we're
+/// not keeping open).
+fn apply_text_edits_to_buffer_tx(
+    buf: &mut Buffer,
+    edits: &[vix_lsp::lsp_types::TextEdit],
+    tx: &mut Transaction,
+) {
     if edits.is_empty() { return; }
     let mut sorted: Vec<_> = edits.iter().collect();
     sorted.sort_by(|a, b| {
@@ -2336,10 +2543,13 @@ fn apply_text_edits_to_buffer(buf: &mut Buffer, edits: &[vix_lsp::lsp_types::Tex
             + (e.range.end.character as usize).min(buf.line_len_chars(end_line));
         if start_char <= end_char && end_char <= buf.len_chars() {
             if start_char < end_char {
+                let removed: String = buf.rope().slice(start_char..end_char).to_string();
                 buf.remove_range(start_char..end_char);
+                tx.push(Change::Delete { at: start_char, removed });
             }
             if !e.new_text.is_empty() {
                 buf.insert_str(start_char, &e.new_text);
+                tx.push(Change::Insert { at: start_char, text: e.new_text.clone() });
             }
         }
     }
@@ -2818,6 +3028,7 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
         PickerKind::Symbols => "symbols",
         PickerKind::Buffers => "buffers",
         PickerKind::CodeActions => "code actions",
+        PickerKind::Jumps => "jumps",
     };
     let prompt = format!(" {} > {}", kind_label, p.query);
     let count = format!(" {}/{} ", p.matches.len(), p.items.len());
@@ -2905,4 +3116,68 @@ pub fn run(buffer: Buffer) -> io::Result<()> {
     execute!(term.backend_mut(), terminal::LeaveAlternateScreen)?;
     term.show_cursor()?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vix_lsp::lsp_types::{Position, Range, TextEdit};
+
+    fn edit(sl: u32, sc: u32, el: u32, ec: u32, text: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position { line: sl, character: sc },
+                end: Position { line: el, character: ec },
+            },
+            new_text: text.into(),
+        }
+    }
+
+    #[test]
+    fn lsp_edits_are_undoable() {
+        let mut ed = Editor::new(Buffer::from_text("hello world\n"));
+        ed.apply_text_edits(&[edit(0, 6, 0, 11, "Rust")]);
+        assert_eq!(ed.buffer.rope().to_string(), "hello Rust\n");
+        ed.dispatch(Action::Undo);
+        assert_eq!(ed.buffer.rope().to_string(), "hello world\n");
+    }
+
+    #[test]
+    fn lsp_edits_do_not_pollute_dot_repeat() {
+        // Set up a dot-repeatable action: `dw` at cursor 0 of "foo bar".
+        let mut ed = Editor::new(Buffer::from_text("foo bar\n"));
+        ed.dispatch(Action::Operate(PendingOp::Delete, Motion::WordForward, 1));
+        assert_eq!(ed.buffer.rope().to_string(), "bar\n");
+        let before = ed.last_change.clone();
+        assert!(matches!(before, Some(RepeatAction::Operate { .. })));
+
+        // Apply an "LSP-style" edit — should NOT overwrite last_change.
+        ed.apply_text_edits(&[edit(0, 0, 0, 0, "baz ")]);
+        assert_eq!(ed.buffer.rope().to_string(), "baz bar\n");
+
+        // last_change must still point at the original `dw` action.
+        match (&before, &ed.last_change) {
+            (Some(RepeatAction::Operate { op: op_a, .. }), Some(RepeatAction::Operate { op: op_b, .. }))
+                if op_a == op_b => {}
+            _ => panic!("LSP edit polluted last_change: {:?}", ed.last_change),
+        }
+
+        // And `.` should still replay the `dw`: from current cursor (start of
+        // "baz bar"), `dw` removes "baz ".
+        ed.sel = Selection::at(0);
+        ed.dispatch(Action::RepeatLastChange);
+        assert_eq!(ed.buffer.rope().to_string(), "bar\n");
+    }
+
+    #[test]
+    fn lsp_edit_then_undo_preserves_dot_repeat() {
+        let mut ed = Editor::new(Buffer::from_text("foo bar\n"));
+        ed.dispatch(Action::Operate(PendingOp::Delete, Motion::WordForward, 1));
+        ed.apply_text_edits(&[edit(0, 0, 0, 0, "baz ")]);
+        // Undo the LSP edit.
+        ed.dispatch(Action::Undo);
+        assert_eq!(ed.buffer.rope().to_string(), "bar\n");
+        // Dot-repeat is still the original dw.
+        assert!(matches!(ed.last_change, Some(RepeatAction::Operate { .. })));
+    }
 }

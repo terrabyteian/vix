@@ -149,15 +149,48 @@ In the editor:
 - **Path absolutization** in `Buffer::load` — relative paths work with LSP URIs.
 - **`x` / `X` char-delete** — dedicated action clamped to line end, so it deletes the final char on a line (old `dl`/`dh` path failed there).
 - **LSP blocking request helper** (`LspClient::wait_response`) with internal holding queue so non-matching events are preserved for the TUI's `try_recv`.
+- **Jump list**. Primary bindings: `go` back / `gi` forward (zellij-safe; `Ctrl-O` is grabbed by zellij's session-mode so it's only the fallback). `Tab` is an extra alias for forward. 100-entry ring stored on `Editor::jumps`. Entries are `(Option<PathBuf>, line, col)` so they survive buffer reshuffles and edits. Push sites: big motions (`gg`/`G`/`nG`), search commit (`/`/`?`) + repeat (`n`/`N`/`*`/`#`), buffer switches (`:e`/`:b*`/`:bn`/`:bp`/pickers), and LSP `gd`. On first jump-back from the tip we stash the current position so jump-forward can return. `:jumps` opens a picker over entries — selection jumps to that entry and repositions the walking cursor.
+- **LSP edits undoable + dot-repeat preserved**. `apply_text_edits` (format, rename, code actions) now builds a `Transaction` and commits it to `history` — so `u` undoes a format/rename in one step. `last_change` is deliberately not touched, so `.` still replays the prior Vim action after an LSP edit intervenes. Parked-buffer edits from a WorkspaceEdit likewise commit to the parked buffer's own history; edits to files that aren't loaded commit to a throwaway transaction (no history to keep). Three regression tests in `vix-tui` pin this.
 
-### Still to do
-- Splits / windows (`:split`, `:vsplit`, `Ctrl-W hjkl`) — deferred: needs a proper Window struct + LayoutNode tree + focus routing for ~114 call sites that currently assume a single active view. A dedicated session.
-- `=` indent via tree-sitter indent queries
-- `.` repeat hardening across LSP-driven edits
-- Visual block mode (maybe)
+### v1 shortlist — ALL COMPLETE
+1. ~~Jump list~~ ✓
+2. ~~`.`-repeat hardening across LSP edits~~ ✓
+3. ~~Phase 5 release pipeline~~ ✓ (run `./scripts/release.sh` to cut v0.0.1)
 
-## Phase 5 — Ship
-Not started. Static musl linux builds, macOS universal binary, Homebrew tap, GitHub releases.
+### Pruned from v1 (won't implement)
+- **Splits / windows** — use `:Buffers` / `:bn` / `:bp` + terminal multiplexer panes. Not worth the ~114-site refactor
+- **Visual block mode (`Ctrl-V`)** — rarely needed; `:%s` and multi-line insert cover the real cases
+- **Macros (`q` / `@`)** — `.` repeat covers 90% of uses
+- **Marks (`m` / `'`)** — jump list subsumes the main workflow
+- **Change list (`g;` / `g,`)** — redundant with jump list
+- **Folding** — deferred indefinitely; not a daily-driver feature
+- **Spell check** — deferred indefinitely
+- **`=` indent via tree-sitter** — format-on-save handles this for the bundled languages
+- **Named registers beyond `"` and `"+`** — rarely used in a cursor-first editor
+
+## Phase 5 — Ship (local release pipeline in place)
+
+Same model as `rug`: a single local shell script builds all targets and pushes to GitHub Releases. No CI matrix — a tag + `gh release create` is enough for a project this small. Homebrew tap deferred.
+
+### Targets shipped
+- `aarch64-apple-darwin` — built natively via `cargo build --release`
+- `x86_64-unknown-linux-gnu` — cross-built via `cross` (docker-backed)
+- `aarch64-unknown-linux-gnu` — cross-built via `cross`
+
+x86_64 darwin intentionally skipped (Rosetta covers it). musl intentionally skipped (glibc is ubiquitous enough; smaller per-target toolchain cost). macOS universal via `lipo` skipped for the same reason.
+
+### Release profile (Cargo.toml)
+LTO, `opt-level = "z"`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. macOS arm64 binary is 8.8 MB; linux binaries are 9.3–9.6 MB.
+
+### Scripts
+- `scripts/release.sh` — guards (clean `main`, tag unused), builds all three targets, tar.gz's them to `dist/`, tags, pushes, `gh release create --generate-notes`. `--dry-run` does everything up to the tag. Prereqs: `cargo`, `cross` (**from main branch**, not the 0.2.5 release — see note below), `docker` (daemon running), `gh`.
+- `install.sh` (repo root) — one-liner installer: `curl -fsSL .../install.sh | sh`. Detects OS+arch, fetches the matching archive from the latest GH release, drops the binary into `/usr/local/bin`. Honors `VIX_VERSION=vX.Y.Z` and `VIX_INSTALL_DIR=/path`.
+
+### Cross gotcha (darwin-arm64 only)
+The stable release of `cross` (0.2.5) is broken on Apple Silicon — it tries to install a Linux rust toolchain on the mac and rustup refuses. Install the main branch instead: `cargo install cross --git https://github.com/cross-rs/cross --locked`.
+
+### CLI flags added
+`vix --version` and `vix --help` — needed so `install.sh`'s post-install smoke-check has something to call, and the Homebrew formula test block (if we ever add a tap) has a one-liner.
 
 ## Deliberate non-goals (do NOT implement)
 - Windows support (Unix/macOS only)
@@ -165,6 +198,7 @@ Not started. Static musl linux builds, macOS universal binary, Homebrew tap, Git
 - User config file (no `~/.config/vix/*`)
 - Multi-cursor
 - Bundled LSP binaries
+- Splits, visual block, macros, marks, folding, spell check (see "Pruned from v1" above)
 
 ## Architectural commitments (don't drift)
 - Cursor-first, NOT selection-first like Helix
@@ -205,7 +239,7 @@ cargo test --workspace                                # should be all green
 cargo clippy --workspace --all-targets                # should be clean
 cargo run --release -- crates/core/src/motion.rs     # dogfood
 ```
-Phase 4 is partially delivered (completion, format-on-save, OSC 52, rename). Remaining: code actions, splits, indent queries, `.`-repeat hardening, visual block, crash recovery.
+v1 shortlist ALL COMPLETE: (1) ~~jump list~~ ✓, (2) ~~`.`-repeat hardening~~ ✓, (3) ~~release pipeline~~ ✓. To ship: `./scripts/release.sh` (prereqs: `cross` from main branch, `docker` running, `gh`). Splits, visual block, macros, marks, folding all pruned.
 
 Phase 2 dogfood commands:
 - `:Files` — fuzzy file finder (respects `.gitignore`)

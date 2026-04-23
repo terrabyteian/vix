@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod edit;
+pub mod jumplist;
 pub mod keymap;
 pub mod mode;
 pub mod motion;
@@ -9,6 +10,7 @@ pub mod textobject;
 
 pub use buffer::Buffer;
 pub use edit::{Change, History, RepeatAction, Transaction};
+pub use jumplist::{JumpEntry, JumpList};
 pub use keymap::{handle_normal_char, Action, InsertPos, NormalKeyState, SearchDirection};
 pub use mode::{Mode, PendingOp};
 pub use motion::{apply as apply_motion, FindDirection, FindKind, Motion};
