@@ -1,0 +1,14 @@
+{
+  "name": "vix-fixture",
+  "version": "0.0.1",
+  "description": "Sample JSON used for picker and search tests.",
+  "people": [
+    { "name": "alice", "role": "engineer" },
+    { "name": "bob", "role": "designer" },
+    { "name": "carol", "role": "manager" }
+  ],
+  "settings": {
+    "theme": "dark",
+    "indent": 2
+  }
+}

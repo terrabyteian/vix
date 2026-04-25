@@ -153,18 +153,35 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
     if let Some('g') = state.prefix {
         let n = state.count();  // raw, not effective — 0 means "first line"
         match c {
-            'g' => { state.reset(); return Action::Move(Motion::BufferStart, n); }
+            'g' => {
+                let pending_op = state.op;
+                state.reset();
+                return match pending_op {
+                    Some(op) => Action::Operate(op, Motion::BufferStart, n),
+                    None => Action::Move(Motion::BufferStart, n),
+                };
+            }
             'd' => { state.reset(); return Action::LspGotoDefinition; }
             'A' => { state.reset(); return Action::LspCodeAction; }
             'o' => { state.reset(); return Action::JumpBack; }
             'i' => { state.reset(); return Action::JumpForward; }
             'u' => {
-                // `gu` is an operator awaiting a motion.
+                // `gu` is an operator awaiting a motion. If we're already in
+                // operator-pending state (e.g. `dgu...`) cancel — that's not
+                // a sensible composition.
+                if state.op.is_some() {
+                    state.reset();
+                    return Action::Unhandled;
+                }
                 state.prefix = None;
                 state.op = Some(PendingOp::ToLower);
                 return Action::Pending;
             }
             'U' => {
+                if state.op.is_some() {
+                    state.reset();
+                    return Action::Unhandled;
+                }
                 state.prefix = None;
                 state.op = Some(PendingOp::ToUpper);
                 return Action::Pending;
@@ -225,6 +242,18 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
             let n = state.effective_count();
             state.reset();
             return Action::OperateLine(op, n);
+        }
+        // `G` after an operator: linewise delete/change/yank from current line
+        // through line `count` (or end-of-buffer with no count).
+        if c == 'G' {
+            let n = state.count();
+            state.reset();
+            return Action::Operate(op, Motion::BufferEnd, n);
+        }
+        // `g` is a prefix even in operator-pending — `gg`, `gu`, `gU` etc.
+        if c == 'g' {
+            state.prefix = Some('g');
+            return Action::Pending;
         }
         // Otherwise interpret as motion.
         if let Some(m) = simple_motion(c) {

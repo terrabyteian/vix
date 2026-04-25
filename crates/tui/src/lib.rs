@@ -15,12 +15,29 @@ use vix_core::{
     apply_motion, compile_search, find_all_in_lines, find_backward, find_forward,
     handle_normal_char, text_object_range, Action, Buffer, Case, Change, FindDirection, FindKind,
     History, InsertPos, JumpEntry, JumpList, Mode, Motion, NormalKeyState, PendingOp, RepeatAction,
-    SearchDirection, Selection, Transaction,
+    SearchDirection, Selection, TextObject, TextObjectKind, Transaction,
 };
+
+pub mod help;
+pub mod testing;
 use vix_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents, Location, MarkedString, Uri};
 use vix_lsp::{parse_response, path_to_uri, server_for_path, uri_to_path, LspClient, RequestId, ServerEvent};
 use vix_syntax::{HlSpan, Language, SyntaxState, HIGHLIGHT_NAMES, Symbol};
 use vix_picker::{grep, scan_files, score, GrepItem, Utf32String};
+
+/// What action triggered the current Insert session — determines how `.`
+/// will replay it on Esc.
+#[derive(Debug, Clone)]
+enum InsertOrigin {
+    /// `i/a/I/A/o/O` — bare insert mode entry.
+    Plain,
+    /// `c<motion>` — replay re-evaluates the motion at the cursor.
+    ChangeMotion { motion: Motion, count: usize },
+    /// `c<text-object>` — replay re-resolves the text object at the cursor.
+    ChangeObject { object: TextObject, kind: TextObjectKind },
+    /// `cc` (or `Ncc`) — replay deletes that many lines' content in place.
+    ChangeLine { count: usize },
+}
 
 /// Accumulates text typed during an Insert-mode session, plus how that session
 /// was entered. On Esc we commit this as one undo unit and one `.` repeat.
@@ -32,6 +49,8 @@ struct PendingInsert {
     /// Stored so `.` can reproduce the relative position.
     #[allow(dead_code)]
     start: usize,
+    /// What action started this insert session.
+    origin: InsertOrigin,
 }
 
 /// Contents of the unnamed register (`"`), plus whether the last yank/delete
@@ -124,6 +143,9 @@ pub struct Editor {
     /// Jump-list ring for `Ctrl-O` / `Ctrl-I`. Entries are keyed by path + line
     /// + col so they survive buffer-index reshuffles and edits.
     jumps: JumpList,
+    /// In Visual mode, the pending text-object kind from the last `i` / `a`.
+    /// Cleared once the object char arrives or Esc is pressed.
+    visual_object_kind: Option<TextObjectKind>,
 }
 
 /// What we asked for — lets us interpret the response when it arrives.
@@ -283,7 +305,52 @@ impl Editor {
             pending_code_actions: Vec::new(),
             yank_flash: None,
             jumps: JumpList::default(),
+            visual_object_kind: None,
         }
+    }
+
+    // --- Read-only accessors for tests / harness consumers --------------------
+    pub fn parked_count(&self) -> usize {
+        self.other_buffers.len()
+    }
+    pub fn buffer_count(&self) -> usize {
+        self.other_buffers.len() + 1
+    }
+    pub fn register_text(&self) -> &str {
+        &self.register.text
+    }
+    pub fn register_linewise(&self) -> bool {
+        self.register.linewise
+    }
+    pub fn jump_list(&self) -> &JumpList {
+        &self.jumps
+    }
+    pub fn last_change(&self) -> Option<&RepeatAction> {
+        self.last_change.as_ref()
+    }
+    pub fn picker_open(&self) -> bool {
+        self.picker.is_some()
+    }
+    pub fn picker_query(&self) -> Option<&str> {
+        self.picker.as_ref().map(|p| p.query.as_str())
+    }
+    pub fn diagnostics_for_active(&self) -> usize {
+        self.buffer
+            .path()
+            .and_then(|p| self.diagnostics.get(p))
+            .map(|d| d.len())
+            .unwrap_or(0)
+    }
+    pub fn active_language(&self) -> Option<vix_syntax::Language> {
+        self.syntax.as_ref().map(|s| s.language())
+    }
+    pub fn symbol_names(&self) -> Vec<String> {
+        let Some(s) = self.syntax.as_ref() else { return Vec::new() };
+        let src = self.buffer.rope().to_string();
+        s.symbols(src.as_bytes())
+            .ok()
+            .map(|v| v.into_iter().map(|sym| sym.name).collect())
+            .unwrap_or_default()
     }
 
     /// Ensure an LSP server is running for the active buffer's language, and
@@ -967,7 +1034,7 @@ impl Editor {
     /// `self.history` — so `u` undoes the entire LSP edit in one step. We
     /// deliberately do NOT touch `self.last_change`: LSP edits must not
     /// pollute `.` repeat (Vim's rule; see plan doc trap #2).
-    fn apply_text_edits(&mut self, edits: &[vix_lsp::lsp_types::TextEdit]) {
+    pub fn apply_text_edits(&mut self, edits: &[vix_lsp::lsp_types::TextEdit]) {
         if edits.is_empty() { return; }
         let sel_before = self.sel;
         let mut tx = Transaction::new();
@@ -1176,6 +1243,37 @@ impl Editor {
     /// Load `path` as a new buffer (or switch to it if already open). The
     /// previous active buffer is parked, including if it has unsaved edits
     /// — Vim-style `hidden`.
+    /// Open a help topic in a scratch buffer. `topic` may be empty to show
+    /// the index page. Subsequent `:help <same>` calls switch back to the
+    /// existing buffer instead of duplicating it (path-keyed dedup).
+    fn open_help_doc(&mut self, topic: &str) {
+        let topic = topic.trim();
+        let (slug, body) = if topic.is_empty() {
+            ("index".to_string(), help::index())
+        } else if let Some(t) = help::lookup(topic) {
+            (t.slug.to_string(), t.body.to_string())
+        } else {
+            self.msg = format!(
+                "no help topic \"{topic}\" — try :help for the index"
+            );
+            return;
+        };
+        // Synthetic path: brackets keep it visually distinct, `.md` extension
+        // routes the markdown highlighter via `Language::from_path`.
+        let synthetic = std::path::PathBuf::from(format!("[help:{slug}].md"));
+        if let Some(idx) = self.buffer_index_by_path(&synthetic) {
+            self.push_jump();
+            self.switch_to_buffer(idx);
+            return;
+        }
+        let mut buf = Buffer::from_text(&body);
+        buf.set_path(&synthetic);
+        buf.set_scratch(true);
+        self.push_jump();
+        self.add_or_switch_buffer(buf);
+        self.msg = format!("help: {slug}");
+    }
+
     fn open_path(&mut self, path: &std::path::Path) {
         // Record departure on any switch / load — but not when the target is
         // already the active buffer.
@@ -1285,11 +1383,6 @@ impl Editor {
             .and_then(|l| SyntaxState::new(l).ok());
         self.invalidate_syntax_cache();
         self.ensure_lsp_open();
-    }
-
-    /// Total buffer count (active + parked).
-    fn buffer_count(&self) -> usize {
-        self.other_buffers.len() + 1
     }
 
     /// Find a buffer by path. Index 0 = active; 1..N = `other_buffers[i-1]`.
@@ -1694,6 +1787,7 @@ impl Editor {
             "Symbols" => { self.open_symbols_picker(); }
             "Buffers" | "ls" => { self.open_buffers_picker(); }
             "jumps" => { self.open_jumps_picker(); }
+            "help" | "h" => { self.open_help_doc(""); }
             "bn" | "bnext" => { self.next_buffer(); }
             "bp" | "bprev" | "bprevious" => { self.prev_buffer(); }
             "bd" | "bdelete" => { self.close_buffer(false); }
@@ -1702,6 +1796,8 @@ impl Editor {
             _ => {
                 if let Some(rest) = cmd.strip_prefix("Grep") {
                     self.open_grep_picker(rest.trim());
+                } else if let Some(rest) = cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h ")) {
+                    self.open_help_doc(rest.trim());
                 } else if let Some(rest) = cmd.strip_prefix("e ") {
                     let path = std::path::PathBuf::from(rest.trim());
                     self.open_path(&path);
@@ -1845,27 +1941,105 @@ impl Editor {
             }
             Action::EnterInsert(pos) => { self.enter_insert(pos); }
             Action::Operate(op, m, n) => {
+                // `G` and `gg` with an operator behave linewise (vim parity).
+                if matches!(m, Motion::BufferStart | Motion::BufferEnd) {
+                    let cur_line = self.cursor_line();
+                    let target_line = match m {
+                        Motion::BufferStart => {
+                            if n == 0 { 0 } else { n.saturating_sub(1).min(self.buffer.len_lines().saturating_sub(1)) }
+                        }
+                        Motion::BufferEnd => {
+                            if n == 0 {
+                                self.buffer.len_lines().saturating_sub(1)
+                            } else {
+                                n.saturating_sub(1).min(self.buffer.len_lines().saturating_sub(1))
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    // The trailing newline produces an extra "empty line"; clamp to
+                    // the last line that actually has a newline terminator.
+                    let last_real_line = if self.buffer.len_chars() > 0
+                        && self.buffer.rope().char(self.buffer.len_chars() - 1) == '\n'
+                    {
+                        self.buffer.len_lines().saturating_sub(2)
+                    } else {
+                        self.buffer.len_lines().saturating_sub(1)
+                    };
+                    let target_line = target_line.min(last_real_line);
+                    let (lo, hi) = if cur_line <= target_line {
+                        (cur_line, target_line)
+                    } else {
+                        (target_line, cur_line)
+                    };
+                    let line_count = hi - lo + 1;
+                    // Reposition cursor to the start of the lower line so OperateLine
+                    // works from there, then dispatch as a linewise op.
+                    self.sel = Selection::at(self.buffer.line_to_char(lo)).clamped(&self.buffer);
+                    let start = self.buffer.line_to_char(lo);
+                    let end_line_char = self.buffer.line_to_char(hi)
+                        + self.buffer.line_len_chars(hi);
+                    let end = if end_line_char < self.buffer.len_chars() {
+                        end_line_char + 1
+                    } else {
+                        end_line_char
+                    };
+                    let entered_insert = self.apply_operator_with_kind(op, start..end, true);
+                    if !entered_insert {
+                        self.last_change = Some(RepeatAction::OperateLine { op, count: line_count });
+                    }
+                    return;
+                }
+
+                // `cw` / `cW` are vim-special: they act like `ce` / `cE`,
+                // i.e. change to end-of-word without consuming the trailing
+                // whitespace. We rewrite the motion before evaluating it.
+                let m = if matches!(op, PendingOp::Change)
+                    && matches!(m, Motion::WordForward)
+                {
+                    Motion::WordEnd
+                } else {
+                    m
+                };
                 let target = apply_motion(&self.buffer, self.sel, m, n);
+                let inclusive = matches!(
+                    m,
+                    Motion::LineEnd
+                    | Motion::WordEnd
+                    | Motion::FindChar(_, _, FindKind::On)
+                    | Motion::MatchBracket
+                );
                 let range = if self.sel.head <= target.head {
-                    self.sel.head..target.head
+                    let end = if inclusive {
+                        (target.head + 1).min(self.buffer.len_chars())
+                    } else {
+                        target.head
+                    };
+                    self.sel.head..end
                 } else {
                     target.head..self.sel.head
                 };
                 let entered_insert = self.apply_operator(op, range);
-                if !entered_insert {
+                if entered_insert {
+                    // `c<motion>` — record origin so leave_insert can build a
+                    // full ChangeMotion replay including the typed text.
+                    if let Some(pi) = self.pending_insert.as_mut() {
+                        pi.origin = InsertOrigin::ChangeMotion { motion: m, count: n };
+                    }
+                } else {
                     self.last_change = Some(RepeatAction::Operate { op, motion: m, count: n });
                 }
-                // For `c<motion>`, we're now in insert mode; the full RepeatAction
-                // gets finalized on Esc. For this simplified version, we treat the
-                // deletion and the subsequent typing as separate repeatables.
-                // TODO: fold `c<motion>...<Esc>` into a single ChangeBurst.
             }
             Action::OperateObject(op, obj, kind, _n) => {
                 // `n` > 1 for text objects is uncommon and semantically fuzzy;
                 // apply once for now.
                 if let Some(range) = text_object_range(&self.buffer, self.sel.head, obj, kind) {
                     let entered_insert = self.apply_operator(op, range);
-                    if !entered_insert {
+                    if entered_insert {
+                        if let Some(pi) = self.pending_insert.as_mut() {
+                            pi.origin = InsertOrigin::ChangeObject { object: obj, kind };
+                        }
+                    } else {
                         self.last_change = Some(RepeatAction::OperateObject {
                             op, object: obj, kind, count: 1,
                         });
@@ -1881,10 +2055,21 @@ impl Editor {
                 // `dd` = 1 line = [line, line]. `2dd` = 2 lines = [line, line+1].
                 let end_line = (line + n - 1).min(self.buffer.len_lines().saturating_sub(1));
                 let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
-                // Include trailing newline if present, so `dd` removes the whole line.
-                let end = if end < self.buffer.len_chars() { end + 1 } else { end };
+                // For Change (cc): keep the trailing newline so we end up on a
+                // blank line in place. For everything else (dd / yy / >>):
+                // include the trailing newline so the row goes away.
+                let include_newline = !matches!(op, PendingOp::Change);
+                let end = if include_newline && end < self.buffer.len_chars() {
+                    end + 1
+                } else {
+                    end
+                };
                 let entered_insert = self.apply_operator_with_kind(op, start..end, true);
-                if !entered_insert {
+                if entered_insert {
+                    if let Some(pi) = self.pending_insert.as_mut() {
+                        pi.origin = InsertOrigin::ChangeLine { count: n };
+                    }
+                } else {
                     self.last_change = Some(RepeatAction::OperateLine { op, count: n });
                 }
             }
@@ -1905,6 +2090,7 @@ impl Editor {
             Action::RepeatLastChange => { self.repeat_last_change(); }
             Action::Paste { after, count } => {
                 for _ in 0..count.max(1) { self.paste(after); }
+                self.last_change = Some(RepeatAction::Paste { after, count });
             }
             Action::ExCommand(cmd) => { self.run_ex(&cmd); }
             Action::EnterSearch(dir) => {
@@ -1916,9 +2102,16 @@ impl Editor {
             Action::WordSearchUnder(dir) => { self.push_jump(); self.word_search_under(dir); }
             Action::ToggleCase(n) => {
                 let start = self.sel.head;
-                let end = (start + n.max(1)).min(self.buffer.len_chars());
+                let n = n.max(1);
+                let end = (start + n).min(self.buffer.len_chars());
                 if start < end {
                     self.apply_operator(PendingOp::SwapCase, start..end);
+                    // `~` advances the cursor by `n` (capped at end-of-line in
+                    // Normal mode, vim semantics).
+                    let (line, _) = self.buffer.char_to_line_col(start);
+                    let line_end = self.buffer.line_to_char(line)
+                        + self.buffer.line_len_chars(line).saturating_sub(1);
+                    self.sel = Selection::at(end.min(line_end)).clamped(&self.buffer);
                 }
             }
             Action::DeleteChars { forward, count } => {
@@ -1993,6 +2186,7 @@ impl Editor {
             tx,
             typed: String::new(),
             start: self.sel.head,
+            origin: InsertOrigin::Plain,
         });
         self.mode = Mode::Insert;
     }
@@ -2035,6 +2229,11 @@ impl Editor {
                     tx,
                     typed: String::new(),
                     start: self.sel.head,
+                    // The caller (Operate / OperateLine / OperateObject) overwrites
+                    // this with the appropriate origin so `.` replays the full
+                    // change (deletion + typed text). Default to Plain in case
+                    // some path forgets to set it.
+                    origin: InsertOrigin::Plain,
                 });
                 self.mode = Mode::Insert;
                 true
@@ -2222,6 +2421,58 @@ impl Editor {
                     self.apply_operator(PendingOp::Delete, range);
                 }
             }
+            RepeatAction::ChangeMotion { motion, count, text } => {
+                // Re-evaluate the motion at the current cursor, delete that
+                // range as a Change (which enters insert), then synthesize the
+                // typed text and leave insert. The whole thing collapses into
+                // one history transaction via leave_insert.
+                let m = if matches!(motion, Motion::WordForward) {
+                    Motion::WordEnd
+                } else {
+                    motion
+                };
+                let target = apply_motion(&self.buffer, self.sel, m, count);
+                let inclusive = matches!(
+                    m,
+                    Motion::LineEnd
+                    | Motion::WordEnd
+                    | Motion::FindChar(_, _, FindKind::On)
+                    | Motion::MatchBracket
+                );
+                let range = if self.sel.head <= target.head {
+                    let end = if inclusive {
+                        (target.head + 1).min(self.buffer.len_chars())
+                    } else {
+                        target.head
+                    };
+                    self.sel.head..end
+                } else {
+                    target.head..self.sel.head
+                };
+                self.apply_operator(PendingOp::Change, range);
+                for c in text.chars() { self.insert_char_in_session(c); }
+                self.leave_insert();
+            }
+            RepeatAction::ChangeObject { object, kind, text } => {
+                if let Some(range) = text_object_range(&self.buffer, self.sel.head, object, kind) {
+                    self.apply_operator(PendingOp::Change, range);
+                    for c in text.chars() { self.insert_char_in_session(c); }
+                    self.leave_insert();
+                }
+            }
+            RepeatAction::ChangeLine { count, text } => {
+                let count = count.max(1);
+                let line = self.cursor_line();
+                let start = self.buffer.line_to_char(line);
+                let end_line = (line + count - 1).min(self.buffer.len_lines().saturating_sub(1));
+                let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
+                self.apply_operator_with_kind(PendingOp::Change, start..end, true);
+                for c in text.chars() { self.insert_char_in_session(c); }
+                self.leave_insert();
+            }
+            RepeatAction::Paste { after, count } => {
+                for _ in 0..count.max(1) { self.paste(after); }
+            }
         }
     }
 
@@ -2274,9 +2525,25 @@ impl Editor {
         if let Some(mut pi) = self.pending_insert.take() {
             pi.tx.sel_after = Some(self.sel);
             self.history.commit(pi.tx);
-            self.last_change = Some(RepeatAction::InsertBurst {
-                pos: pi.pos,
-                text: pi.typed,
+            self.last_change = Some(match pi.origin {
+                InsertOrigin::Plain => RepeatAction::InsertBurst {
+                    pos: pi.pos,
+                    text: pi.typed,
+                },
+                InsertOrigin::ChangeMotion { motion, count } => RepeatAction::ChangeMotion {
+                    motion,
+                    count,
+                    text: pi.typed,
+                },
+                InsertOrigin::ChangeObject { object, kind } => RepeatAction::ChangeObject {
+                    object,
+                    kind,
+                    text: pi.typed,
+                },
+                InsertOrigin::ChangeLine { count } => RepeatAction::ChangeLine {
+                    count,
+                    text: pi.typed,
+                },
             });
         }
         self.mode = Mode::Normal;
@@ -2286,7 +2553,7 @@ impl Editor {
     }
 
     /// Handle a single key event for the current mode.
-    fn handle_key(&mut self, k: KeyEvent) {
+    pub fn handle_key(&mut self, k: KeyEvent) {
         self.msg.clear();
         // Any keypress closes the hover popup (except when the picker is up).
         if self.picker.is_none() {
@@ -2347,9 +2614,40 @@ impl Editor {
             Mode::Visual | Mode::VisualLine => {
                 if k.code == KeyCode::Esc {
                     self.keys = NormalKeyState::default();
+                    self.visual_object_kind = None;
                     self.mode = Mode::Normal;
                     self.sel.anchor = self.sel.head;
                 } else if let KeyCode::Char(c) = k.code {
+                    // Text-object selection inside visual: `iw`, `a"`, etc.
+                    // First key (`i` / `a`) sets the kind; second key picks
+                    // the object and we extend the visual selection to cover
+                    // the object's range.
+                    if let Some(kind) = self.visual_object_kind.take() {
+                        let obj = match c {
+                            'w' => Some(TextObject::Word),
+                            '"' => Some(TextObject::Quote('"')),
+                            '\'' => Some(TextObject::Quote('\'')),
+                            '`' => Some(TextObject::Quote('`')),
+                            '(' | ')' | 'b' => Some(TextObject::Pair('(', ')')),
+                            '{' | '}' | 'B' => Some(TextObject::Pair('{', '}')),
+                            '[' | ']' => Some(TextObject::Pair('[', ']')),
+                            '<' | '>' => Some(TextObject::Pair('<', '>')),
+                            _ => None,
+                        };
+                        if let Some(o) = obj {
+                            if let Some(range) = text_object_range(&self.buffer, self.sel.head, o, kind) {
+                                // Replace the visual selection with the object's
+                                // range, head positioned at the last included char.
+                                self.sel.anchor = range.start;
+                                self.sel.head = range.end.saturating_sub(1).max(range.start);
+                                self.sel.virt_col = None;
+                                self.sel = self.sel.clamped(&self.buffer);
+                            }
+                        }
+                        return;
+                    }
+                    if c == 'i' { self.visual_object_kind = Some(TextObjectKind::Inner); return; }
+                    if c == 'a' { self.visual_object_kind = Some(TextObjectKind::Around); return; }
                     // Operator on selection: apply immediately, leave Visual.
                     let op = match c {
                         'd' | 'x' => Some(PendingOp::Delete),
@@ -2367,10 +2665,15 @@ impl Editor {
                         return;
                     }
                     // `p`/`P` paste over visual selection: delete first, then paste.
+                    // Vim quirk: the deleted text MUST NOT replace the unnamed
+                    // register here, otherwise `p` would paste the just-deleted
+                    // visual selection instead of the prior yank.
                     if c == 'p' || c == 'P' {
                         let range = self.visual_range();
                         let linewise = self.mode == Mode::VisualLine;
+                        let saved = self.register.clone();
                         self.apply_operator_with_kind(PendingOp::Delete, range, linewise);
+                        self.register = saved;
                         self.paste(true);
                         self.mode = Mode::Normal;
                         self.sel.anchor = self.sel.head;

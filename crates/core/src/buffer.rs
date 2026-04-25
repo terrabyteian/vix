@@ -9,6 +9,8 @@ pub enum BufferError {
     Io(#[from] std::io::Error),
     #[error("buffer has no associated file path")]
     NoPath,
+    #[error("scratch buffer is not writable")]
+    Scratch,
 }
 
 pub struct Buffer {
@@ -19,15 +21,18 @@ pub struct Buffer {
     /// caches (syntax spans, etc.) compare against this to know when to
     /// rebuild.
     version: u64,
+    /// In-memory-only buffer (e.g. `:help`). Refuses `save()`. Carries a
+    /// synthetic path purely for display + syntax-by-extension routing.
+    scratch: bool,
 }
 
 impl Buffer {
     pub fn empty() -> Self {
-        Self { rope: Rope::new(), path: None, dirty: false, version: 0 }
+        Self { rope: Rope::new(), path: None, dirty: false, version: 0, scratch: false }
     }
 
     pub fn from_text(s: &str) -> Self {
-        Self { rope: Rope::from_str(s), path: None, dirty: false, version: 0 }
+        Self { rope: Rope::from_str(s), path: None, dirty: false, version: 0, scratch: false }
     }
 
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, BufferError> {
@@ -47,10 +52,13 @@ impl Buffer {
         } else {
             Rope::new()
         };
-        Ok(Self { rope, path: Some(p), dirty: false, version: 0 })
+        Ok(Self { rope, path: Some(p), dirty: false, version: 0, scratch: false })
     }
 
     pub fn save(&mut self) -> Result<(), BufferError> {
+        if self.scratch {
+            return Err(BufferError::Scratch);
+        }
         let path = self.path.as_ref().ok_or(BufferError::NoPath)?.clone();
         self.save_as(&path)
     }
@@ -75,6 +83,8 @@ impl Buffer {
     pub fn set_path<P: AsRef<Path>>(&mut self, p: P) { self.path = Some(p.as_ref().to_path_buf()); }
     pub fn dirty(&self) -> bool { self.dirty }
     pub fn version(&self) -> u64 { self.version }
+    pub fn is_scratch(&self) -> bool { self.scratch }
+    pub fn set_scratch(&mut self, v: bool) { self.scratch = v; }
 
     pub fn len_chars(&self) -> usize { self.rope.len_chars() }
     pub fn len_lines(&self) -> usize { self.rope.len_lines() }

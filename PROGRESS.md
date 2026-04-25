@@ -208,12 +208,44 @@ The stable release of `cross` (0.2.5) is broken on Apple Silicon — it tries to
 - ropey 1.6 (stable), NOT 2.0-beta
 
 ## Known rough edges / tech debt
-- `~` moves cursor to `new_len - 1` — subtle off-by-one to revisit
-- `.` repeat for `c<motion>...<Esc>` currently records the delete and insert as two separate repeatables; should fuse to a single ChangeBurst (noted in `dispatch`)
+- ~~`~` moves cursor to `new_len - 1` — subtle off-by-one to revisit~~ ✓ fixed
+- ~~`.` repeat for `c<motion>...<Esc>` currently records the delete and insert as two separate repeatables; should fuse to a single ChangeBurst~~ ✓ fixed (`RepeatAction::ChangeMotion / ChangeObject / ChangeLine`)
 - Indent operator applies 4 spaces flat; no tab-respect or file-configured shiftwidth — fine until Phase 4
 - Visual mode cursor rendering: in VisualLine mode the cursor position may look odd near line ends
 - No yanked-range flash indicator
 - `:s` doesn't support backreferences in replacement (`$1`, `\1`); just literal text and `&` is not translated — only plain replacement for now
+
+## Phase 4.5 — Test harness + parity fixes (2026-04-25)
+
+### Delivered
+- **`crates/tui/src/testing::Harness`** — drives an `Editor` via `handle_key` with a vim-flavoured key DSL (`<Esc>`, `<CR>`, `<C-x>`, `<Tab>`, `<lt>`, …). `keys()` / `cmd()` / `text()` / `cursor()` / `mode()` / `register()` / `jump_list()` / `picker_open()` accessors.
+- **`tests/fixtures/`** — `sample.{rs,py,ts,md,json}` + `project/` for picker tests.
+- **Integration test files** under `crates/tui/tests/`:
+  - `motions.rs` (25), `operators.rs` (21), `text_objects.rs` (17), `dot_repeat.rs` (9),
+  - `search.rs` (15), `ex.rs` (12), `jumplist.rs` (11), `multi_buffer.rs` (9),
+  - `registers.rs` (9), `insert_mode.rs` (13), `visual.rs` (13), `undo_redo.rs` (10), `syntax.rs` (10).
+- **Workspace stats**: 251 tests passing, clippy clean (`cargo clippy --workspace --tests -- -D warnings`).
+
+### Bugs surfaced by the suite + fixed
+1. **Inclusive operator motions** — `d$` / `y$` / `de` / `df<c>` / `d%` were off-by-one (the last char wasn't included). Added an `inclusive` flag to the `Operate` dispatch for `LineEnd` / `WordEnd` / `FindChar(_, _, On)` / `MatchBracket`.
+2. **`dG` / `cG` / `yG` / `dgg` etc.** — `G` and `gg` weren't recognized as motion targets in operator-pending state. Added explicit arms in the keymap operator-pending block, and a linewise dispatch path in `Action::Operate` so `dG` deletes whole lines including the trailing newline.
+3. **`cc` removed the trailing newline** — `OperateLine` now keeps the newline for Change so `cc` lands on a blank line in place (vim parity).
+4. **`~` didn't advance cursor** — toggling case now advances the cursor by `n`, capped at end-of-line.
+5. **`cw` deleted trailing whitespace** — vim's special case (`cw` ≡ `ce`) is now applied inside `Action::Operate` (and replayed by `RepeatAction::ChangeMotion`).
+6. **`viw` etc. didn't work** — Visual mode now treats `i` / `a` as text-object prefixes (separate `visual_object_kind` state); the next char picks the object and replaces the visual selection with the object's range.
+7. **`p` over visual selection pasted the deleted text** — the implicit Delete was overwriting the unnamed register before `paste()` ran. Saved + restored the register around the delete.
+8. **`p` / `P` weren't dot-repeatable** — added `RepeatAction::Paste`.
+9. **`c<motion>...<Esc>` and `c<text-object>...<Esc>` weren't fully dot-repeatable** — added `InsertOrigin` on `PendingInsert` so `leave_insert` builds `ChangeMotion` / `ChangeObject` / `ChangeLine` repeats including the typed text.
+
+## Phase 4.6 — In-binary help (2026-04-25)
+
+### Delivered
+- **`docs/MANUAL_TESTING.md`** — 12-section playbook for the things the harness can't reach (rendering, live LSP per-server, OSC 52 across local/SSH/tmux/zellij, picker UX, disk I/O, release-binary smoke).
+- **`crates/tui/src/help.rs`** — embeds doc bodies via `include_str!`, exposes a `Topic` registry + `lookup` + `index()`. Adding a new topic = one entry in `TOPICS`.
+- **`Buffer::scratch` flag** (`crates/core/src/buffer.rs`) — `save()` returns `BufferError::Scratch` so `:w` on a help buffer surfaces a clean error instead of writing a literal `[help:testing].md` file in cwd.
+- **`:help` / `:h` ex commands** — no-arg opens the index; `:help testing` opens the manual playbook in a parked scratch buffer with markdown highlighting (synthetic `[help:<slug>].md` path routes through `Language::from_path`). Reopening dedupes by path; original buffer is parked and restored via `:bn` / `:bd`.
+- **`crates/tui/tests/help.rs`** (7 tests): index, topic, unknown topic message, `h` alias, `:w` refusal, dedup, parking.
+- **Workspace stats**: 258 tests passing, clippy clean.
 
 ## File map (critical files)
 - `crates/core/src/buffer.rs`
@@ -239,7 +271,7 @@ cargo test --workspace                                # should be all green
 cargo clippy --workspace --all-targets                # should be clean
 cargo run --release -- crates/core/src/motion.rs     # dogfood
 ```
-v1 shortlist ALL COMPLETE: (1) ~~jump list~~ ✓, (2) ~~`.`-repeat hardening~~ ✓, (3) ~~release pipeline~~ ✓. To ship: `./scripts/release.sh` (prereqs: `cross` from main branch, `docker` running, `gh`). Splits, visual block, macros, marks, folding all pruned.
+v1 shortlist ALL COMPLETE: (1) ~~jump list~~ ✓, (2) ~~`.`-repeat hardening~~ ✓, (3) ~~release pipeline~~ ✓. To ship: `./scripts/release.sh` (prereqs: `cross` from main branch, `docker` running, `gh`). Splits, visual block, macros, marks, folding all pruned. Phase 4.5 (test harness + 9 parity fixes) and Phase 4.6 (`:help` doc + in-binary help registry) landed 2026-04-25 — 258 tests, clippy clean.
 
 Phase 2 dogfood commands:
 - `:Files` — fuzzy file finder (respects `.gitignore`)

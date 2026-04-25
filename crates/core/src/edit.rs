@@ -36,6 +36,16 @@ pub enum RepeatAction {
     OperateObject { op: PendingOp, object: TextObject, kind: TextObjectKind, count: usize },
     /// `x` / `X` — delete chars on the current line.
     DeleteChars { forward: bool, count: usize },
+    /// `c<motion>...<Esc>` — change over a motion plus the typed replacement.
+    /// Replayed as: re-evaluate the motion at the cursor, delete that range,
+    /// re-type the recorded text.
+    ChangeMotion { motion: Motion, count: usize, text: String },
+    /// `c<text-object>...<Esc>` — change over a text object plus typed text.
+    ChangeObject { object: TextObject, kind: TextObjectKind, text: String },
+    /// `cc...<Esc>` — change whole lines plus typed text.
+    ChangeLine { count: usize, text: String },
+    /// `p` / `P` — paste the unnamed register.
+    Paste { after: bool, count: usize },
 }
 
 #[derive(Debug, Clone)]
