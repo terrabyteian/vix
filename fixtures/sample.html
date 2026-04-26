@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>vix html fixture</title>
+    <style>
+        body { font-family: sans-serif; margin: 2rem; }
+        .greeting { color: steelblue; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1 class="greeting">hello, world</h1>
+    </header>
+    <main>
+        <p>This is a <strong>fixture</strong> for HTML highlighting.</p>
+        <ul>
+            <li>item one</li>
+            <li>item two</li>
+            <li><a href="https://example.com" target="_blank">a link</a></li>
+        </ul>
+        <form action="/submit" method="post">
+            <label for="name">Name:</label>
+            <input id="name" type="text" name="name" placeholder="Ada" required />
+            <button type="submit">Send</button>
+        </form>
+    </main>
+    <script>
+        document.querySelector("button").addEventListener("click", () => {
+            console.log("clicked");
+        });
+    </script>
+</body>
+</html>

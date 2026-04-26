@@ -1,0 +1,34 @@
+# Fixture: exercise toml highlighting.
+
+name = "vix-sample"
+version = "0.1.0"
+active = true
+retries = 3
+ratio = 0.75
+tags = ["editor", "vim", "rust"]
+
+[author]
+name = "Ada Lovelace"
+email = "ada@example.com"
+age = 36
+
+[dependencies]
+ropey = "1.6"
+ratatui = "0.30"
+tree-sitter = { version = "0.25", features = ["std"] }
+
+[scripts]
+build = "cargo build --release"
+test = "cargo test --workspace"
+
+[[servers]]
+name = "rust-analyzer"
+ext = ["rs"]
+
+[[servers]]
+name = "pyright"
+ext = ["py", "pyi"]
+
+[[servers]]
+name = "gopls"
+ext = ["go"]

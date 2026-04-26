@@ -59,6 +59,7 @@ pub enum Language {
     Html,
     Css,
     Bash,
+    Hcl,
 }
 
 impl Language {
@@ -84,6 +85,10 @@ impl Language {
             "html" | "htm" => Some(Language::Html),
             "css" => Some(Language::Css),
             "sh" | "bash" => Some(Language::Bash),
+            // HCL family: Terraform (.tf, .tfvars), OpenTofu (.tofu, .tofuvars),
+            // Packer (.pkr.hcl / .pkrvars.hcl — only the trailing .hcl ext is
+            // visible to `path.extension`), and bare HCL (.hcl, .nomad).
+            "hcl" | "tf" | "tfvars" | "tofu" | "tofuvars" | "nomad" => Some(Language::Hcl),
             _ => None,
         }
     }
@@ -201,6 +206,13 @@ impl SyntaxState {
                 "",
                 "",
             )?,
+            Language::Hcl => HighlightConfiguration::new(
+                tree_sitter_hcl::LANGUAGE.into(),
+                "hcl",
+                HCL_HIGHLIGHTS,
+                "",
+                "",
+            )?,
         };
         cfg.configure(HIGHLIGHT_NAMES);
         Ok(Self {
@@ -233,6 +245,7 @@ impl SyntaxState {
             Language::Html => tree_sitter_html::LANGUAGE.into(),
             Language::Css => tree_sitter_css::LANGUAGE.into(),
             Language::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Language::Hcl => tree_sitter_hcl::LANGUAGE.into(),
         };
         let mut parser = Parser::new();
         parser.set_language(&ts_lang)?;
@@ -353,6 +366,51 @@ const TS_SYMBOLS: &str = r#"
 (method_definition name: (property_identifier) @name)
 "#;
 
+/// Hand-rolled highlights query for HCL (Terraform, OpenTofu, Packer, Nomad,
+/// bare HCL). The upstream `tree-sitter-hcl` crate ships only the parser, no
+/// queries, so we maintain our own. Captures are restricted to scopes listed
+/// in [`HIGHLIGHT_NAMES`].
+const HCL_HIGHLIGHTS: &str = r#"
+(comment) @comment
+
+(numeric_lit) @constant
+(bool_lit) @constant.builtin
+(null_lit) @constant.builtin
+
+(string_lit) @string
+(template_literal) @string
+(heredoc_template) @string
+(heredoc_identifier) @string.special
+(quoted_template_start) @string
+(quoted_template_end) @string
+
+(template_interpolation_start) @punctuation.special
+(template_interpolation_end) @punctuation.special
+(template_for_start) @punctuation.special
+(template_for_end) @punctuation.special
+(template_if_intro) @punctuation.special
+(template_if_end) @punctuation.special
+(template_else_intro) @punctuation.special
+
+(block (identifier) @keyword)
+(attribute (identifier) @property)
+(function_call (identifier) @function)
+(get_attr (identifier) @property)
+(variable_expr (identifier) @variable)
+
+["if" "else" "for" "in" "endfor" "endif"] @keyword.control
+
+[
+  "==" "!=" "<" ">" "<=" ">="
+  "&&" "||" "!"
+  "+" "-" "*" "/" "%"
+  "?" ":" "=" "=>"
+] @operator
+
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+["," "."] @punctuation.delimiter
+"#;
+
 const GO_SYMBOLS: &str = r#"
 (function_declaration name: (identifier) @name)
 (method_declaration name: (field_identifier) @name)
@@ -387,6 +445,12 @@ mod tests {
             ("a.html", Language::Html),
             ("a.css", Language::Css),
             ("a.sh", Language::Bash),
+            ("main.tf", Language::Hcl),
+            ("vars.tfvars", Language::Hcl),
+            ("config.hcl", Language::Hcl),
+            ("ec2.pkr.hcl", Language::Hcl),
+            ("opentofu.tofu", Language::Hcl),
+            ("job.nomad", Language::Hcl),
         ];
         for (p, want) in cases {
             assert_eq!(Language::from_path(Path::new(p)), Some(want), "path {p}");
@@ -442,6 +506,7 @@ mod tests {
             Language::Html,
             Language::Css,
             Language::Bash,
+            Language::Hcl,
         ] {
             SyntaxState::new(lang).unwrap_or_else(|e| panic!("{lang:?}: {e}"));
         }
@@ -459,6 +524,32 @@ mod tests {
             .iter()
             .any(|s| s.scope == kw_idx && &src[s.range.clone()] == b"fn");
         assert!(has_kw, "expected keyword span for fn; got {:?}", spans);
+    }
+
+    #[test]
+    fn highlight_hcl_block_and_string() {
+        let mut s = SyntaxState::new(Language::Hcl).unwrap();
+        let src = b"resource \"aws_instance\" \"web\" {\n  ami = \"ami-123\"\n}\n";
+        let spans = s.highlight(src).unwrap();
+        let kw = HIGHLIGHT_NAMES.iter().position(|n| *n == "keyword").unwrap();
+        let str_idx = HIGHLIGHT_NAMES.iter().position(|n| *n == "string").unwrap();
+        let prop = HIGHLIGHT_NAMES.iter().position(|n| *n == "property").unwrap();
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.scope == kw && &src[s.range.clone()] == b"resource"),
+            "expected keyword span for `resource`"
+        );
+        assert!(
+            spans.iter().any(|s| s.scope == str_idx),
+            "expected string span"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.scope == prop && &src[s.range.clone()] == b"ami"),
+            "expected property span for `ami`"
+        );
     }
 
     #[test]

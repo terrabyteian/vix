@@ -1,0 +1,52 @@
+/* Fixture: exercise CSS highlighting. */
+
+:root {
+    --primary: #4a90e2;
+    --bg: #fafafa;
+    --radius: 6px;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    padding: 2rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: #222;
+}
+
+.greeting,
+header h1 {
+    color: var(--primary);
+    font-weight: 700;
+    font-size: 1.5rem;
+}
+
+.button {
+    display: inline-block;
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--primary);
+    border-radius: var(--radius);
+    background: white;
+    cursor: pointer;
+    transition: background 150ms ease-in-out;
+}
+
+.button:hover,
+.button:focus {
+    background: var(--primary);
+    color: white;
+}
+
+@media (max-width: 600px) {
+    body { padding: 1rem; }
+    .button { width: 100%; }
+}
+
+@keyframes fade-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}

@@ -1427,8 +1427,14 @@ impl Editor {
                     let list_row = (row_in_overlay - 1) as usize;
                     let match_idx = self.last_picker_scroll + list_row;
                     if let Some(&(item_idx, _)) = p.matches.get(match_idx) {
-                        p.selected = match_idx;
-                        Some(p.items[item_idx].value.clone())
+                        // First click on a row just focuses it; a second
+                        // click on the same already-selected row activates.
+                        if p.selected == match_idx {
+                            Some(p.items[item_idx].value.clone())
+                        } else {
+                            p.selected = match_idx;
+                            None
+                        }
                     } else {
                         return;
                     }

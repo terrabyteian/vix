@@ -20,4 +20,5 @@ tree-sitter-toml-ng.workspace = true
 tree-sitter-html.workspace = true
 tree-sitter-css.workspace = true
 tree-sitter-bash.workspace = true
+tree-sitter-hcl.workspace = true
 anyhow.workspace = true
