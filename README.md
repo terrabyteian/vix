@@ -5,13 +5,13 @@ A single-binary, no-config, opinionated modal editor. Vim grammar (operator + mo
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | sh
 ```
 
 Pin a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | VIX_VERSION=v0.1.0 sh
 ```
 
 **Build from source** (requires Rust):
