@@ -89,6 +89,44 @@ fn closing_last_buffer_quits() {
 }
 
 #[test]
+fn tab_cycles_buffers_alt_tab_style() {
+    let a = tmpfile("alpha file\n");
+    let b = tmpfile("beta file\n");
+    let mut h = Harness::with_text("origin\n");
+    h.cmd(&format!("e {}", a.display()));
+    h.cmd(&format!("e {}", b.display()));
+    h.assert_text("beta file\n");
+    h.keys("<Tab>");
+    let after_one = h.text();
+    assert_ne!(after_one, "beta file\n", "Tab should advance to a different buffer");
+    // Two more tabs should wrap back to beta (3 buffers total).
+    h.keys("<Tab><Tab>");
+    h.assert_text("beta file\n");
+}
+
+#[test]
+fn shift_tab_cycles_buffers_backwards() {
+    let a = tmpfile("alpha2\n");
+    let b = tmpfile("beta2\n");
+    let mut h = Harness::with_text("origin\n");
+    h.cmd(&format!("e {}", a.display()));
+    h.cmd(&format!("e {}", b.display()));
+    let forward_once = {
+        let mut probe = Harness::with_text("origin\n");
+        probe.cmd(&format!("e {}", a.display()));
+        probe.cmd(&format!("e {}", b.display()));
+        probe.keys("<Tab>");
+        probe.text()
+    };
+    // Shift-Tab should land somewhere different than Tab (with 3 buffers
+    // the prev and next directions diverge), and never land back on the
+    // starting buffer.
+    h.keys("<S-Tab>");
+    assert_ne!(h.text(), "beta2\n");
+    assert_ne!(h.text(), forward_once);
+}
+
+#[test]
 fn bd_blocks_on_dirty_buffer() {
     let mut h = Harness::with_text("hello\n");
     h.keys("Adirty<Esc>");

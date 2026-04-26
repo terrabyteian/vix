@@ -1,4 +1,7 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -74,6 +77,9 @@ struct BufferSave {
     syntax_version: Option<u64>,
     pending_insert: Option<PendingInsert>,
     last_change: Option<RepeatAction>,
+    /// Stable creation-order id. Survives swaps; used to render a steady
+    /// position counter in the statusline as the user cycles buffers.
+    bid: u64,
 }
 
 pub struct Editor {
@@ -146,6 +152,31 @@ pub struct Editor {
     /// In Visual mode, the pending text-object kind from the last `i` / `a`.
     /// Cleared once the object char arrives or Esc is pressed.
     visual_object_kind: Option<TextObjectKind>,
+    /// Stable id of the currently-active buffer. Paired with `BufferSave::bid`
+    /// to render a position counter that tracks the active buffer through
+    /// `<Tab>` / `:bn` rotations.
+    active_bid: u64,
+    /// Monotonic source for new buffer ids.
+    next_bid: u64,
+    /// Last rendered content rect. Used to translate mouse coords to buffer
+    /// positions. None until the first frame is drawn.
+    last_content_rect: Option<Rect>,
+    /// Width of the gutter (line numbers + diag glyph + space) at the last
+    /// render. Click x − content_rect.x − this = column into the line.
+    last_gutter_cols: u16,
+    /// Last rendered picker overlay rect, and the scroll offset into the
+    /// match list at that frame. Used to translate mouse events on the picker
+    /// back into list-item indices. `None` when no picker is up.
+    last_picker_rect: Option<Rect>,
+    last_picker_scroll: usize,
+    /// Set true after `<Space>` is pressed in Normal mode. The next key
+    /// resolves the leader sequence. Cleared on Esc / mode changes / Ctrl-C.
+    pending_leader: bool,
+    /// One-shot flag used at launch: when the user opens vix without a file
+    /// (or with a directory), we boot with an empty placeholder buffer and
+    /// pop the file picker. The first buffer they pick should *replace*
+    /// that placeholder rather than park it. Consumed on the first swap.
+    discard_active_on_swap: bool,
 }
 
 /// What we asked for — lets us interpret the response when it arrives.
@@ -202,6 +233,10 @@ struct Picker {
     selected: usize,
     /// Vertical scroll offset within the match list.
     scroll: usize,
+    /// Cached file-scan items so `<Tab>` Files↔Grep toggling doesn't
+    /// rescan the tree on every flip. Populated for the unified
+    /// Files/Grep picker; left `None` for other picker kinds.
+    cached_files: Option<Vec<PickerItem>>,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +270,36 @@ enum PickerValue {
     CodeAction(usize),
     /// Index into the jump list's current entries (oldest = 0).
     JumpIndex(usize),
+}
+
+/// Scan `cwd` for files (respecting `.gitignore`) and wrap them as picker
+/// items. Used by the unified Files/Grep picker.
+fn scan_files_as_picker_items(cwd: &std::path::Path) -> Vec<PickerItem> {
+    scan_files(cwd)
+        .into_iter()
+        .map(|fi| PickerItem {
+            display: fi.rel_path.to_string_lossy().into_owned(),
+            value: PickerValue::File(fi.rel_path),
+            haystack: fi.haystack,
+        })
+        .collect()
+}
+
+/// Run a regex grep across `cwd` and wrap results as picker items. Errors
+/// (e.g. user typed an in-progress regex like `[`) collapse to an empty
+/// list — no UX-disrupting noise during live typing.
+fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
+    let hits: Vec<GrepItem> = grep(cwd, query).unwrap_or_default();
+    hits.into_iter()
+        .map(|g| {
+            let display = format!("{}:{}: {}", g.path.display(), g.line, g.text);
+            PickerItem {
+                display,
+                value: PickerValue::GrepHit { path: g.path, line: g.line },
+                haystack: g.haystack,
+            }
+        })
+        .collect()
 }
 
 /// Render label for the buffer picker: "[1] path   [+]".
@@ -306,6 +371,14 @@ impl Editor {
             yank_flash: None,
             jumps: JumpList::default(),
             visual_object_kind: None,
+            last_content_rect: None,
+            last_gutter_cols: 0,
+            last_picker_rect: None,
+            last_picker_scroll: 0,
+            pending_leader: false,
+            discard_active_on_swap: false,
+            active_bid: 0,
+            next_bid: 1,
         }
     }
 
@@ -333,6 +406,21 @@ impl Editor {
     }
     pub fn picker_query(&self) -> Option<&str> {
         self.picker.as_ref().map(|p| p.query.as_str())
+    }
+    /// One-word label for the active picker kind (test introspection).
+    #[doc(hidden)]
+    pub fn picker_selected_for_test(&self) -> usize {
+        self.picker.as_ref().map(|p| p.selected).unwrap_or(0)
+    }
+    pub fn picker_kind_label(&self) -> Option<&'static str> {
+        self.picker.as_ref().map(|p| match p.kind {
+            PickerKind::Files => "files",
+            PickerKind::Grep => "grep",
+            PickerKind::Symbols => "symbols",
+            PickerKind::Buffers => "buffers",
+            PickerKind::CodeActions => "code_actions",
+            PickerKind::Jumps => "jumps",
+        })
     }
     pub fn diagnostics_for_active(&self) -> usize {
         self.buffer
@@ -799,6 +887,7 @@ impl Editor {
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
+            cached_files: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1049,27 +1138,95 @@ impl Editor {
     }
 
     /// Open the file finder picker rooted at the current working directory.
-    fn open_files_picker(&mut self) {
+    pub fn open_files_picker(&mut self) {
+        self.open_picker_unified(PickerKind::Files, "");
+    }
+
+    /// Unified Files↔Grep picker. `<Tab>` toggles submode, query carries
+    /// over. Files results are scanned once on open and cached so toggling
+    /// is free.
+    fn open_picker_unified(&mut self, initial: PickerKind, initial_query: &str) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let scanned = scan_files(&cwd);
-        let items: Vec<PickerItem> = scanned
-            .into_iter()
-            .map(|fi| PickerItem {
-                display: fi.rel_path.to_string_lossy().into_owned(),
-                value: PickerValue::File(fi.rel_path),
-                haystack: fi.haystack,
-            })
-            .collect();
+        let cached_files = scan_files_as_picker_items(&cwd);
+        let items = match initial {
+            PickerKind::Files => cached_files.clone(),
+            PickerKind::Grep => {
+                if initial_query.len() >= 2 {
+                    grep_as_picker_items(&cwd, initial_query)
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => return,
+        };
         let mut p = Picker {
-            kind: PickerKind::Files,
-            query: String::new(),
+            kind: initial,
+            query: initial_query.to_string(),
             items,
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
+            cached_files: Some(cached_files),
         };
         p.rescore();
         self.picker = Some(p);
+    }
+
+    /// Toggle the active picker between Files and Grep submodes. The query
+    /// is preserved; the items list is regenerated from the cache (Files)
+    /// or by re-running grep (Grep, if query is at least 2 chars).
+    fn toggle_picker_mode(&mut self) {
+        let (new_kind, query, cached) = {
+            let Some(p) = self.picker.as_mut() else { return };
+            let new_kind = match p.kind {
+                PickerKind::Files => PickerKind::Grep,
+                PickerKind::Grep => PickerKind::Files,
+                _ => return,
+            };
+            (new_kind, p.query.clone(), p.cached_files.clone())
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let new_items = match new_kind {
+            PickerKind::Grep => {
+                if query.len() >= 2 {
+                    grep_as_picker_items(&cwd, &query)
+                } else {
+                    Vec::new()
+                }
+            }
+            PickerKind::Files => match cached {
+                Some(c) => c,
+                None => scan_files_as_picker_items(&cwd),
+            },
+            _ => return,
+        };
+        let Some(p) = self.picker.as_mut() else { return };
+        p.kind = new_kind;
+        p.items = new_items;
+        if matches!(p.kind, PickerKind::Files) && p.cached_files.is_none() {
+            p.cached_files = Some(p.items.clone());
+        }
+        p.selected = 0;
+        p.scroll = 0;
+        p.rescore();
+    }
+
+    /// Re-grep on each query change in Grep submode. Requires ≥2 chars;
+    /// shorter queries clear the items list.
+    fn refresh_grep_items(&mut self) {
+        let query = match self.picker.as_ref() {
+            Some(p) if matches!(p.kind, PickerKind::Grep) => p.query.clone(),
+            _ => return,
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let new_items = if query.len() >= 2 {
+            grep_as_picker_items(&cwd, &query)
+        } else {
+            Vec::new()
+        };
+        let Some(p) = self.picker.as_mut() else { return };
+        p.items = new_items;
+        p.rescore();
     }
 
     /// Open the tree-sitter symbol picker for the current buffer.
@@ -1111,102 +1268,178 @@ impl Editor {
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
+            cached_files: None,
         };
         p.rescore();
         self.picker = Some(p);
     }
 
-    /// Open the grep picker with an initial pattern. Empty pattern = no hits.
+    /// Open the grep picker, optionally pre-filled with `pattern`. Pattern
+    /// becomes the initial query; the live grep machinery handles results.
     fn open_grep_picker(&mut self, pattern: &str) {
-        if pattern.is_empty() {
-            self.msg = "usage: :Grep <pattern>".into();
-            return;
-        }
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let hits: Vec<GrepItem> = grep(&cwd, pattern).unwrap_or_else(|e| {
-            self.msg = format!("grep: {e}");
-            Vec::new()
-        });
-        if hits.is_empty() && self.msg.is_empty() {
-            self.msg = format!("no matches for {pattern}");
-        }
-        let items: Vec<PickerItem> = hits
-            .into_iter()
-            .map(|g| {
-                let display = format!("{}:{}: {}", g.path.display(), g.line, g.text);
-                PickerItem {
-                    display,
-                    value: PickerValue::GrepHit { path: g.path, line: g.line },
-                    haystack: g.haystack,
-                }
-            })
-            .collect();
-        let mut p = Picker {
-            kind: PickerKind::Grep,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-        };
-        p.rescore();
-        self.picker = Some(p);
+        self.open_picker_unified(PickerKind::Grep, pattern);
     }
 
     /// Handle a key event while the picker overlay is active. Returns true if
     /// the event was consumed; false means the picker closed itself.
     fn handle_picker_key(&mut self, k: KeyEvent) -> bool {
-        let Some(p) = self.picker.as_mut() else { return false };
-        match k.code {
-            KeyCode::Esc => {
+        // What to do *after* picker-internal mutation completes. Lets us
+        // release the &mut borrow before calling self-mutating helpers.
+        enum Post {
+            None,
+            Close,
+            Select(PickerValue),
+            Toggle,
+            // Re-score (Files) or re-grep (Grep) after the query changed.
+            Refresh,
+        }
+
+        let post = {
+            let Some(p) = self.picker.as_mut() else { return false };
+            let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
+            match k.code {
+                KeyCode::Esc => {
+                    if is_unified && !p.query.is_empty() {
+                        p.query.clear();
+                        Post::Refresh
+                    } else {
+                        Post::Close
+                    }
+                }
+                KeyCode::Tab => {
+                    if is_unified {
+                        Post::Toggle
+                    } else {
+                        Post::None
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(&(idx, _)) = p.matches.get(p.selected) {
+                        Post::Select(p.items[idx].value.clone())
+                    } else {
+                        Post::Close
+                    }
+                }
+                KeyCode::Up => {
+                    if p.selected > 0 {
+                        p.selected -= 1;
+                    }
+                    Post::None
+                }
+                KeyCode::Down => {
+                    if p.selected + 1 < p.matches.len() {
+                        p.selected += 1;
+                    }
+                    Post::None
+                }
+                KeyCode::Backspace => {
+                    if p.query.pop().is_some() {
+                        Post::Refresh
+                    } else {
+                        Post::None
+                    }
+                }
+                KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    match c {
+                        'n' | 'j' => {
+                            if p.selected + 1 < p.matches.len() {
+                                p.selected += 1;
+                            }
+                        }
+                        'p' | 'k' => {
+                            if p.selected > 0 {
+                                p.selected -= 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    Post::None
+                }
+                KeyCode::Char(c) => {
+                    p.query.push(c);
+                    Post::Refresh
+                }
+                _ => Post::None,
+            }
+        };
+
+        match post {
+            Post::None => {}
+            Post::Close => {
                 self.picker = None;
             }
-            KeyCode::Enter => {
-                if let Some(&(idx, _)) = p.matches.get(p.selected) {
-                    let value = p.items[idx].value.clone();
-                    self.picker = None;
-                    self.pick_result(value);
-                } else {
-                    self.picker = None;
-                }
+            Post::Select(v) => {
+                self.picker = None;
+                self.pick_result(v);
             }
-            KeyCode::Up => {
-                if p.selected > 0 {
-                    p.selected -= 1;
-                }
+            Post::Toggle => {
+                self.toggle_picker_mode();
             }
-            KeyCode::Down => {
-                if p.selected + 1 < p.matches.len() {
-                    p.selected += 1;
-                }
-            }
-            KeyCode::Backspace => {
-                if p.query.pop().is_some() {
+            Post::Refresh => {
+                let is_grep = matches!(
+                    self.picker.as_ref().map(|p| &p.kind),
+                    Some(PickerKind::Grep)
+                );
+                if is_grep {
+                    self.refresh_grep_items();
+                } else if let Some(p) = self.picker.as_mut() {
                     p.rescore();
                 }
             }
-            KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                match c {
-                    'n' | 'j' => {
-                        if p.selected + 1 < p.matches.len() {
-                            p.selected += 1;
-                        }
-                    }
-                    'p' | 'k' => {
-                        if p.selected > 0 {
-                            p.selected -= 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            KeyCode::Char(c) => {
-                p.query.push(c);
-                p.rescore();
-            }
-            _ => {}
         }
         true
+    }
+
+    /// Handle a mouse event while the picker overlay is active. Scroll
+    /// moves the selection (so the visible window follows automatically);
+    /// left-click on a row activates that entry. Clicks outside the overlay
+    /// or on the header row are ignored.
+    fn handle_picker_mouse(&mut self, me: MouseEvent) {
+        let selected_value: Option<PickerValue> = {
+            let Some(p) = self.picker.as_mut() else { return };
+            match me.kind {
+                MouseEventKind::ScrollUp => {
+                    if p.selected > 0 {
+                        p.selected -= 1;
+                    }
+                    None
+                }
+                MouseEventKind::ScrollDown => {
+                    if p.selected + 1 < p.matches.len() {
+                        p.selected += 1;
+                    }
+                    None
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let Some(rect) = self.last_picker_rect else { return };
+                    if me.column < rect.x
+                        || me.row < rect.y
+                        || me.column >= rect.x + rect.width
+                        || me.row >= rect.y + rect.height
+                    {
+                        return;
+                    }
+                    let row_in_overlay = me.row - rect.y;
+                    // Row 0 is the header; list rows start at 1.
+                    if row_in_overlay == 0 {
+                        return;
+                    }
+                    let list_row = (row_in_overlay - 1) as usize;
+                    let match_idx = self.last_picker_scroll + list_row;
+                    if let Some(&(item_idx, _)) = p.matches.get(match_idx) {
+                        p.selected = match_idx;
+                        Some(p.items[item_idx].value.clone())
+                    } else {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        };
+        if let Some(v) = selected_value {
+            self.picker = None;
+            self.pick_result(v);
+        }
     }
 
     /// Act on a picker selection: open a file or jump to a grep hit.
@@ -1340,6 +1573,7 @@ impl Editor {
             syntax_version: self.syntax_version.take(),
             pending_insert: self.pending_insert.take(),
             last_change: self.last_change.take(),
+            bid: self.active_bid,
         }
     }
 
@@ -1355,6 +1589,15 @@ impl Editor {
         self.syntax_version = save.syntax_version;
         self.pending_insert = save.pending_insert;
         self.last_change = save.last_change;
+        self.active_bid = save.bid;
+    }
+
+    /// Allocate a fresh buffer id and assign it to the (newly-installed)
+    /// active buffer. Call after `add_or_switch_buffer` puts a brand-new
+    /// buffer into the active slot.
+    fn assign_new_active_bid(&mut self) {
+        self.active_bid = self.next_bid;
+        self.next_bid = self.next_bid.wrapping_add(1).max(1);
     }
 
     /// Replace the active buffer with a freshly-loaded one. Parks the
@@ -1365,17 +1608,29 @@ impl Editor {
         if let Some(new_path) = buffer.path() {
             if let Some(idx) = self.buffer_index_by_path(new_path) {
                 self.switch_to_buffer(idx);
+                self.discard_active_on_swap = false;
                 return;
             }
         }
-        let current = self.save_active();
-        self.other_buffers.push(current);
+        // Launch-mode placeholder consumption: if the active buffer is the
+        // pristine empty buffer we created at startup, drop it instead of
+        // parking so the user's first selection is their first buffer.
+        let drop_placeholder = self.discard_active_on_swap
+            && self.buffer.path().is_none()
+            && !self.buffer.dirty()
+            && self.buffer.rope().len_chars() == 0;
+        self.discard_active_on_swap = false;
+        if !drop_placeholder {
+            let current = self.save_active();
+            self.other_buffers.push(current);
+        }
         self.buffer = buffer;
         self.sel = Selection::at(0);
         self.history = History::new();
         self.view_top = 0;
         self.pending_insert = None;
         self.last_change = None;
+        self.assign_new_active_bid();
         self.syntax = self
             .buffer
             .path()
@@ -1590,6 +1845,7 @@ impl Editor {
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
+            cached_files: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1648,6 +1904,7 @@ impl Editor {
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
+            cached_files: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -2573,6 +2830,7 @@ impl Editor {
             self.keys = NormalKeyState::default();
             self.cmdline.clear();
             self.pending_insert = None;
+            self.pending_leader = false;
             return;
         }
 
@@ -2585,7 +2843,7 @@ impl Editor {
             return;
         }
 
-        // Ctrl-O / Ctrl-I (or Tab) in Normal mode: jump list back / forward.
+        // Ctrl-O / Ctrl-I in Normal mode: jump list back / forward.
         if self.mode == Mode::Normal
             && k.modifiers.contains(KeyModifiers::CONTROL)
             && k.code == KeyCode::Char('o')
@@ -2594,21 +2852,98 @@ impl Editor {
             return;
         }
         if self.mode == Mode::Normal
-            && (k.code == KeyCode::Tab
-                || (k.modifiers.contains(KeyModifiers::CONTROL)
-                    && k.code == KeyCode::Char('i')))
+            && k.modifiers.contains(KeyModifiers::CONTROL)
+            && k.code == KeyCode::Char('i')
         {
             self.jump_forward();
             return;
         }
 
+        // Tab / Shift-Tab in Normal mode: cycle to next/prev open buffer
+        // (Alt-Tab style — wraps around at the ends).
+        if self.mode == Mode::Normal && k.code == KeyCode::Tab {
+            if k.modifiers.contains(KeyModifiers::SHIFT) {
+                self.prev_buffer();
+            } else {
+                self.next_buffer();
+            }
+            return;
+        }
+        if self.mode == Mode::Normal && k.code == KeyCode::BackTab {
+            self.prev_buffer();
+            return;
+        }
+
+        // Arrow keys mirror hjkl. In Normal/Visual they go through the keymap
+        // so they compose with operators (`d<Right>` works like `dl`); in
+        // Insert they move the cursor one step. The completion popup keeps
+        // first dibs on Up/Down when it's open.
+        let arrow_char = match k.code {
+            KeyCode::Left => Some('h'),
+            KeyCode::Right => Some('l'),
+            KeyCode::Up => Some('k'),
+            KeyCode::Down => Some('j'),
+            _ => None,
+        };
+        if let Some(c) = arrow_char {
+            let popup_handles = self.mode == Mode::Insert
+                && self.completion_popup.is_some()
+                && matches!(k.code, KeyCode::Up | KeyCode::Down);
+            if !popup_handles {
+                match self.mode {
+                    Mode::Normal | Mode::Visual | Mode::VisualLine => {
+                        let action = handle_normal_char(&mut self.keys, c);
+                        self.dispatch(action);
+                        return;
+                    }
+                    Mode::Insert => {
+                        let motion = match c {
+                            'h' => Motion::Left,
+                            'l' => Motion::Right,
+                            'k' => Motion::Up,
+                            'j' => Motion::Down,
+                            _ => unreachable!(),
+                        };
+                        // Cursor move closes any completion popup and breaks
+                        // the insert session for `.`-repeat parity.
+                        self.completion_popup = None;
+                        self.sel = apply_motion(&self.buffer, self.sel, motion, 1)
+                            .clamped(&self.buffer);
+                        if let Some(pi) = self.pending_insert.as_mut() {
+                            pi.typed.clear();
+                            pi.start = self.sel.head;
+                        }
+                        return;
+                    }
+                    Mode::Command => return,
+                }
+            }
+        }
+
         match self.mode {
             Mode::Normal => {
                 if let KeyCode::Char(c) = k.code {
+                    let unmodified = !k.modifiers.contains(KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(KeyModifiers::ALT);
+                    if unmodified {
+                        if self.pending_leader {
+                            self.pending_leader = false;
+                            match c {
+                                'f' => { self.open_files_picker(); return; }
+                                'g' => { self.open_grep_picker(""); return; }
+                                _ => return,
+                            }
+                        }
+                        if c == ' ' {
+                            self.pending_leader = true;
+                            return;
+                        }
+                    }
                     let action = handle_normal_char(&mut self.keys, c);
                     self.dispatch(action);
                 } else if k.code == KeyCode::Esc {
                     self.keys = NormalKeyState::default();
+                    self.pending_leader = false;
                 }
             }
             Mode::Visual | Mode::VisualLine => {
@@ -2765,6 +3100,101 @@ impl Editor {
                 _ => {}
             },
         }
+    }
+
+    /// Handle a mouse event. Left-click positions the cursor; scroll is left
+    /// to the terminal's translation (which crossterm forwards as
+    /// ScrollUp/Down events — caller may ignore them since the
+    /// `ensure_cursor_visible` pass keeps the view aligned with the cursor).
+    pub fn handle_mouse(&mut self, me: MouseEvent) {
+        // Picker overlay owns the mouse while up: scroll cycles the
+        // selection, left-click activates an entry.
+        if self.picker.is_some() {
+            self.handle_picker_mouse(me);
+            return;
+        }
+        if self.completion_popup.is_some() {
+            return;
+        }
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(ch) = self.click_to_char(me.column, me.row) {
+                    self.push_jump();
+                    if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+                        // Extend the selection: keep anchor, move head.
+                        self.sel.head = ch;
+                        self.sel.virt_col = None;
+                        self.sel = self.sel.clamped(&self.buffer);
+                    } else {
+                        self.sel = Selection::at(ch).clamped(&self.buffer);
+                    }
+                    self.hover_popup = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Drag enters/extends a charwise visual selection from the
+                // initial click point. The first Down already set anchor=head;
+                // here we move head only.
+                if let Some(ch) = self.click_to_char(me.column, me.row) {
+                    if !matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+                        self.mode = Mode::Visual;
+                    }
+                    self.sel.head = ch;
+                    self.sel.virt_col = None;
+                    self.sel = self.sel.clamped(&self.buffer);
+                }
+            }
+            // Move the cursor along with the scroll so the view actually
+            // advances — `ensure_cursor_visible` in render would otherwise yank
+            // `view_top` back to the cursor and the scroll would feel like a
+            // no-op once the cursor was on-screen.
+            MouseEventKind::ScrollUp => {
+                self.sel = apply_motion(&self.buffer, self.sel, Motion::Up, 1)
+                    .clamped(&self.buffer);
+            }
+            MouseEventKind::ScrollDown => {
+                self.sel = apply_motion(&self.buffer, self.sel, Motion::Down, 1)
+                    .clamped(&self.buffer);
+            }
+            _ => {}
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_render_geometry_for_test(&mut self, rect: Rect, gutter_cols: u16) {
+        self.last_content_rect = Some(rect);
+        self.last_gutter_cols = gutter_cols;
+    }
+
+    #[doc(hidden)]
+    pub fn set_picker_geometry_for_test(&mut self, rect: Rect, scroll: usize) {
+        self.last_picker_rect = Some(rect);
+        self.last_picker_scroll = scroll;
+    }
+
+    /// Translate absolute terminal (col, row) to a buffer char offset, or
+    /// None if the click was outside the content area / past EOF.
+    fn click_to_char(&self, col: u16, row: u16) -> Option<usize> {
+        let rect = self.last_content_rect?;
+        if col < rect.x
+            || row < rect.y
+            || col >= rect.x + rect.width
+            || row >= rect.y + rect.height
+        {
+            return None;
+        }
+        let screen_row = row - rect.y;
+        let screen_col = col.saturating_sub(rect.x);
+        // Clicks in the gutter snap to col 0 of that line.
+        let in_text_col = screen_col.saturating_sub(self.last_gutter_cols) as usize;
+        let line_idx = self.view_top + screen_row as usize;
+        let total = self.buffer.len_lines();
+        if line_idx >= total {
+            return None;
+        }
+        let line_len = self.buffer.line_len_chars(line_idx);
+        let col_clamped = in_text_col.min(line_len);
+        Some(self.buffer.line_to_char(line_idx) + col_clamped)
     }
 }
 
@@ -2940,7 +3370,11 @@ fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
         if Instant::now() >= *until { ed.yank_flash = None; }
     }
 
-    render_content(f, content_area, ed, &ed.syntax_cache);
+    // Take the highlight cache out of `ed` so we can pass `&mut ed` and the
+    // borrowed cache through render_content side by side. Restored after.
+    let hl_cache = std::mem::take(&mut ed.syntax_cache);
+    render_content(f, content_area, ed, &hl_cache);
+    ed.syntax_cache = hl_cache;
     render_statusline(f, statusline_area, ed);
     render_cmdline(f, cmdline_area, ed);
 
@@ -2952,6 +3386,8 @@ fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     }
     if ed.picker.is_some() {
         render_picker(f, content_area, ed);
+    } else {
+        ed.last_picker_rect = None;
     }
 }
 
@@ -3107,10 +3543,14 @@ fn scope_style(scope_idx: usize) -> Option<Style> {
     Some(Style::default().fg(color))
 }
 
-fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &Editor, hl_spans: &[HlSpan]) {
+fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans: &[HlSpan]) {
     let total_lines = ed.buffer.len_lines();
     let rows = area.height as usize;
     let gutter_width = total_lines.to_string().len().max(3) + 1;
+    // Stash for mouse → buffer translation. `+2` = diag-glyph col + trailing
+    // space before content. Matches the prefix actually written below.
+    ed.last_content_rect = Some(area);
+    ed.last_gutter_cols = (gutter_width + 2) as u16;
 
     let (cursor_line, cursor_col) = ed.buffer.char_to_line_col(ed.sel.head);
 
@@ -3294,7 +3734,21 @@ fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let path = ed.buffer.path().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".into());
     let dirty = if ed.buffer.dirty() { " [+]" } else { "" };
     let buf_count = ed.other_buffers.len() + 1;
-    let buf_info = if buf_count > 1 { format!("[1/{buf_count}] ") } else { String::new() };
+    let buf_info = if buf_count > 1 {
+        // Position by stable buffer id so the counter advances as the user
+        // cycles with `<Tab>` / `:bn` instead of being pinned at 1.
+        let mut bids: Vec<u64> = ed.other_buffers.iter().map(|b| b.bid).collect();
+        bids.push(ed.active_bid);
+        bids.sort_unstable();
+        let pos = bids
+            .iter()
+            .position(|b| *b == ed.active_bid)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        format!("[{pos}/{buf_count}] ")
+    } else {
+        String::new()
+    };
     let diag_info = diag_summary(ed);
     let right = format!(" {}{}{}:{} ", buf_info, diag_info, line + 1, col + 1);
     let left_mode = format!(" {} ", ed.mode.label());
@@ -3309,8 +3763,11 @@ fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     f.render_widget(Paragraph::new(line_widget), area);
 }
 
-fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
-    let Some(p) = ed.picker.as_ref() else { return };
+fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
+    let Some(p) = ed.picker.as_ref() else {
+        ed.last_picker_rect = None;
+        return;
+    };
 
     // Centered overlay: ~80% wide, 2/3 tall. Clamp to minimums so it renders
     // on small terminals too.
@@ -3334,7 +3791,12 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
         PickerKind::Jumps => "jumps",
     };
     let prompt = format!(" {} > {}", kind_label, p.query);
-    let count = format!(" {}/{} ", p.matches.len(), p.items.len());
+    let toggle_hint = match p.kind {
+        PickerKind::Files => " <Tab>=grep ",
+        PickerKind::Grep => " <Tab>=files ",
+        _ => "",
+    };
+    let count = format!("{}{}/{} ", toggle_hint, p.matches.len(), p.items.len());
     let header_pad =
         (w as usize).saturating_sub(prompt.len() + count.len());
     let header = Line::from(vec![
@@ -3378,6 +3840,9 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
         }
     }
     f.render_widget(Paragraph::new(lines), overlay);
+
+    ed.last_picker_rect = Some(overlay);
+    ed.last_picker_scroll = scroll;
 }
 
 fn render_cmdline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
@@ -3388,15 +3853,19 @@ fn render_cmdline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     f.render_widget(Paragraph::new(content), area);
 }
 
-pub fn run(buffer: Buffer) -> io::Result<()> {
+pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen)?;
+    execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut term: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 
     let mut ed = Editor::new(buffer);
     ed.ensure_lsp_open();
+    if open_files_picker {
+        ed.discard_active_on_swap = true;
+        ed.open_files_picker();
+    }
     let result = (|| -> io::Result<()> {
         while !ed.quit {
             ed.drain_lsp_events();
@@ -3404,10 +3873,10 @@ pub fn run(buffer: Buffer) -> io::Result<()> {
             // Poll for input with a short timeout so LSP events get a chance
             // to flow in between keystrokes without blocking.
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        ed.handle_key(k);
-                    }
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => ed.handle_key(k),
+                    Event::Mouse(m) => ed.handle_mouse(m),
+                    _ => {}
                 }
             }
         }
@@ -3416,7 +3885,7 @@ pub fn run(buffer: Buffer) -> io::Result<()> {
 
     // Always restore terminal even on error.
     terminal::disable_raw_mode()?;
-    execute!(term.backend_mut(), terminal::LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), DisableMouseCapture, terminal::LeaveAlternateScreen)?;
     term.show_cursor()?;
     result
 }

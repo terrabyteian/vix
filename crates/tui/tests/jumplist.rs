@@ -46,11 +46,11 @@ fn ctrl_o_fallback_works() {
 }
 
 #[test]
-fn tab_is_jump_forward_fallback() {
+fn ctrl_i_is_jump_forward_fallback() {
     let mut h = Harness::with_text(PARA);
     h.keys("G");
     h.keys("go");
-    h.keys("<Tab>");
+    h.keys("<C-i>");
     // Forward after go should return to the line G landed on.
     h.assert_cursor(6, 0);
 }

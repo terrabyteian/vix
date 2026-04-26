@@ -6,7 +6,10 @@
 //! `<C-x>` map to the obvious `KeyEvent`. Use `<lt>` for a literal `<`.
 
 use crate::Editor;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use std::path::PathBuf;
 use vix_core::{Buffer, JumpList, Mode, RepeatAction};
 
@@ -111,6 +114,14 @@ impl Harness {
         self.editor.picker_open()
     }
 
+    pub fn picker_query(&self) -> Option<&str> {
+        self.editor.picker_query()
+    }
+
+    pub fn picker_kind(&self) -> Option<&'static str> {
+        self.editor.picker_kind_label()
+    }
+
     pub fn quit_requested(&self) -> bool {
         self.editor.quit
     }
@@ -125,6 +136,63 @@ impl Harness {
 
     pub fn assert_text(&self, expected: &str) {
         assert_eq!(self.text(), expected, "buffer text mismatch");
+    }
+
+    /// Pretend a frame was rendered with the given content rect + gutter
+    /// width. Required before `click(..)` / `scroll_*(..)` because the real
+    /// values are normally populated by `render_content`.
+    pub fn set_render_geometry(&mut self, content_rect: Rect, gutter_cols: u16) {
+        self.editor.set_render_geometry_for_test(content_rect, gutter_cols);
+    }
+
+    /// Pretend the picker was just rendered with the given overlay rect and
+    /// scroll offset. Required before calling `click(..)` against picker
+    /// rows in tests, since `last_picker_rect` is normally populated by
+    /// `render_picker`.
+    pub fn set_picker_geometry(&mut self, rect: Rect, scroll: usize) {
+        self.editor.set_picker_geometry_for_test(rect, scroll);
+    }
+
+    /// Simulate a left-button mouse-down at absolute terminal coords.
+    pub fn click(&mut self, col: u16, row: u16) {
+        self.editor.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    /// Simulate a left-button drag at absolute terminal coords.
+    pub fn drag(&mut self, col: u16, row: u16) {
+        self.editor.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.editor.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.editor.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    pub fn view_top(&self) -> usize {
+        self.editor.view_top
     }
 
     pub fn assert_cursor(&self, line: usize, col: usize) {
