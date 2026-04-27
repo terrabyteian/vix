@@ -33,7 +33,12 @@ pub struct GrepItem {
 /// Walk `root` respecting `.gitignore` and return a deduped list of files.
 pub fn scan_files(root: &Path) -> Vec<FileItem> {
     let mut out: Vec<FileItem> = Vec::new();
-    for entry in WalkBuilder::new(root).hidden(false).build().flatten() {
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build()
+        .flatten()
+    {
         let Some(ft) = entry.file_type() else { continue };
         if !ft.is_file() {
             continue;
@@ -57,7 +62,12 @@ pub fn scan_files(root: &Path) -> Vec<FileItem> {
 pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
     let matcher = RegexMatcher::new(pattern)?;
     let mut out: Vec<GrepItem> = Vec::new();
-    for entry in WalkBuilder::new(root).hidden(false).build().flatten() {
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build()
+        .flatten()
+    {
         let Some(ft) = entry.file_type() else { continue };
         if !ft.is_file() {
             continue;
