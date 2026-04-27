@@ -92,6 +92,23 @@ impl Language {
             _ => None,
         }
     }
+
+    /// Single-line comment prefix for this language, or `None` for languages
+    /// where line comments aren't a fit (HTML/Markdown use block syntax;
+    /// JSON has no comments).
+    pub fn line_comment(&self) -> Option<&'static str> {
+        match self {
+            Language::Rust
+            | Language::JavaScript
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::Go
+            | Language::Css
+            | Language::Hcl => Some("//"),
+            Language::Python | Language::Bash | Language::Toml => Some("#"),
+            Language::Markdown | Language::Html | Language::Json => None,
+        }
+    }
 }
 
 /// A single highlight span: a byte range in the source plus a scope index

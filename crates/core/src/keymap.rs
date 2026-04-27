@@ -94,6 +94,10 @@ pub struct NormalKeyState {
 }
 
 impl NormalKeyState {
+    /// True iff a `g` prefix has been consumed and we're awaiting its second char.
+    pub fn awaiting_g(&self) -> bool {
+        self.prefix == Some('g')
+    }
     fn count(&self) -> usize {
         self.count_buf.parse::<usize>().ok().unwrap_or(0).max(0)
     }
@@ -186,6 +190,15 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
                 state.op = Some(PendingOp::ToUpper);
                 return Action::Pending;
             }
+            'c' => {
+                if state.op.is_some() {
+                    state.reset();
+                    return Action::Unhandled;
+                }
+                state.prefix = None;
+                state.op = Some(PendingOp::ToggleComment);
+                return Action::Pending;
+            }
             _ => { state.reset(); return Action::Unhandled; }
         }
     }
@@ -237,6 +250,7 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
             | (PendingOp::Yank, 'y')
             | (PendingOp::ShiftLeft, '<')
             | (PendingOp::ShiftRight, '>')
+            | (PendingOp::ToggleComment, 'c')
         );
         if doubled {
             let n = state.effective_count();

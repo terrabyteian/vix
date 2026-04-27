@@ -34,4 +34,5 @@ pub enum PendingOp {
     ToLower,
     ToUpper,
     SwapCase,
+    ToggleComment,
 }

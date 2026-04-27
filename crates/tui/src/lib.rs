@@ -2546,6 +2546,10 @@ impl Editor {
                 self.indent_range(range, false);
                 false
             }
+            PendingOp::ToggleComment => {
+                self.toggle_comment_range(range);
+                false
+            }
             _ => {
                 self.msg = format!("{op:?} not yet implemented");
                 false
@@ -2593,6 +2597,83 @@ impl Editor {
                 }
             }
         }
+        self.sel = Selection::at(self.buffer.line_to_char(first_line)).clamped(&self.buffer);
+        self.sel = apply_motion(&self.buffer, self.sel, Motion::LineFirstNonBlank, 1);
+        tx.sel_after = Some(self.sel);
+        self.history.commit(tx);
+    }
+
+    /// Toggle line comments across the lines touched by `range`. Comment
+    /// state is determined by the non-blank lines: if every non-blank line
+    /// already starts with the language's line-comment prefix, uncomment;
+    /// otherwise comment by inserting at the minimum indent column.
+    fn toggle_comment_range(&mut self, range: std::ops::Range<usize>) {
+        let Some(prefix) = self.syntax.as_ref().and_then(|s| s.language().line_comment()) else {
+            self.msg = "No line comment for this language".into();
+            return;
+        };
+        let (first_line, _) = self.buffer.char_to_line_col(range.start);
+        let (mut last_line, _) = self.buffer.char_to_line_col(range.end.saturating_sub(1));
+        if range.end == 0 { last_line = first_line; }
+
+        let line_text = |buf: &Buffer, line: usize| -> String {
+            let raw: String = buf.rope().line(line).chars().collect();
+            raw.trim_end_matches('\n').to_string()
+        };
+
+        let mut all_commented = true;
+        let mut min_indent = usize::MAX;
+        let mut any_non_blank = false;
+        for line in first_line..=last_line {
+            let text = line_text(&self.buffer, line);
+            let indent = text.chars().take_while(|c| c.is_whitespace()).count();
+            if indent == text.chars().count() { continue; }
+            any_non_blank = true;
+            if indent < min_indent { min_indent = indent; }
+            let after_indent: String = text.chars().skip(indent).collect();
+            if !after_indent.starts_with(prefix) { all_commented = false; }
+        }
+        if !any_non_blank { return; }
+        if min_indent == usize::MAX { min_indent = 0; }
+
+        let sel_before = self.sel;
+        let mut tx = Transaction::new();
+        tx.sel_before = Some(sel_before);
+
+        if all_commented {
+            let prefix_chars = prefix.chars().count();
+            for line in (first_line..=last_line).rev() {
+                let text = line_text(&self.buffer, line);
+                let indent = text.chars().take_while(|c| c.is_whitespace()).count();
+                if indent == text.chars().count() { continue; }
+                let after_indent: String = text.chars().skip(indent).collect();
+                if !after_indent.starts_with(prefix) { continue; }
+                let line_start = self.buffer.line_to_char(line);
+                let remove_start = line_start + indent;
+                let trailing_space =
+                    if after_indent.chars().nth(prefix_chars) == Some(' ') { 1 } else { 0 };
+                let remove_count = prefix_chars + trailing_space;
+                let removed: String = self
+                    .buffer
+                    .rope()
+                    .slice(remove_start..(remove_start + remove_count))
+                    .to_string();
+                self.buffer.remove_range(remove_start..(remove_start + remove_count));
+                tx.push(Change::Delete { at: remove_start, removed });
+            }
+        } else {
+            let to_insert = format!("{} ", prefix);
+            for line in (first_line..=last_line).rev() {
+                let text = line_text(&self.buffer, line);
+                let indent = text.chars().take_while(|c| c.is_whitespace()).count();
+                if indent == text.chars().count() { continue; }
+                let line_start = self.buffer.line_to_char(line);
+                let insert_at = line_start + min_indent;
+                self.buffer.insert_str(insert_at, &to_insert);
+                tx.push(Change::Insert { at: insert_at, text: to_insert.clone() });
+            }
+        }
+
         self.sel = Selection::at(self.buffer.line_to_char(first_line)).clamped(&self.buffer);
         self.sel = apply_motion(&self.buffer, self.sel, Motion::LineFirstNonBlank, 1);
         tx.sel_after = Some(self.sel);
@@ -2989,6 +3070,19 @@ impl Editor {
                     }
                     if c == 'i' { self.visual_object_kind = Some(TextObjectKind::Inner); return; }
                     if c == 'a' { self.visual_object_kind = Some(TextObjectKind::Around); return; }
+                    // `gc`: toggle line comments on the visual selection. The
+                    // first `g` keystroke routes through handle_normal_char and
+                    // sets keys.prefix; we intercept the follow-up `c` here so
+                    // it fires on the selection rather than waiting for a motion.
+                    if self.keys.awaiting_g() && c == 'c' {
+                        let range = self.visual_range();
+                        let linewise = self.mode == Mode::VisualLine;
+                        self.keys = NormalKeyState::default();
+                        self.apply_operator_with_kind(PendingOp::ToggleComment, range, linewise);
+                        self.mode = Mode::Normal;
+                        self.sel.anchor = self.sel.head;
+                        return;
+                    }
                     // Operator on selection: apply immediately, leave Visual.
                     let op = match c {
                         'd' | 'x' => Some(PendingOp::Delete),
