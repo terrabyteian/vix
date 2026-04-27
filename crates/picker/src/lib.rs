@@ -3,10 +3,11 @@
 //! scanning and nucleo-backed scoring.
 
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
 
 use grep_regex::RegexMatcher;
 use grep_searcher::{sinks::UTF8, Searcher};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
     Config, Matcher,
@@ -59,39 +60,68 @@ pub fn scan_files(root: &Path) -> Vec<FileItem> {
 }
 
 /// Recursively grep `root` for `pattern`. Returns per-line matches.
+///
+/// Uses `WalkParallel` and one `Searcher` per worker thread, the same
+/// pattern ripgrep itself uses. Worker threads send hits over an mpsc
+/// channel; the calling thread drains it once the walk completes.
 pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
-    let matcher = RegexMatcher::new(pattern)?;
-    let mut out: Vec<GrepItem> = Vec::new();
-    for entry in WalkBuilder::new(root)
+    let matcher = Arc::new(RegexMatcher::new(pattern)?);
+    let root: Arc<Path> = Arc::from(root.to_path_buf().into_boxed_path());
+    let (tx, rx) = mpsc::channel::<GrepItem>();
+
+    let walker = WalkBuilder::new(&*root)
         .hidden(false)
         .filter_entry(|e| e.file_name() != ".git")
-        .build()
-        .flatten()
-    {
-        let Some(ft) = entry.file_type() else { continue };
-        if !ft.is_file() {
-            continue;
-        }
-        let path = entry.path().to_path_buf();
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        .build_parallel();
+
+    walker.run(|| {
+        // Per-worker state. `Searcher` keeps internal buffers we reuse
+        // across files; the matcher is shared via Arc; the sender is cloned
+        // so each worker has its own handle (the original is dropped after
+        // `run` returns, which lets the receiver loop terminate).
+        let tx = tx.clone();
+        let matcher = Arc::clone(&matcher);
+        let root = Arc::clone(&root);
         let mut searcher = Searcher::new();
-        let _ = searcher.search_path(
-            &matcher,
-            &path,
-            UTF8(|line_no, text| {
-                let text = text.trim_end_matches('\n').to_string();
-                let display = format!("{}:{}: {}", rel.display(), line_no, text);
-                out.push(GrepItem {
-                    path: path.clone(),
-                    line: line_no,
-                    text,
-                    haystack: Utf32String::from(display),
-                });
-                Ok(true)
-            }),
-        );
-    }
-    Ok(out)
+        Box::new(move |result| {
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            let Some(ft) = entry.file_type() else { return WalkState::Continue };
+            if !ft.is_file() {
+                return WalkState::Continue;
+            }
+            let path = entry.path().to_path_buf();
+            let rel = path.strip_prefix(&*root).unwrap_or(&path).to_path_buf();
+            let _ = searcher.search_path(
+                &*matcher,
+                &path,
+                UTF8(|line_no, text| {
+                    let text = text.trim_end_matches('\n').to_string();
+                    let display = format!("{}:{}: {}", rel.display(), line_no, text);
+                    // Receiver hung up = caller dropped the result. Nothing
+                    // useful left to do; signal the searcher to stop this file.
+                    if tx
+                        .send(GrepItem {
+                            path: path.clone(),
+                            line: line_no,
+                            text,
+                            haystack: Utf32String::from(display),
+                        })
+                        .is_err()
+                    {
+                        return Ok(false);
+                    }
+                    Ok(true)
+                }),
+            );
+            WalkState::Continue
+        })
+    });
+
+    drop(tx);
+    Ok(rx.iter().collect())
 }
 
 /// Score a corpus against `query` and return the top-N by score, descending.
@@ -155,5 +185,44 @@ mod tests {
         let hits = score(&items, "", 10);
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].0, "a");
+    }
+
+    /// Lay out a small tree under a unique temp dir, run `grep`, and confirm
+    /// matches across multiple files come back. Exercises the parallel walker:
+    /// without per-worker `Searcher`s and channel plumbing this would either
+    /// fail to compile or race on shared state.
+    #[test]
+    fn grep_finds_matches_across_multiple_files() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-grep-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), "alpha\nbeta NEEDLE here\ngamma\n").unwrap();
+        fs::write(dir.join("b.txt"), "no match here\n").unwrap();
+        fs::write(dir.join("sub/c.txt"), "first NEEDLE\nsecond NEEDLE\n").unwrap();
+
+        let hits = grep(&dir, "NEEDLE").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(hits.len(), 3, "expected 3 hits across 2 files; got {hits:?}");
+        let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+        assert!(texts.contains(&"beta NEEDLE here"));
+        assert!(texts.contains(&"first NEEDLE"));
+        assert!(texts.contains(&"second NEEDLE"));
+    }
+
+    #[test]
+    fn grep_skips_dot_git() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-grep-git-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git/HEAD"), "MARKER\n").unwrap();
+        fs::write(dir.join("real.txt"), "MARKER\n").unwrap();
+
+        let hits = grep(&dir, "MARKER").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(hits.len(), 1, "expected to skip .git; got {hits:?}");
+        assert!(hits[0].path.ends_with("real.txt"));
     }
 }
