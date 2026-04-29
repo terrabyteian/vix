@@ -31,8 +31,7 @@ fn main() -> Result<()> {
         Some(p) => {
             let path = Path::new(&p);
             if path.is_dir() {
-                env::set_current_dir(path)
-                    .with_context(|| format!("failed to chdir to {p}"))?;
+                env::set_current_dir(path).with_context(|| format!("failed to chdir to {p}"))?;
                 (Buffer::empty(), true)
             } else {
                 (

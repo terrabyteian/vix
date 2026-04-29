@@ -36,11 +36,17 @@ pub fn find_forward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, usi
         // Search from `col` on the first line, from 0 on subsequent lines.
         let search_from_bytes = if line == start_line {
             // Convert start_col (char) to byte offset within line_text.
-            line_text.char_indices().nth(start_col).map(|(b, _)| b).unwrap_or(line_text.len())
+            line_text
+                .char_indices()
+                .nth(start_col)
+                .map(|(b, _)| b)
+                .unwrap_or(line_text.len())
         } else {
             0
         };
-        if search_from_bytes > line_text.len() { continue; }
+        if search_from_bytes > line_text.len() {
+            continue;
+        }
         if let Some(m) = re.find(&line_text[search_from_bytes..]) {
             let line_start = buf.line_to_char(line);
             let match_byte = search_from_bytes + m.start();
@@ -60,15 +66,23 @@ pub fn find_backward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, us
     for line in (0..=start_line).rev() {
         let line_text: String = buf.rope().line(line).chars().collect();
         let max_byte = if line == start_line {
-            line_text.char_indices().nth(start_col).map(|(b, _)| b).unwrap_or(line_text.len())
+            line_text
+                .char_indices()
+                .nth(start_col)
+                .map(|(b, _)| b)
+                .unwrap_or(line_text.len())
         } else {
             line_text.len()
         };
-        if max_byte == 0 { continue; }
+        if max_byte == 0 {
+            continue;
+        }
         // Find the last match that ends <= max_byte.
         let haystack = &line_text[..max_byte];
         let mut last = None;
-        for m in re.find_iter(haystack) { last = Some(m); }
+        for m in re.find_iter(haystack) {
+            last = Some(m);
+        }
         if let Some(m) = last {
             let line_start = buf.line_to_char(line);
             let start_char = line_start + byte_to_char_in(&line_text, m.start());
@@ -80,9 +94,12 @@ pub fn find_backward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, us
 }
 
 /// Collect all matches within a range of lines (for highlighting the viewport).
-pub fn find_all_in_lines(buf: &Buffer, re: &Regex, start_line: usize, end_line: usize)
-    -> Vec<(usize, usize)>
-{
+pub fn find_all_in_lines(
+    buf: &Buffer,
+    re: &Regex,
+    start_line: usize,
+    end_line: usize,
+) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let last = end_line.min(buf.len_lines());
     for line in start_line..last {

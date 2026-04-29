@@ -91,7 +91,11 @@ mod tests {
     use super::*;
 
     fn entry(line: usize) -> JumpEntry {
-        JumpEntry { path: Some(PathBuf::from("/t")), line, col: 0 }
+        JumpEntry {
+            path: Some(PathBuf::from("/t")),
+            line,
+            col: 0,
+        }
     }
 
     #[test]

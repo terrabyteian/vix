@@ -102,7 +102,10 @@ $BIN tests/fixtures/project/src/main.rs
 
 - [ ] `:Files` (or whatever the bound key is) opens the file picker. Type a
       query — results filter incrementally with no visible lag.
-- [ ] `<CR>` opens the selected file; `<Esc>` cancels.
+- [ ] `<CR>` switches the picker from input mode to browse mode; `j` / `k`
+      move the selection there; a second `<CR>` opens the selected file.
+- [ ] `<Esc>` in browse mode returns to input mode; `<Esc>` in input mode
+      clears the query first, then closes.
 - [ ] `:Buffers` lists the active + parked buffers; selecting one switches to
       it without disturbing the unnamed register.
 - [ ] `:Grep foo` opens grep results; entries show `file:line` and a snippet.

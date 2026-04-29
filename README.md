@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh 
 Pin a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | VIX_VERSION=v0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | VIX_VERSION=v0.2.0 sh
 ```
 
 **Build from source** (requires Rust):
@@ -77,12 +77,15 @@ Inside a picker:
 
 | Key | Action |
 |---|---|
-| Type | Filter |
+| Type | Filter in input mode |
 | `↑` / `↓` / mouse scroll | Move selection |
-| `<Enter>` | Open the selected entry |
+| `<Enter>` | Switch from input mode to browse mode |
+| `j` / `k` | Move selection in browse mode |
+| `<Enter>` in browse mode | Open the selected entry |
 | First click on a row | Focus the row |
 | Second click on the focused row | Open it |
-| `<Esc>` | First clears the query, then closes |
+| `<Esc>` in browse mode | Return to input mode |
+| `<Esc>` in input mode | First clears the query, then closes |
 
 ## Buffers
 

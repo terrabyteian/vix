@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | sh
 #
 # Specific version:
-#   curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.1.0 sh
+#   curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.2.0 sh
 set -e
 
 REPO="terrabyteian/vix"

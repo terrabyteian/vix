@@ -18,18 +18,18 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc as smpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use lsp_types::{
-    CodeActionContext, CodeActionParams, CompletionParams, Diagnostic,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams,
-    PartialResultParams, Position, PublishDiagnosticsParams, Range, RenameParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+    CodeActionContext, CodeActionParams, CompletionParams, Diagnostic, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    FormattingOptions, GotoDefinitionParams, HoverParams, PartialResultParams, Position,
+    PublishDiagnosticsParams, Range, RenameParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
+    VersionedTextDocumentIdentifier, WorkDoneProgressParams,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -149,9 +149,7 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) =
-                (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-            {
+            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
                 out.push(h * 16 + l);
                 i += 3;
                 continue;
@@ -209,8 +207,15 @@ pub enum ServerEvent {
 
 /// Commands the I/O thread services.
 enum OutMsg {
-    Notify { method: &'static str, params: Value },
-    Request { id: i64, method: &'static str, params: Value },
+    Notify {
+        method: &'static str,
+        params: Value,
+    },
+    Request {
+        id: i64,
+        method: &'static str,
+        params: Value,
+    },
     Shutdown,
 }
 
@@ -320,7 +325,11 @@ impl LspClient {
                 Err(_) => return None,
             };
             match ev {
-                ServerEvent::Response { id: rid, result, error } if rid == id => {
+                ServerEvent::Response {
+                    id: rid,
+                    result,
+                    error,
+                } if rid == id => {
                     return Some((result, error));
                 }
                 other => {
@@ -427,12 +436,7 @@ impl LspClient {
         )
     }
 
-    pub fn code_action(
-        &self,
-        uri: Uri,
-        range: Range,
-        diagnostics: Vec<Diagnostic>,
-    ) -> RequestId {
+    pub fn code_action(&self, uri: Uri, range: Range, diagnostics: Vec<Diagnostic>) -> RequestId {
         self.request(
             "textDocument/codeAction",
             CodeActionParams {
@@ -735,9 +739,7 @@ async fn read_loop(
                 let id_num = id_val.as_i64();
                 if Some(init_id) == id_num {
                     if let Some(tx) = init_done_tx.take() {
-                        let err = msg
-                            .get("error")
-                            .map(|e| e.to_string());
+                        let err = msg.get("error").map(|e| e.to_string());
                         match err {
                             Some(e) => {
                                 let _ = tx.send(Err(anyhow!("initialize error: {e}"))).await;

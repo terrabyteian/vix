@@ -58,12 +58,12 @@ fn ctrl_i_is_jump_forward_fallback() {
 #[test]
 fn gg_pushes_a_jump() {
     let mut h = Harness::with_text(PARA);
-    h.keys("G");      // push (0, 0); land at (6, 0)
-    h.keys("3G");     // push (6, 0); land somewhere on line 2
+    h.keys("G"); // push (0, 0); land at (6, 0)
+    h.keys("3G"); // push (6, 0); land somewhere on line 2
     let mid = h.cursor();
-    h.keys("gg");     // push mid; land at (0, 0)
+    h.keys("gg"); // push mid; land at (0, 0)
     h.assert_cursor(0, 0);
-    h.keys("go");     // back to mid
+    h.keys("go"); // back to mid
     h.assert_cursor(mid.0, mid.1);
 }
 

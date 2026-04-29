@@ -60,18 +60,18 @@ pub enum Action {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchDirection {
-    Forward,   // /, n
-    Backward,  // ?, N
+    Forward,  // /, n
+    Backward, // ?, N
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertPos {
-    AtCursor,        // i
-    BeforeLine,      // I (first non-blank)
-    AfterCursor,     // a
-    AfterLine,       // A (line end)
-    OpenBelow,       // o
-    OpenAbove,       // O
+    AtCursor,    // i
+    BeforeLine,  // I (first non-blank)
+    AfterCursor, // a
+    AfterLine,   // A (line end)
+    OpenBelow,   // o
+    OpenAbove,   // O
 }
 
 /// Accumulates keypresses in Normal mode. Caller resets (`take`) after each
@@ -155,7 +155,7 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
 
     // Handle `g` prefix: next char must be `g` for `gg`, `u`/`U` for case ops.
     if let Some('g') = state.prefix {
-        let n = state.count();  // raw, not effective — 0 means "first line"
+        let n = state.count(); // raw, not effective — 0 means "first line"
         match c {
             'g' => {
                 let pending_op = state.op;
@@ -165,10 +165,22 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
                     None => Action::Move(Motion::BufferStart, n),
                 };
             }
-            'd' => { state.reset(); return Action::LspGotoDefinition; }
-            'A' => { state.reset(); return Action::LspCodeAction; }
-            'o' => { state.reset(); return Action::JumpBack; }
-            'i' => { state.reset(); return Action::JumpForward; }
+            'd' => {
+                state.reset();
+                return Action::LspGotoDefinition;
+            }
+            'A' => {
+                state.reset();
+                return Action::LspCodeAction;
+            }
+            'o' => {
+                state.reset();
+                return Action::JumpBack;
+            }
+            'i' => {
+                state.reset();
+                return Action::JumpForward;
+            }
             'u' => {
                 // `gu` is an operator awaiting a motion. If we're already in
                 // operator-pending state (e.g. `dgu...`) cancel — that's not
@@ -199,7 +211,10 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
                 state.op = Some(PendingOp::ToggleComment);
                 return Action::Pending;
             }
-            _ => { state.reset(); return Action::Unhandled; }
+            _ => {
+                state.reset();
+                return Action::Unhandled;
+            }
         }
     }
 
@@ -229,16 +244,34 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
             };
         }
         // `i` or `a` = begin text-object.
-        if c == 'i' { state.text_object_kind = Some(TextObjectKind::Inner); return Action::Pending; }
-        if c == 'a' { state.text_object_kind = Some(TextObjectKind::Around); return Action::Pending; }
+        if c == 'i' {
+            state.text_object_kind = Some(TextObjectKind::Inner);
+            return Action::Pending;
+        }
+        if c == 'a' {
+            state.text_object_kind = Some(TextObjectKind::Around);
+            return Action::Pending;
+        }
 
         // f/F/t/T after operator: set up pending_find; target char comes next.
         // The early `pending_find` branch at the top handles the second key.
         match c {
-            'f' => { state.pending_find = Some((FindDirection::Forward, FindKind::On)); return Action::Pending; }
-            'F' => { state.pending_find = Some((FindDirection::Backward, FindKind::On)); return Action::Pending; }
-            't' => { state.pending_find = Some((FindDirection::Forward, FindKind::Till)); return Action::Pending; }
-            'T' => { state.pending_find = Some((FindDirection::Backward, FindKind::Till)); return Action::Pending; }
+            'f' => {
+                state.pending_find = Some((FindDirection::Forward, FindKind::On));
+                return Action::Pending;
+            }
+            'F' => {
+                state.pending_find = Some((FindDirection::Backward, FindKind::On));
+                return Action::Pending;
+            }
+            't' => {
+                state.pending_find = Some((FindDirection::Forward, FindKind::Till));
+                return Action::Pending;
+            }
+            'T' => {
+                state.pending_find = Some((FindDirection::Backward, FindKind::Till));
+                return Action::Pending;
+            }
             _ => {}
         }
 
@@ -246,11 +279,11 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
         let doubled = matches!(
             (op, c),
             (PendingOp::Delete, 'd')
-            | (PendingOp::Change, 'c')
-            | (PendingOp::Yank, 'y')
-            | (PendingOp::ShiftLeft, '<')
-            | (PendingOp::ShiftRight, '>')
-            | (PendingOp::ToggleComment, 'c')
+                | (PendingOp::Change, 'c')
+                | (PendingOp::Yank, 'y')
+                | (PendingOp::ShiftLeft, '<')
+                | (PendingOp::ShiftRight, '>')
+                | (PendingOp::ToggleComment, 'c')
         );
         if doubled {
             let n = state.effective_count();
@@ -282,78 +315,251 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
 
     match c {
         // Motions
-        'h' => { let n = state.effective_count(); state.reset(); Action::Move(Motion::Left, n) }
-        'l' => { let n = state.effective_count(); state.reset(); Action::Move(Motion::Right, n) }
-        'j' => { let n = state.effective_count(); state.reset(); Action::Move(Motion::Down, n) }
-        'k' => { let n = state.effective_count(); state.reset(); Action::Move(Motion::Up, n) }
-        '0' => { state.reset(); Action::Move(Motion::LineStart, 1) }
-        '^' => { state.reset(); Action::Move(Motion::LineFirstNonBlank, 1) }
-        '$' => { state.reset(); Action::Move(Motion::LineEnd, 1) }
-        'w' => { let n = state.effective_count(); state.reset(); Action::Move(Motion::WordForward, n) }
-        'b' => { let n = state.effective_count(); state.reset(); Action::Move(Motion::WordBackward, n) }
-        'e' => { let n = state.effective_count(); state.reset(); Action::Move(Motion::WordEnd, n) }
-        '%' => { state.reset(); Action::Move(Motion::MatchBracket, 1) }
+        'h' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Move(Motion::Left, n)
+        }
+        'l' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Move(Motion::Right, n)
+        }
+        'j' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Move(Motion::Down, n)
+        }
+        'k' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Move(Motion::Up, n)
+        }
+        '0' => {
+            state.reset();
+            Action::Move(Motion::LineStart, 1)
+        }
+        '^' => {
+            state.reset();
+            Action::Move(Motion::LineFirstNonBlank, 1)
+        }
+        '$' => {
+            state.reset();
+            Action::Move(Motion::LineEnd, 1)
+        }
+        'w' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Move(Motion::WordForward, n)
+        }
+        'b' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Move(Motion::WordBackward, n)
+        }
+        'e' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Move(Motion::WordEnd, n)
+        }
+        '%' => {
+            state.reset();
+            Action::Move(Motion::MatchBracket, 1)
+        }
         'G' => {
             let n = state.count();
             state.reset();
             Action::Move(Motion::BufferEnd, n)
         }
-        'g' => { state.prefix = Some('g'); Action::Pending }
+        'g' => {
+            state.prefix = Some('g');
+            Action::Pending
+        }
 
         // Mode switches
-        'i' => { state.reset(); Action::EnterInsert(InsertPos::AtCursor) }
-        'I' => { state.reset(); Action::EnterInsert(InsertPos::BeforeLine) }
-        'a' => { state.reset(); Action::EnterInsert(InsertPos::AfterCursor) }
-        'A' => { state.reset(); Action::EnterInsert(InsertPos::AfterLine) }
-        'o' => { state.reset(); Action::EnterInsert(InsertPos::OpenBelow) }
-        'O' => { state.reset(); Action::EnterInsert(InsertPos::OpenAbove) }
-        'v' => { state.reset(); Action::EnterMode(Mode::Visual) }
-        'V' => { state.reset(); Action::EnterMode(Mode::VisualLine) }
-        ':' => { state.reset(); Action::EnterMode(Mode::Command) }
-        '/' => { state.reset(); Action::EnterSearch(SearchDirection::Forward) }
-        '?' => { state.reset(); Action::EnterSearch(SearchDirection::Backward) }
-        'n' => { state.reset(); Action::SearchRepeat(SearchDirection::Forward) }
-        'N' => { state.reset(); Action::SearchRepeat(SearchDirection::Backward) }
-        '*' => { state.reset(); Action::WordSearchUnder(SearchDirection::Forward) }
-        '#' => { state.reset(); Action::WordSearchUnder(SearchDirection::Backward) }
+        'i' => {
+            state.reset();
+            Action::EnterInsert(InsertPos::AtCursor)
+        }
+        'I' => {
+            state.reset();
+            Action::EnterInsert(InsertPos::BeforeLine)
+        }
+        'a' => {
+            state.reset();
+            Action::EnterInsert(InsertPos::AfterCursor)
+        }
+        'A' => {
+            state.reset();
+            Action::EnterInsert(InsertPos::AfterLine)
+        }
+        'o' => {
+            state.reset();
+            Action::EnterInsert(InsertPos::OpenBelow)
+        }
+        'O' => {
+            state.reset();
+            Action::EnterInsert(InsertPos::OpenAbove)
+        }
+        'v' => {
+            state.reset();
+            Action::EnterMode(Mode::Visual)
+        }
+        'V' => {
+            state.reset();
+            Action::EnterMode(Mode::VisualLine)
+        }
+        ':' => {
+            state.reset();
+            Action::EnterMode(Mode::Command)
+        }
+        '/' => {
+            state.reset();
+            Action::EnterSearch(SearchDirection::Forward)
+        }
+        '?' => {
+            state.reset();
+            Action::EnterSearch(SearchDirection::Backward)
+        }
+        'n' => {
+            state.reset();
+            Action::SearchRepeat(SearchDirection::Forward)
+        }
+        'N' => {
+            state.reset();
+            Action::SearchRepeat(SearchDirection::Backward)
+        }
+        '*' => {
+            state.reset();
+            Action::WordSearchUnder(SearchDirection::Forward)
+        }
+        '#' => {
+            state.reset();
+            Action::WordSearchUnder(SearchDirection::Backward)
+        }
 
         // Char-find motions: next keystroke is the target.
-        'f' => { state.pending_find = Some((FindDirection::Forward, FindKind::On)); Action::Pending }
-        'F' => { state.pending_find = Some((FindDirection::Backward, FindKind::On)); Action::Pending }
-        't' => { state.pending_find = Some((FindDirection::Forward, FindKind::Till)); Action::Pending }
-        'T' => { state.pending_find = Some((FindDirection::Backward, FindKind::Till)); Action::Pending }
-        ';' => { let n = state.effective_count(); state.reset(); Action::RepeatFind { reverse: false, count: n } }
-        ',' => { let n = state.effective_count(); state.reset(); Action::RepeatFind { reverse: true, count: n } }
+        'f' => {
+            state.pending_find = Some((FindDirection::Forward, FindKind::On));
+            Action::Pending
+        }
+        'F' => {
+            state.pending_find = Some((FindDirection::Backward, FindKind::On));
+            Action::Pending
+        }
+        't' => {
+            state.pending_find = Some((FindDirection::Forward, FindKind::Till));
+            Action::Pending
+        }
+        'T' => {
+            state.pending_find = Some((FindDirection::Backward, FindKind::Till));
+            Action::Pending
+        }
+        ';' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::RepeatFind {
+                reverse: false,
+                count: n,
+            }
+        }
+        ',' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::RepeatFind {
+                reverse: true,
+                count: n,
+            }
+        }
 
         // Operators — begin pending.
-        'd' => { state.op = Some(PendingOp::Delete); Action::Pending }
-        'c' => { state.op = Some(PendingOp::Change); Action::Pending }
-        'y' => { state.op = Some(PendingOp::Yank); Action::Pending }
-        '<' => { state.op = Some(PendingOp::ShiftLeft); Action::Pending }
-        '>' => { state.op = Some(PendingOp::ShiftRight); Action::Pending }
+        'd' => {
+            state.op = Some(PendingOp::Delete);
+            Action::Pending
+        }
+        'c' => {
+            state.op = Some(PendingOp::Change);
+            Action::Pending
+        }
+        'y' => {
+            state.op = Some(PendingOp::Yank);
+            Action::Pending
+        }
+        '<' => {
+            state.op = Some(PendingOp::ShiftLeft);
+            Action::Pending
+        }
+        '>' => {
+            state.op = Some(PendingOp::ShiftRight);
+            Action::Pending
+        }
 
         // Undo / redo / repeat
-        'u' => { state.reset(); Action::Undo }
-        '.' => { state.reset(); Action::RepeatLastChange }
+        'u' => {
+            state.reset();
+            Action::Undo
+        }
+        '.' => {
+            state.reset();
+            Action::RepeatLastChange
+        }
 
         // `~` toggles case of the char under cursor and advances. Emit as
         // a swap-case operator over a 1-char range: model it as Operate with
         // a Right motion of 0 — actually simplest is a dedicated action.
-        '~' => { let n = state.effective_count(); state.reset(); Action::ToggleCase(n) }
+        '~' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::ToggleCase(n)
+        }
 
         // Paste
-        'p' => { let n = state.effective_count(); state.reset(); Action::Paste { after: true, count: n } }
-        'P' => { let n = state.effective_count(); state.reset(); Action::Paste { after: false, count: n } }
+        'p' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Paste {
+                after: true,
+                count: n,
+            }
+        }
+        'P' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::Paste {
+                after: false,
+                count: n,
+            }
+        }
 
         // Delete char under / before cursor. Vim's `x`/`X` are like `dl`/`dh`
         // but include the last char on a line (which Motion::Right won't cross).
-        'x' => { let n = state.effective_count(); state.reset(); Action::DeleteChars { forward: true, count: n } }
-        'X' => { let n = state.effective_count(); state.reset(); Action::DeleteChars { forward: false, count: n } }
+        'x' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::DeleteChars {
+                forward: true,
+                count: n,
+            }
+        }
+        'X' => {
+            let n = state.effective_count();
+            state.reset();
+            Action::DeleteChars {
+                forward: false,
+                count: n,
+            }
+        }
 
         // LSP
-        'K' => { state.reset(); Action::LspHover }
+        'K' => {
+            state.reset();
+            Action::LspHover
+        }
 
-        _ => { state.reset(); Action::Unhandled }
+        _ => {
+            state.reset();
+            Action::Unhandled
+        }
     }
 }
 
@@ -381,28 +587,40 @@ mod tests {
     #[test]
     fn single_motion() {
         let mut s = NormalKeyState::default();
-        assert_eq!(handle_normal_char(&mut s, 'l'), Action::Move(Motion::Right, 1));
+        assert_eq!(
+            handle_normal_char(&mut s, 'l'),
+            Action::Move(Motion::Right, 1)
+        );
     }
 
     #[test]
     fn count_prefix() {
         let mut s = NormalKeyState::default();
         assert_eq!(handle_normal_char(&mut s, '3'), Action::Pending);
-        assert_eq!(handle_normal_char(&mut s, 'w'), Action::Move(Motion::WordForward, 3));
+        assert_eq!(
+            handle_normal_char(&mut s, 'w'),
+            Action::Move(Motion::WordForward, 3)
+        );
     }
 
     #[test]
     fn operator_then_motion() {
         let mut s = NormalKeyState::default();
         assert_eq!(handle_normal_char(&mut s, 'd'), Action::Pending);
-        assert_eq!(handle_normal_char(&mut s, 'w'), Action::Operate(PendingOp::Delete, Motion::WordForward, 1));
+        assert_eq!(
+            handle_normal_char(&mut s, 'w'),
+            Action::Operate(PendingOp::Delete, Motion::WordForward, 1)
+        );
     }
 
     #[test]
     fn doubled_operator_is_linewise() {
         let mut s = NormalKeyState::default();
         assert_eq!(handle_normal_char(&mut s, 'd'), Action::Pending);
-        assert_eq!(handle_normal_char(&mut s, 'd'), Action::OperateLine(PendingOp::Delete, 1));
+        assert_eq!(
+            handle_normal_char(&mut s, 'd'),
+            Action::OperateLine(PendingOp::Delete, 1)
+        );
     }
 
     #[test]
@@ -412,13 +630,19 @@ mod tests {
         assert_eq!(handle_normal_char(&mut s, '2'), Action::Pending);
         assert_eq!(handle_normal_char(&mut s, 'd'), Action::Pending);
         assert_eq!(handle_normal_char(&mut s, '3'), Action::Pending);
-        assert_eq!(handle_normal_char(&mut s, 'w'), Action::Operate(PendingOp::Delete, Motion::WordForward, 6));
+        assert_eq!(
+            handle_normal_char(&mut s, 'w'),
+            Action::Operate(PendingOp::Delete, Motion::WordForward, 6)
+        );
     }
 
     #[test]
     fn leading_zero_is_line_start() {
         let mut s = NormalKeyState::default();
-        assert_eq!(handle_normal_char(&mut s, '0'), Action::Move(Motion::LineStart, 1));
+        assert_eq!(
+            handle_normal_char(&mut s, '0'),
+            Action::Move(Motion::LineStart, 1)
+        );
     }
 
     #[test]
@@ -426,7 +650,10 @@ mod tests {
         let mut s = NormalKeyState::default();
         assert_eq!(handle_normal_char(&mut s, '1'), Action::Pending);
         assert_eq!(handle_normal_char(&mut s, '0'), Action::Pending);
-        assert_eq!(handle_normal_char(&mut s, 'l'), Action::Move(Motion::Right, 10));
+        assert_eq!(
+            handle_normal_char(&mut s, 'l'),
+            Action::Move(Motion::Right, 10)
+        );
     }
 
     #[test]
@@ -434,13 +661,19 @@ mod tests {
         let mut s = NormalKeyState::default();
         assert_eq!(handle_normal_char(&mut s, 'g'), Action::Pending);
         // count 0 = "first line" default
-        assert_eq!(handle_normal_char(&mut s, 'g'), Action::Move(Motion::BufferStart, 0));
+        assert_eq!(
+            handle_normal_char(&mut s, 'g'),
+            Action::Move(Motion::BufferStart, 0)
+        );
     }
 
     #[test]
     fn line_jump_with_count() {
         let mut s = NormalKeyState::default();
         assert_eq!(handle_normal_char(&mut s, '5'), Action::Pending);
-        assert_eq!(handle_normal_char(&mut s, 'G'), Action::Move(Motion::BufferEnd, 5));
+        assert_eq!(
+            handle_normal_char(&mut s, 'G'),
+            Action::Move(Motion::BufferEnd, 5)
+        );
     }
 }

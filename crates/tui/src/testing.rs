@@ -6,9 +6,7 @@
 //! `<C-x>` map to the obvious `KeyEvent`. Use `<lt>` for a literal `<`.
 
 use crate::Editor;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::path::PathBuf;
 use vix_core::{Buffer, JumpList, Mode, RepeatAction};
@@ -142,7 +140,8 @@ impl Harness {
     /// width. Required before `click(..)` / `scroll_*(..)` because the real
     /// values are normally populated by `render_content`.
     pub fn set_render_geometry(&mut self, content_rect: Rect, gutter_cols: u16) {
-        self.editor.set_render_geometry_for_test(content_rect, gutter_cols);
+        self.editor
+            .set_render_geometry_for_test(content_rect, gutter_cols);
     }
 
     /// Pretend the picker was just rendered with the given overlay rect and

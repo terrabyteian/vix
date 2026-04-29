@@ -23,10 +23,15 @@ use vix_core::{
 
 pub mod help;
 pub mod testing;
-use vix_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents, Location, MarkedString, Uri};
-use vix_lsp::{parse_response, path_to_uri, server_for_path, uri_to_path, LspClient, RequestId, ServerEvent};
-use vix_syntax::{HlSpan, Language, SyntaxState, HIGHLIGHT_NAMES, Symbol};
+use vix_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents, Location,
+    MarkedString, Uri,
+};
+use vix_lsp::{
+    parse_response, path_to_uri, server_for_path, uri_to_path, LspClient, RequestId, ServerEvent,
+};
 use vix_picker::{grep, scan_files, score, GrepItem, Utf32String};
+use vix_syntax::{HlSpan, Language, Symbol, SyntaxState, HIGHLIGHT_NAMES};
 
 /// What action triggered the current Insert session — determines how `.`
 /// will replay it on Esc.
@@ -37,7 +42,10 @@ enum InsertOrigin {
     /// `c<motion>` — replay re-evaluates the motion at the cursor.
     ChangeMotion { motion: Motion, count: usize },
     /// `c<text-object>` — replay re-resolves the text object at the cursor.
-    ChangeObject { object: TextObject, kind: TextObjectKind },
+    ChangeObject {
+        object: TextObject,
+        kind: TextObjectKind,
+    },
     /// `cc` (or `Ncc`) — replay deletes that many lines' content in place.
     ChangeLine { count: usize },
 }
@@ -169,6 +177,7 @@ pub struct Editor {
     /// back into list-item indices. `None` when no picker is up.
     last_picker_rect: Option<Rect>,
     last_picker_scroll: usize,
+    last_picker_list_rows: usize,
     /// Set true after `<Space>` is pressed in Normal mode. The next key
     /// resolves the leader sequence. Cleared on Esc / mode changes / Ctrl-C.
     pending_leader: bool,
@@ -187,7 +196,9 @@ enum PendingRequest {
     /// Completion request. `prefix_start` is the char offset where the
     /// identifier under the cursor began when we sent the request, so we
     /// know what range to replace on accept.
-    Completion { prefix_start: usize },
+    Completion {
+        prefix_start: usize,
+    },
 }
 
 /// A pending completion popup in Insert mode.
@@ -223,6 +234,7 @@ struct LspDocState {
 /// rendering while it's alive; dismissal returns control to Normal mode.
 struct Picker {
     kind: PickerKind,
+    mode: PickerMode,
     query: String,
     /// `(display, value, haystack)` tuples. `value` is the selected payload
     /// (path or grep hit) passed to `on_select`.
@@ -237,6 +249,12 @@ struct Picker {
     /// rescan the tree on every flip. Populated for the unified
     /// Files/Grep picker; left `None` for other picker kinds.
     cached_files: Option<Vec<PickerItem>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PickerMode {
+    Input,
+    Browse,
 }
 
 #[derive(Clone, Debug)]
@@ -261,7 +279,10 @@ struct PickerItem {
 #[derive(Clone, Debug)]
 enum PickerValue {
     File(std::path::PathBuf),
-    GrepHit { path: std::path::PathBuf, line: u64 },
+    GrepHit {
+        path: std::path::PathBuf,
+        line: u64,
+    },
     /// Char offset within the current buffer to jump the cursor to.
     BufferOffset(usize),
     /// Buffer index (0 = active, 1.. = parked) to switch to.
@@ -292,14 +313,135 @@ fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
     let hits: Vec<GrepItem> = grep(cwd, query).unwrap_or_default();
     hits.into_iter()
         .map(|g| {
-            let display = format!("{}:{}: {}", g.path.display(), g.line, g.text);
+            let rel = g.path.strip_prefix(cwd).unwrap_or(&g.path);
+            let display = format!("{}:{}: {}", rel.display(), g.line, g.text);
             PickerItem {
                 display,
-                value: PickerValue::GrepHit { path: g.path, line: g.line },
+                value: PickerValue::GrepHit {
+                    path: g.path,
+                    line: g.line,
+                },
                 haystack: g.haystack,
             }
         })
         .collect()
+}
+
+fn count_chars(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn take_start(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+fn take_end(s: &str, n: usize) -> String {
+    let len = count_chars(s);
+    s.chars().skip(len.saturating_sub(n)).collect()
+}
+
+fn truncate_end(s: &str, width: usize) -> String {
+    let len = count_chars(s);
+    if len <= width {
+        return s.to_string();
+    }
+    if width <= 3 {
+        return take_start(s, width);
+    }
+    format!("{}...", take_start(s, width - 3))
+}
+
+fn fit_path_display(path: &str, width: usize) -> String {
+    if count_chars(path) <= width {
+        return path.to_string();
+    }
+    if width <= 3 {
+        return take_start(path, width);
+    }
+
+    let last_sep = path.rfind(|c| c == '/' || c == '\\');
+    let Some(last_sep) = last_sep else {
+        return format!("...{}", take_end(path, width - 3));
+    };
+    let tail = &path[last_sep + 1..];
+    let tail_len = count_chars(tail);
+    if tail_len + 4 <= width {
+        let first_sep = path.find(|c| c == '/' || c == '\\').unwrap_or(last_sep);
+        let first = &path[..first_sep];
+        let candidate = format!("{first}/.../{tail}");
+        if count_chars(&candidate) <= width {
+            return candidate;
+        }
+        return format!(".../{tail}");
+    }
+    format!("...{}", take_end(path, width - 3))
+}
+
+fn fit_grep_display(display: &str, line: u64, width: usize) -> String {
+    if count_chars(display) <= width {
+        return display.to_string();
+    }
+
+    let marker = format!(":{line}: ");
+    let Some(marker_start) = display.find(&marker) else {
+        return truncate_end(display, width);
+    };
+    let path = &display[..marker_start];
+    let snippet = &display[marker_start + marker.len()..];
+    let marker_width = count_chars(&marker);
+    if width <= marker_width + 3 {
+        return truncate_end(display, width);
+    }
+
+    let snippet_reserve = match width {
+        0..=24 => 0,
+        25..=50 => 8,
+        _ => 16,
+    };
+    let path_budget = width
+        .saturating_sub(marker_width + snippet_reserve)
+        .max(width.saturating_sub(marker_width).min(8));
+    let path_text = fit_path_display(path, path_budget);
+    let prefix = format!("{path_text}{marker}");
+    let prefix_width = count_chars(&prefix);
+    if prefix_width >= width {
+        return truncate_end(&prefix, width);
+    }
+
+    let snippet_width = width - prefix_width;
+    format!("{prefix}{}", truncate_end(snippet, snippet_width))
+}
+
+fn fit_picker_row(item: &PickerItem, width: usize) -> String {
+    match &item.value {
+        PickerValue::File(_) => fit_path_display(&item.display, width),
+        PickerValue::GrepHit { line, .. } => fit_grep_display(&item.display, *line, width),
+        _ => truncate_end(&item.display, width),
+    }
+}
+
+fn wrap_picker_detail(text: &str, width: usize, rows: usize) -> Vec<String> {
+    if rows == 0 || width == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < chars.len() && out.len() < rows {
+        let end = (start + width).min(chars.len());
+        out.push(chars[start..end].iter().collect::<String>());
+        start = end;
+    }
+    if start < chars.len() {
+        if let Some(last) = out.last_mut() {
+            *last = if width <= 3 {
+                take_start(last, width)
+            } else {
+                format!("{}...", take_start(last, width - 3))
+            };
+        }
+    }
+    out
 }
 
 /// Render label for the buffer picker: "[1] path   [+]".
@@ -314,6 +456,15 @@ fn label_for_buffer(buf: &Buffer, idx: usize, active: bool) -> String {
 }
 
 impl Picker {
+    fn move_selection(&mut self, delta: isize) {
+        if delta < 0 {
+            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.selected =
+                (self.selected + delta as usize).min(self.matches.len().saturating_sub(1));
+        }
+    }
+
     /// Re-score items against `self.query`. Caps visible matches at 1000 to
     /// keep the render loop snappy on large repos.
     fn rescore(&mut self) {
@@ -375,6 +526,7 @@ impl Editor {
             last_gutter_cols: 0,
             last_picker_rect: None,
             last_picker_scroll: 0,
+            last_picker_list_rows: 0,
             pending_leader: false,
             discard_active_on_swap: false,
             active_bid: 0,
@@ -433,7 +585,9 @@ impl Editor {
         self.syntax.as_ref().map(|s| s.language())
     }
     pub fn symbol_names(&self) -> Vec<String> {
-        let Some(s) = self.syntax.as_ref() else { return Vec::new() };
+        let Some(s) = self.syntax.as_ref() else {
+            return Vec::new();
+        };
         let src = self.buffer.rope().to_string();
         s.symbols(src.as_bytes())
             .ok()
@@ -444,9 +598,13 @@ impl Editor {
     /// Ensure an LSP server is running for the active buffer's language, and
     /// that the buffer is open on it. Idempotent per (server, path).
     fn ensure_lsp_open(&mut self) {
-        let Some(path) = self.buffer.path() else { return };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
         let path: PathBuf = path.to_path_buf();
-        let Some(config) = server_for_path(&path) else { return };
+        let Some(config) = server_for_path(&path) else {
+            return;
+        };
         // Spawn the server if we haven't already.
         let cmd = config.cmd.clone();
         if self.lsp_failed.contains(&cmd) {
@@ -493,9 +651,13 @@ impl Editor {
     /// counter, send a full `didChange` and bump. Full-text sync is
     /// heavier than incremental but dead-simple; incremental can come later.
     fn sync_lsp_changes(&mut self) {
-        let Some(path) = self.buffer.path() else { return };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
         let path: PathBuf = path.to_path_buf();
-        let Some(doc) = self.lsp_docs.get_mut(&path) else { return };
+        let Some(doc) = self.lsp_docs.get_mut(&path) else {
+            return;
+        };
         let bv = self.buffer.version();
         if doc.last_sent_buffer_version == bv {
             return;
@@ -541,7 +703,10 @@ impl Editor {
                     self.handle_lsp_response(intent, result, error);
                 }
             }
-            ServerEvent::Log { level: _, message: _ } => {
+            ServerEvent::Log {
+                level: _,
+                message: _,
+            } => {
                 // Stash the most recent server log for debugging; drop in msg
                 // only if nothing more useful is present.
             }
@@ -650,7 +815,11 @@ impl Editor {
         };
         // Record the departure even if we're jumping within the same buffer,
         // so `Ctrl-O` returns to the call site after `gd`.
-        let same_buf = self.buffer.path().map(|p| p == path.as_path()).unwrap_or(false);
+        let same_buf = self
+            .buffer
+            .path()
+            .map(|p| p == path.as_path())
+            .unwrap_or(false);
         if same_buf {
             self.push_jump();
         }
@@ -670,7 +839,9 @@ impl Editor {
     fn request_hover(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
-        let Some(path) = self.buffer.path() else { return };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
         let path: PathBuf = path.to_path_buf();
         let Some(doc) = self.lsp_docs.get(&path).cloned() else {
             self.msg = "lsp: no server".into();
@@ -688,7 +859,9 @@ impl Editor {
     fn request_definition(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
-        let Some(path) = self.buffer.path() else { return };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
         let path: PathBuf = path.to_path_buf();
         let Some(doc) = self.lsp_docs.get(&path).cloned() else {
             self.msg = "lsp: no server".into();
@@ -707,7 +880,9 @@ impl Editor {
     fn request_completion(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
-        let Some(path) = self.buffer.path() else { return };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
         let path: PathBuf = path.to_path_buf();
         let Some(doc) = self.lsp_docs.get(&path).cloned() else {
             self.msg = "lsp: no server".into();
@@ -743,7 +918,9 @@ impl Editor {
     /// Rebuild `visible` based on the current prefix (chars between
     /// `prefix_start` and the cursor), case-insensitive prefix match.
     fn refilter_completions(&mut self) {
-        let Some(popup) = self.completion_popup.as_mut() else { return };
+        let Some(popup) = self.completion_popup.as_mut() else {
+            return;
+        };
         if self.sel.head < popup.prefix_start {
             self.completion_popup = None;
             return;
@@ -756,10 +933,7 @@ impl Editor {
         let prefix_lc = prefix.to_lowercase();
         popup.visible.clear();
         for (idx, item) in popup.items.iter().enumerate() {
-            let hay = item
-                .filter_text
-                .as_deref()
-                .unwrap_or(item.label.as_str());
+            let hay = item.filter_text.as_deref().unwrap_or(item.label.as_str());
             if hay.to_lowercase().starts_with(&prefix_lc) {
                 popup.visible.push(idx);
             }
@@ -774,8 +948,12 @@ impl Editor {
     /// Apply the currently-selected completion item: replace the prefix range
     /// with the item's text.
     fn accept_completion(&mut self) {
-        let Some(popup) = self.completion_popup.take() else { return };
-        let Some(&item_idx) = popup.visible.get(popup.selected) else { return };
+        let Some(popup) = self.completion_popup.take() else {
+            return;
+        };
+        let Some(&item_idx) = popup.visible.get(popup.selected) else {
+            return;
+        };
         let item = &popup.items[item_idx];
         let insert_text = item
             .insert_text
@@ -796,8 +974,12 @@ impl Editor {
 
     /// Select the next / previous completion item. Wraps.
     fn move_completion_selection(&mut self, delta: isize) {
-        let Some(popup) = self.completion_popup.as_mut() else { return };
-        if popup.visible.is_empty() { return; }
+        let Some(popup) = self.completion_popup.as_mut() else {
+            return;
+        };
+        if popup.visible.is_empty() {
+            return;
+        }
         let len = popup.visible.len() as isize;
         let cur = popup.selected as isize;
         let new = ((cur + delta) % len + len) % len;
@@ -809,10 +991,18 @@ impl Editor {
     fn run_code_action(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
-        let Some(path) = self.buffer.path() else { self.msg = "no file".into(); return };
+        let Some(path) = self.buffer.path() else {
+            self.msg = "no file".into();
+            return;
+        };
         let path: PathBuf = path.to_path_buf();
-        let Some(doc) = self.lsp_docs.get(&path).cloned() else { self.msg = "lsp: no server".into(); return };
-        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else { return };
+        let Some(doc) = self.lsp_docs.get(&path).cloned() else {
+            self.msg = "lsp: no server".into();
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else {
+            return;
+        };
         let (line, col) = self.buffer.char_to_line_col(self.sel.head);
         // Range: if we're in a Visual selection, use it; otherwise a
         // zero-width range at the cursor. Diagnostics on the cursor's line
@@ -823,13 +1013,25 @@ impl Editor {
                 let (sl, sc) = self.buffer.char_to_line_col(r.start);
                 let (el, ec) = self.buffer.char_to_line_col(r.end);
                 vix_lsp::lsp_types::Range {
-                    start: vix_lsp::lsp_types::Position { line: sl as u32, character: sc as u32 },
-                    end: vix_lsp::lsp_types::Position { line: el as u32, character: ec as u32 },
+                    start: vix_lsp::lsp_types::Position {
+                        line: sl as u32,
+                        character: sc as u32,
+                    },
+                    end: vix_lsp::lsp_types::Position {
+                        line: el as u32,
+                        character: ec as u32,
+                    },
                 }
             }
             _ => vix_lsp::lsp_types::Range {
-                start: vix_lsp::lsp_types::Position { line: line as u32, character: col as u32 },
-                end: vix_lsp::lsp_types::Position { line: line as u32, character: col as u32 },
+                start: vix_lsp::lsp_types::Position {
+                    line: line as u32,
+                    character: col as u32,
+                },
+                end: vix_lsp::lsp_types::Position {
+                    line: line as u32,
+                    character: col as u32,
+                },
             },
         };
         let diags: Vec<_> = self
@@ -849,8 +1051,14 @@ impl Editor {
         let id = client.code_action(doc.uri, range, diags);
         let result = match client.wait_response(id, Duration::from_millis(3000)) {
             Some((res, None)) => res,
-            Some((_, Some(e))) => { self.msg = format!("code action: {e}"); return; }
-            None => { self.msg = "code action: timed out".into(); return; }
+            Some((_, Some(e))) => {
+                self.msg = format!("code action: {e}");
+                return;
+            }
+            None => {
+                self.msg = "code action: timed out".into();
+                return;
+            }
         };
         let Some(result) = result else {
             self.msg = "no code actions".into();
@@ -859,7 +1067,10 @@ impl Editor {
         let actions: Vec<vix_lsp::lsp_types::CodeActionOrCommand> =
             match parse_response(Some(result)) {
                 Ok(Some(a)) => a,
-                _ => { self.msg = "no code actions".into(); return; }
+                _ => {
+                    self.msg = "no code actions".into();
+                    return;
+                }
             };
         if actions.is_empty() {
             self.msg = "no code actions".into();
@@ -882,6 +1093,7 @@ impl Editor {
         self.pending_code_actions = actions;
         let mut p = Picker {
             kind: PickerKind::CodeActions,
+            mode: PickerMode::Input,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -897,7 +1109,9 @@ impl Editor {
     /// its Command (best-effort — we log unknown commands rather than round-
     /// tripping `workspace/executeCommand`).
     fn apply_code_action(&mut self, idx: usize) {
-        let Some(action) = self.pending_code_actions.get(idx).cloned() else { return };
+        let Some(action) = self.pending_code_actions.get(idx).cloned() else {
+            return;
+        };
         match action {
             vix_lsp::lsp_types::CodeActionOrCommand::Command(cmd) => {
                 self.run_lsp_command(cmd);
@@ -919,9 +1133,15 @@ impl Editor {
     /// which we don't currently handle — but the edit part of most actions
     /// is already returned inline in the CodeAction and applied above.
     fn run_lsp_command(&mut self, cmd: vix_lsp::lsp_types::Command) {
-        let Some(path) = self.buffer.path() else { return };
-        let Some(doc) = self.lsp_docs.get(path).cloned() else { return };
-        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else { return };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
+        let Some(doc) = self.lsp_docs.get(path).cloned() else {
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else {
+            return;
+        };
         let _ = client.execute_command(cmd.command, cmd.arguments.unwrap_or_default());
     }
 
@@ -932,27 +1152,51 @@ impl Editor {
     fn run_rename(&mut self, new_name: &str) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
-        let Some(path) = self.buffer.path() else { self.msg = "lsp: no file".into(); return };
+        let Some(path) = self.buffer.path() else {
+            self.msg = "lsp: no file".into();
+            return;
+        };
         let path: PathBuf = path.to_path_buf();
-        let Some(doc) = self.lsp_docs.get(&path).cloned() else { self.msg = "lsp: no server".into(); return };
-        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else { return };
+        let Some(doc) = self.lsp_docs.get(&path).cloned() else {
+            self.msg = "lsp: no server".into();
+            return;
+        };
+        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else {
+            return;
+        };
         let (line, col) = self.buffer.char_to_line_col(self.sel.head);
-        let id = client.rename(doc.uri.clone(), line as u32, col as u32, new_name.to_string());
+        let id = client.rename(
+            doc.uri.clone(),
+            line as u32,
+            col as u32,
+            new_name.to_string(),
+        );
         let result = match client.wait_response(id, Duration::from_millis(5000)) {
             Some((res, None)) => res,
-            Some((_, Some(e))) => { self.msg = format!("rename: {e}"); return; }
-            None => { self.msg = "rename: timed out (server still indexing?)".into(); return; }
+            Some((_, Some(e))) => {
+                self.msg = format!("rename: {e}");
+                return;
+            }
+            None => {
+                self.msg = "rename: timed out (server still indexing?)".into();
+                return;
+            }
         };
         let Some(result) = result else {
             self.msg = "rename: not renamable at this position".into();
             return;
         };
-        let edit: vix_lsp::lsp_types::WorkspaceEdit =
-            match parse_response(Some(result.clone())) {
-                Ok(Some(e)) => e,
-                Ok(None) => { self.msg = "rename: not renamable at this position".into(); return; }
-                Err(e) => { self.msg = format!("rename: bad response: {e}"); return; }
-            };
+        let edit: vix_lsp::lsp_types::WorkspaceEdit = match parse_response(Some(result.clone())) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                self.msg = "rename: not renamable at this position".into();
+                return;
+            }
+            Err(e) => {
+                self.msg = format!("rename: bad response: {e}");
+                return;
+            }
+        };
         self.apply_workspace_edit(edit);
     }
 
@@ -962,7 +1206,8 @@ impl Editor {
     fn apply_workspace_edit(&mut self, edit: vix_lsp::lsp_types::WorkspaceEdit) {
         use vix_lsp::lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf};
 
-        let mut per_file: Vec<(vix_lsp::lsp_types::Uri, Vec<vix_lsp::lsp_types::TextEdit>)> = Vec::new();
+        let mut per_file: Vec<(vix_lsp::lsp_types::Uri, Vec<vix_lsp::lsp_types::TextEdit>)> =
+            Vec::new();
         if let Some(changes) = edit.changes {
             for (uri, edits) in changes {
                 per_file.push((uri, edits));
@@ -1080,10 +1325,16 @@ impl Editor {
     fn format_buffer(&mut self) -> bool {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
-        let Some(path) = self.buffer.path() else { return false };
+        let Some(path) = self.buffer.path() else {
+            return false;
+        };
         let path: PathBuf = path.to_path_buf();
-        let Some(doc) = self.lsp_docs.get(&path).cloned() else { return false };
-        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else { return false };
+        let Some(doc) = self.lsp_docs.get(&path).cloned() else {
+            return false;
+        };
+        let Some(client) = self.lsp_clients.get(&doc.server_cmd) else {
+            return false;
+        };
         let id = client.formatting(doc.uri.clone(), 4, true);
         match client.wait_response(id, Duration::from_millis(1500)) {
             Some((Some(result), None)) => {
@@ -1093,12 +1344,21 @@ impl Editor {
                         true
                     }
                     Ok(None) => false,
-                    Err(e) => { self.msg = format!("lsp format: {e}"); false }
+                    Err(e) => {
+                        self.msg = format!("lsp format: {e}");
+                        false
+                    }
                 }
             }
-            Some((_, Some(err))) => { self.msg = format!("lsp format: {err}"); false }
+            Some((_, Some(err))) => {
+                self.msg = format!("lsp format: {err}");
+                false
+            }
             Some((None, None)) => false,
-            None => { self.msg = "lsp: format timed out".into(); false }
+            None => {
+                self.msg = "lsp: format timed out".into();
+                false
+            }
         }
     }
 
@@ -1106,10 +1366,15 @@ impl Editor {
     fn format_and_save(&mut self) {
         self.format_buffer();
         match self.buffer.save() {
-            Ok(()) => self.msg = format!(
-                "\"{}\" written",
-                self.buffer.path().map(|p| p.display().to_string()).unwrap_or_default()
-            ),
+            Ok(()) => {
+                self.msg = format!(
+                    "\"{}\" written",
+                    self.buffer
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                )
+            }
             Err(e) => self.msg = format!("error: {e}"),
         }
     }
@@ -1124,7 +1389,9 @@ impl Editor {
     /// deliberately do NOT touch `self.last_change`: LSP edits must not
     /// pollute `.` repeat (Vim's rule; see plan doc trap #2).
     pub fn apply_text_edits(&mut self, edits: &[vix_lsp::lsp_types::TextEdit]) {
-        if edits.is_empty() { return; }
+        if edits.is_empty() {
+            return;
+        }
         let sel_before = self.sel;
         let mut tx = Transaction::new();
         tx.sel_before = Some(sel_before);
@@ -1161,6 +1428,7 @@ impl Editor {
         };
         let mut p = Picker {
             kind: initial,
+            mode: PickerMode::Input,
             query: initial_query.to_string(),
             items,
             matches: Vec::new(),
@@ -1177,7 +1445,9 @@ impl Editor {
     /// or by re-running grep (Grep, if query is at least 2 chars).
     fn toggle_picker_mode(&mut self) {
         let (new_kind, query, cached) = {
-            let Some(p) = self.picker.as_mut() else { return };
+            let Some(p) = self.picker.as_mut() else {
+                return;
+            };
             let new_kind = match p.kind {
                 PickerKind::Files => PickerKind::Grep,
                 PickerKind::Grep => PickerKind::Files,
@@ -1200,7 +1470,9 @@ impl Editor {
             },
             _ => return,
         };
-        let Some(p) = self.picker.as_mut() else { return };
+        let Some(p) = self.picker.as_mut() else {
+            return;
+        };
         p.kind = new_kind;
         p.items = new_items;
         if matches!(p.kind, PickerKind::Files) && p.cached_files.is_none() {
@@ -1224,7 +1496,9 @@ impl Editor {
         } else {
             Vec::new()
         };
-        let Some(p) = self.picker.as_mut() else { return };
+        let Some(p) = self.picker.as_mut() else {
+            return;
+        };
         p.items = new_items;
         p.rescore();
     }
@@ -1263,6 +1537,7 @@ impl Editor {
             .collect();
         let mut p = Picker {
             kind: PickerKind::Symbols,
+            mode: PickerMode::Input,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -1295,11 +1570,16 @@ impl Editor {
         }
 
         let post = {
-            let Some(p) = self.picker.as_mut() else { return false };
+            let Some(p) = self.picker.as_mut() else {
+                return false;
+            };
             let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
             match k.code {
                 KeyCode::Esc => {
-                    if is_unified && !p.query.is_empty() {
+                    if p.mode == PickerMode::Browse {
+                        p.mode = PickerMode::Input;
+                        Post::None
+                    } else if is_unified && !p.query.is_empty() {
                         p.query.clear();
                         Post::Refresh
                     } else {
@@ -1314,26 +1594,27 @@ impl Editor {
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(&(idx, _)) = p.matches.get(p.selected) {
+                    if p.mode == PickerMode::Input {
+                        p.mode = PickerMode::Browse;
+                        Post::None
+                    } else if let Some(&(idx, _)) = p.matches.get(p.selected) {
                         Post::Select(p.items[idx].value.clone())
                     } else {
                         Post::Close
                     }
                 }
                 KeyCode::Up => {
-                    if p.selected > 0 {
-                        p.selected -= 1;
-                    }
+                    p.move_selection(-1);
                     Post::None
                 }
                 KeyCode::Down => {
-                    if p.selected + 1 < p.matches.len() {
-                        p.selected += 1;
-                    }
+                    p.move_selection(1);
                     Post::None
                 }
                 KeyCode::Backspace => {
-                    if p.query.pop().is_some() {
+                    if p.mode == PickerMode::Browse {
+                        Post::None
+                    } else if p.query.pop().is_some() {
                         Post::Refresh
                     } else {
                         Post::None
@@ -1341,16 +1622,16 @@ impl Editor {
                 }
                 KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     match c {
-                        'n' | 'j' => {
-                            if p.selected + 1 < p.matches.len() {
-                                p.selected += 1;
-                            }
-                        }
-                        'p' | 'k' => {
-                            if p.selected > 0 {
-                                p.selected -= 1;
-                            }
-                        }
+                        'n' | 'j' => p.move_selection(1),
+                        'p' | 'k' => p.move_selection(-1),
+                        _ => {}
+                    }
+                    Post::None
+                }
+                KeyCode::Char(c) if p.mode == PickerMode::Browse => {
+                    match c {
+                        'j' => p.move_selection(1),
+                        'k' => p.move_selection(-1),
                         _ => {}
                     }
                     Post::None
@@ -1396,7 +1677,9 @@ impl Editor {
     /// or on the header row are ignored.
     fn handle_picker_mouse(&mut self, me: MouseEvent) {
         let selected_value: Option<PickerValue> = {
-            let Some(p) = self.picker.as_mut() else { return };
+            let Some(p) = self.picker.as_mut() else {
+                return;
+            };
             match me.kind {
                 MouseEventKind::ScrollUp => {
                     if p.selected > 0 {
@@ -1411,7 +1694,9 @@ impl Editor {
                     None
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    let Some(rect) = self.last_picker_rect else { return };
+                    let Some(rect) = self.last_picker_rect else {
+                        return;
+                    };
                     if me.column < rect.x
                         || me.row < rect.y
                         || me.column >= rect.x + rect.width
@@ -1425,6 +1710,9 @@ impl Editor {
                         return;
                     }
                     let list_row = (row_in_overlay - 1) as usize;
+                    if list_row >= self.last_picker_list_rows {
+                        return;
+                    }
                     let match_idx = self.last_picker_scroll + list_row;
                     if let Some(&(item_idx, _)) = p.matches.get(match_idx) {
                         // First click on a row just focuses it; a second
@@ -1492,9 +1780,7 @@ impl Editor {
         } else if let Some(t) = help::lookup(topic) {
             (t.slug.to_string(), t.body.to_string())
         } else {
-            self.msg = format!(
-                "no help topic \"{topic}\" — try :help for the index"
-            );
+            self.msg = format!("no help topic \"{topic}\" — try :help for the index");
             return;
         };
         // Synthetic path: brackets keep it visually distinct, `.md` extension
@@ -1516,11 +1802,7 @@ impl Editor {
     fn open_path(&mut self, path: &std::path::Path) {
         // Record departure on any switch / load — but not when the target is
         // already the active buffer.
-        let same_as_active = self
-            .buffer
-            .path()
-            .map(|p| p == path)
-            .unwrap_or(false);
+        let same_as_active = self.buffer.path().map(|p| p == path).unwrap_or(false);
         if !same_as_active {
             self.push_jump();
         }
@@ -1534,7 +1816,10 @@ impl Editor {
                 self.add_or_switch_buffer(buf);
                 self.msg = format!(
                     "opened \"{}\"",
-                    self.buffer.path().map(|p| p.display().to_string()).unwrap_or_default()
+                    self.buffer
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
                 );
             }
             Err(e) => self.msg = format!("error: {e}"),
@@ -1827,8 +2112,7 @@ impl Editor {
             return;
         }
         let pos = self.jumps.pos();
-        let entries: Vec<(usize, JumpEntry)> =
-            self.jumps.entries().cloned().enumerate().collect();
+        let entries: Vec<(usize, JumpEntry)> = self.jumps.entries().cloned().enumerate().collect();
         let mut items: Vec<PickerItem> = Vec::with_capacity(entries.len());
         for (i, e) in entries.iter() {
             let marker = if *i == pos { '>' } else { ' ' };
@@ -1837,7 +2121,14 @@ impl Editor {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "[No Name]".into());
-            let label = format!("{}  {:>3}  L{}:{}  {}", marker, i + 1, e.line + 1, e.col + 1, path);
+            let label = format!(
+                "{}  {:>3}  L{}:{}  {}",
+                marker,
+                i + 1,
+                e.line + 1,
+                e.col + 1,
+                path
+            );
             items.push(PickerItem {
                 display: label.clone(),
                 value: PickerValue::JumpIndex(*i),
@@ -1846,6 +2137,7 @@ impl Editor {
         }
         let mut p = Picker {
             kind: PickerKind::Jumps,
+            mode: PickerMode::Input,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -1905,6 +2197,7 @@ impl Editor {
         }
         let mut p = Picker {
             kind: PickerKind::Buffers,
+            mode: PickerMode::Input,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -1917,10 +2210,15 @@ impl Editor {
     }
 
     fn do_search(&mut self, query: &str, dir: SearchDirection) {
-        if query.is_empty() { return; }
+        if query.is_empty() {
+            return;
+        }
         let re = match compile_search(query, Case::Smart) {
             Ok(r) => r,
-            Err(e) => { self.msg = format!("E: {e}"); return; }
+            Err(e) => {
+                self.msg = format!("E: {e}");
+                return;
+            }
         };
         // Vim starts search from cursor + 1 for forward, cursor for backward.
         let start_from = match dir {
@@ -1939,14 +2237,18 @@ impl Editor {
                 self.last_search = Some((query.to_string(), dir));
                 self.hl_search = true;
             }
-            None => { self.msg = format!("E486: Pattern not found: {query}"); }
+            None => {
+                self.msg = format!("E486: Pattern not found: {query}");
+            }
         }
     }
 
     fn word_search_under(&mut self, dir: SearchDirection) {
         let rope = self.buffer.rope();
         let len = self.buffer.len_chars();
-        if len == 0 { return; }
+        if len == 0 {
+            return;
+        }
         let is_word = |c: char| c.is_alphanumeric() || c == '_';
         let mut start = self.sel.head.min(len.saturating_sub(1));
         // If cursor is not on a word char, try to find one to the right on this line.
@@ -1954,14 +2256,23 @@ impl Editor {
             let (line, _) = self.buffer.char_to_line_col(start);
             let line_end = self.buffer.line_to_char(line) + self.buffer.line_len_chars(line);
             let mut i = start;
-            while i < line_end && !is_word(rope.char(i)) { i += 1; }
-            if i >= line_end { self.msg = "E348: No string under cursor".into(); return; }
+            while i < line_end && !is_word(rope.char(i)) {
+                i += 1;
+            }
+            if i >= line_end {
+                self.msg = "E348: No string under cursor".into();
+                return;
+            }
             start = i;
         }
         // Extend backward to start of word.
-        while start > 0 && is_word(rope.char(start - 1)) { start -= 1; }
+        while start > 0 && is_word(rope.char(start - 1)) {
+            start -= 1;
+        }
         let mut end = start;
-        while end < len && is_word(rope.char(end)) { end += 1; }
+        while end < len && is_word(rope.char(end)) {
+            end += 1;
+        }
         let word: String = rope.slice(start..end).to_string();
         // Build a pattern with word boundaries, escaping regex metachars.
         let escaped = regex_escape_like(&word);
@@ -1984,7 +2295,9 @@ impl Editor {
         self.do_search(&query, effective);
     }
 
-    fn cursor_line(&self) -> usize { self.buffer.char_to_line_col(self.sel.head).0 }
+    fn cursor_line(&self) -> usize {
+        self.buffer.char_to_line_col(self.sel.head).0
+    }
 
     /// Char-range covered by the current Visual/VisualLine selection, ready
     /// to be consumed by an operator.
@@ -2002,7 +2315,11 @@ impl Editor {
                 let start = self.buffer.line_to_char(start_line);
                 let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
                 // Include trailing newline if present.
-                if end < self.buffer.len_chars() { start..(end + 1) } else { start..end }
+                if end < self.buffer.len_chars() {
+                    start..(end + 1)
+                } else {
+                    start..end
+                }
             }
             _ => r,
         }
@@ -2021,8 +2338,12 @@ impl Editor {
         let cmd = cmd.trim();
         match cmd {
             "w" => self.format_and_save(),
-            "fmt" | "format" => { self.format_buffer(); }
-            "action" | "actions" | "ca" => { self.run_code_action(); }
+            "fmt" | "format" => {
+                self.format_buffer();
+            }
+            "action" | "actions" | "ca" => {
+                self.run_code_action();
+            }
             "q" => {
                 if self.buffer.dirty() {
                     self.msg = "E37: No write since last change (use :q!)".into();
@@ -2030,7 +2351,9 @@ impl Editor {
                     self.close_buffer(false);
                 }
             }
-            "q!" => { self.close_buffer(true); }
+            "q!" => {
+                self.close_buffer(true);
+            }
             "qa" | "qall" => {
                 if self.any_buffer_dirty() {
                     self.msg = "E37: unsaved buffers exist (use :qa!)".into();
@@ -2038,28 +2361,52 @@ impl Editor {
                     self.quit = true;
                 }
             }
-            "qa!" | "qall!" => { self.quit = true; }
+            "qa!" | "qall!" => {
+                self.quit = true;
+            }
             "wq" | "x" => {
                 self.format_and_save();
                 if !self.buffer.dirty() {
                     self.close_buffer(false);
                 }
             }
-            "noh" | "nohl" | "nohlsearch" => { self.hl_search = false; }
-            "Files" => { self.open_files_picker(); }
-            "Symbols" => { self.open_symbols_picker(); }
-            "Buffers" | "ls" => { self.open_buffers_picker(); }
-            "jumps" => { self.open_jumps_picker(); }
-            "help" | "h" => { self.open_help_doc(""); }
-            "bn" | "bnext" => { self.next_buffer(); }
-            "bp" | "bprev" | "bprevious" => { self.prev_buffer(); }
-            "bd" | "bdelete" => { self.close_buffer(false); }
-            "bd!" | "bdelete!" => { self.close_buffer(true); }
+            "noh" | "nohl" | "nohlsearch" => {
+                self.hl_search = false;
+            }
+            "Files" => {
+                self.open_files_picker();
+            }
+            "Symbols" => {
+                self.open_symbols_picker();
+            }
+            "Buffers" | "ls" => {
+                self.open_buffers_picker();
+            }
+            "jumps" => {
+                self.open_jumps_picker();
+            }
+            "help" | "h" => {
+                self.open_help_doc("");
+            }
+            "bn" | "bnext" => {
+                self.next_buffer();
+            }
+            "bp" | "bprev" | "bprevious" => {
+                self.prev_buffer();
+            }
+            "bd" | "bdelete" => {
+                self.close_buffer(false);
+            }
+            "bd!" | "bdelete!" => {
+                self.close_buffer(true);
+            }
             "" => {}
             _ => {
                 if let Some(rest) = cmd.strip_prefix("Grep") {
                     self.open_grep_picker(rest.trim());
-                } else if let Some(rest) = cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h ")) {
+                } else if let Some(rest) =
+                    cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h "))
+                {
                     self.open_help_doc(rest.trim());
                 } else if let Some(rest) = cmd.strip_prefix("e ") {
                     let path = std::path::PathBuf::from(rest.trim());
@@ -2085,15 +2432,24 @@ impl Editor {
     /// v1 supports `%` (whole file) and no-range (current line). Flags: g, i.
     fn run_substitute(&mut self, cmd: &str) {
         // Strip the range prefix + the `s`.
-        let rest = if let Some(r) = cmd.strip_prefix("%s") { r }
-                   else if let Some(r) = cmd.strip_prefix(".s") { r }
-                   else if let Some(r) = cmd.strip_prefix('s') { r }
-                   else { self.msg = "internal: bad :s".into(); return; };
+        let rest = if let Some(r) = cmd.strip_prefix("%s") {
+            r
+        } else if let Some(r) = cmd.strip_prefix(".s") {
+            r
+        } else if let Some(r) = cmd.strip_prefix('s') {
+            r
+        } else {
+            self.msg = "internal: bad :s".into();
+            return;
+        };
         let whole_file = cmd.starts_with("%s");
 
         // First char after `s` is the delimiter.
         let mut chars = rest.chars();
-        let Some(delim) = chars.next() else { self.msg = "E471: usage :s/pat/rep/flags".into(); return; };
+        let Some(delim) = chars.next() else {
+            self.msg = "E471: usage :s/pat/rep/flags".into();
+            return;
+        };
         let body: String = chars.collect();
         let parts: Vec<&str> = body.splitn(3, delim).collect();
         if parts.len() < 2 {
@@ -2106,9 +2462,15 @@ impl Editor {
         let global = flags.contains('g');
         let case_insensitive = flags.contains('i');
 
-        let re = match regex::RegexBuilder::new(pattern).case_insensitive(case_insensitive).build() {
+        let re = match regex::RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+        {
             Ok(r) => r,
-            Err(e) => { self.msg = format!("E: {e}"); return; }
+            Err(e) => {
+                self.msg = format!("E: {e}");
+                return;
+            }
         };
 
         // Determine the char-range to operate on.
@@ -2147,7 +2509,9 @@ impl Editor {
                 let end_char = line_start + line_text[..end_byte].chars().count();
                 replacements.push((start_char..end_char, matched.to_string(), rep));
                 offset = end_byte;
-                if !global { break; }
+                if !global {
+                    break;
+                }
             }
             let _ = offset;
         }
@@ -2166,8 +2530,14 @@ impl Editor {
         for (range, old, new_text) in &replacements {
             self.buffer.remove_range(range.clone());
             self.buffer.insert_str(range.start, new_text);
-            tx.push(Change::Delete { at: range.start, removed: old.clone() });
-            tx.push(Change::Insert { at: range.start, text: new_text.clone() });
+            tx.push(Change::Delete {
+                at: range.start,
+                removed: old.clone(),
+            });
+            tx.push(Change::Insert {
+                at: range.start,
+                text: new_text.clone(),
+            });
         }
         self.sel = self.sel.clamped(&self.buffer);
         tx.sel_after = Some(self.sel);
@@ -2189,33 +2559,47 @@ impl Editor {
                 let new_sel = apply_motion(&self.buffer, self.sel, m, n);
                 if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
                     // Extend: keep anchor, move head only.
-                    self.sel = Selection { anchor: self.sel.anchor, head: new_sel.head, virt_col: new_sel.virt_col };
+                    self.sel = Selection {
+                        anchor: self.sel.anchor,
+                        head: new_sel.head,
+                        virt_col: new_sel.virt_col,
+                    };
                 } else {
                     self.sel = new_sel;
                 }
                 self.sel = self.sel.clamped(&self.buffer);
             }
             Action::EnterMode(m) => {
-                if m == Mode::Command { self.cmdline.clear(); }
+                if m == Mode::Command {
+                    self.cmdline.clear();
+                }
                 if matches!(m, Mode::Visual | Mode::VisualLine) {
                     self.sel.anchor = self.sel.head;
                 }
                 self.mode = m;
             }
-            Action::EnterInsert(pos) => { self.enter_insert(pos); }
+            Action::EnterInsert(pos) => {
+                self.enter_insert(pos);
+            }
             Action::Operate(op, m, n) => {
                 // `G` and `gg` with an operator behave linewise (vim parity).
                 if matches!(m, Motion::BufferStart | Motion::BufferEnd) {
                     let cur_line = self.cursor_line();
                     let target_line = match m {
                         Motion::BufferStart => {
-                            if n == 0 { 0 } else { n.saturating_sub(1).min(self.buffer.len_lines().saturating_sub(1)) }
+                            if n == 0 {
+                                0
+                            } else {
+                                n.saturating_sub(1)
+                                    .min(self.buffer.len_lines().saturating_sub(1))
+                            }
                         }
                         Motion::BufferEnd => {
                             if n == 0 {
                                 self.buffer.len_lines().saturating_sub(1)
                             } else {
-                                n.saturating_sub(1).min(self.buffer.len_lines().saturating_sub(1))
+                                n.saturating_sub(1)
+                                    .min(self.buffer.len_lines().saturating_sub(1))
                             }
                         }
                         _ => unreachable!(),
@@ -2240,8 +2624,8 @@ impl Editor {
                     // works from there, then dispatch as a linewise op.
                     self.sel = Selection::at(self.buffer.line_to_char(lo)).clamped(&self.buffer);
                     let start = self.buffer.line_to_char(lo);
-                    let end_line_char = self.buffer.line_to_char(hi)
-                        + self.buffer.line_len_chars(hi);
+                    let end_line_char =
+                        self.buffer.line_to_char(hi) + self.buffer.line_len_chars(hi);
                     let end = if end_line_char < self.buffer.len_chars() {
                         end_line_char + 1
                     } else {
@@ -2249,7 +2633,10 @@ impl Editor {
                     };
                     let entered_insert = self.apply_operator_with_kind(op, start..end, true);
                     if !entered_insert {
-                        self.last_change = Some(RepeatAction::OperateLine { op, count: line_count });
+                        self.last_change = Some(RepeatAction::OperateLine {
+                            op,
+                            count: line_count,
+                        });
                     }
                     return;
                 }
@@ -2257,9 +2644,7 @@ impl Editor {
                 // `cw` / `cW` are vim-special: they act like `ce` / `cE`,
                 // i.e. change to end-of-word without consuming the trailing
                 // whitespace. We rewrite the motion before evaluating it.
-                let m = if matches!(op, PendingOp::Change)
-                    && matches!(m, Motion::WordForward)
-                {
+                let m = if matches!(op, PendingOp::Change) && matches!(m, Motion::WordForward) {
                     Motion::WordEnd
                 } else {
                     m
@@ -2268,9 +2653,9 @@ impl Editor {
                 let inclusive = matches!(
                     m,
                     Motion::LineEnd
-                    | Motion::WordEnd
-                    | Motion::FindChar(_, _, FindKind::On)
-                    | Motion::MatchBracket
+                        | Motion::WordEnd
+                        | Motion::FindChar(_, _, FindKind::On)
+                        | Motion::MatchBracket
                 );
                 let range = if self.sel.head <= target.head {
                     let end = if inclusive {
@@ -2287,10 +2672,17 @@ impl Editor {
                     // `c<motion>` — record origin so leave_insert can build a
                     // full ChangeMotion replay including the typed text.
                     if let Some(pi) = self.pending_insert.as_mut() {
-                        pi.origin = InsertOrigin::ChangeMotion { motion: m, count: n };
+                        pi.origin = InsertOrigin::ChangeMotion {
+                            motion: m,
+                            count: n,
+                        };
                     }
                 } else {
-                    self.last_change = Some(RepeatAction::Operate { op, motion: m, count: n });
+                    self.last_change = Some(RepeatAction::Operate {
+                        op,
+                        motion: m,
+                        count: n,
+                    });
                 }
             }
             Action::OperateObject(op, obj, kind, _n) => {
@@ -2304,7 +2696,10 @@ impl Editor {
                         }
                     } else {
                         self.last_change = Some(RepeatAction::OperateObject {
-                            op, object: obj, kind, count: 1,
+                            op,
+                            object: obj,
+                            kind,
+                            count: 1,
                         });
                     }
                 } else {
@@ -2350,19 +2745,34 @@ impl Editor {
                     self.msg = "Already at newest change".into();
                 }
             }
-            Action::RepeatLastChange => { self.repeat_last_change(); }
+            Action::RepeatLastChange => {
+                self.repeat_last_change();
+            }
             Action::Paste { after, count } => {
-                for _ in 0..count.max(1) { self.paste(after); }
+                for _ in 0..count.max(1) {
+                    self.paste(after);
+                }
                 self.last_change = Some(RepeatAction::Paste { after, count });
             }
-            Action::ExCommand(cmd) => { self.run_ex(&cmd); }
+            Action::ExCommand(cmd) => {
+                self.run_ex(&cmd);
+            }
             Action::EnterSearch(dir) => {
                 self.cmdline.clear();
-                self.cmdline_prompt = match dir { SearchDirection::Forward => '/', SearchDirection::Backward => '?' };
+                self.cmdline_prompt = match dir {
+                    SearchDirection::Forward => '/',
+                    SearchDirection::Backward => '?',
+                };
                 self.mode = Mode::Command;
             }
-            Action::SearchRepeat(dir) => { self.push_jump(); self.search_repeat(dir); }
-            Action::WordSearchUnder(dir) => { self.push_jump(); self.word_search_under(dir); }
+            Action::SearchRepeat(dir) => {
+                self.push_jump();
+                self.search_repeat(dir);
+            }
+            Action::WordSearchUnder(dir) => {
+                self.push_jump();
+                self.word_search_under(dir);
+            }
             Action::ToggleCase(n) => {
                 let start = self.sel.head;
                 let n = n.max(1);
@@ -2390,15 +2800,36 @@ impl Editor {
                     return;
                 };
                 let effective_dir = if reverse {
-                    match dir { FindDirection::Forward => FindDirection::Backward, FindDirection::Backward => FindDirection::Forward }
-                } else { dir };
-                self.sel = apply_motion(&self.buffer, self.sel, Motion::FindChar(c, effective_dir, kind), count).clamped(&self.buffer);
+                    match dir {
+                        FindDirection::Forward => FindDirection::Backward,
+                        FindDirection::Backward => FindDirection::Forward,
+                    }
+                } else {
+                    dir
+                };
+                self.sel = apply_motion(
+                    &self.buffer,
+                    self.sel,
+                    Motion::FindChar(c, effective_dir, kind),
+                    count,
+                )
+                .clamped(&self.buffer);
             }
-            Action::LspHover => { self.request_hover(); }
-            Action::LspGotoDefinition => { self.request_definition(); }
-            Action::LspCodeAction => { self.run_code_action(); }
-            Action::JumpBack => { self.jump_back(); }
-            Action::JumpForward => { self.jump_forward(); }
+            Action::LspHover => {
+                self.request_hover();
+            }
+            Action::LspGotoDefinition => {
+                self.request_definition();
+            }
+            Action::LspCodeAction => {
+                self.run_code_action();
+            }
+            Action::JumpBack => {
+                self.jump_back();
+            }
+            Action::JumpForward => {
+                self.jump_forward();
+            }
             Action::Pending | Action::Unhandled => {}
         }
     }
@@ -2433,13 +2864,19 @@ impl Editor {
             InsertPos::OpenBelow => {
                 let line_end = self.buffer.line_to_char(line) + self.buffer.line_len_chars(line);
                 self.buffer.insert_char(line_end, '\n');
-                tx.push(Change::Insert { at: line_end, text: "\n".into() });
+                tx.push(Change::Insert {
+                    at: line_end,
+                    text: "\n".into(),
+                });
                 self.sel = Selection::at(line_end + 1);
             }
             InsertPos::OpenAbove => {
                 let line_start = self.buffer.line_to_char(line);
                 self.buffer.insert_char(line_start, '\n');
-                tx.push(Change::Insert { at: line_start, text: "\n".into() });
+                tx.push(Change::Insert {
+                    at: line_start,
+                    text: "\n".into(),
+                });
                 self.sel = Selection::at(line_start);
             }
         }
@@ -2461,32 +2898,49 @@ impl Editor {
 
     /// Linewise-aware operator application. `linewise` affects the register
     /// tag on yank/delete.
-    fn apply_operator_with_kind(&mut self, op: PendingOp, range: std::ops::Range<usize>, linewise: bool) -> bool {
+    fn apply_operator_with_kind(
+        &mut self,
+        op: PendingOp,
+        range: std::ops::Range<usize>,
+        linewise: bool,
+    ) -> bool {
         match op {
             PendingOp::Delete => {
                 let removed: String = self.buffer.rope().slice(range.clone()).to_string();
-                self.register = Register { text: removed.clone(), linewise };
+                self.register = Register {
+                    text: removed.clone(),
+                    linewise,
+                };
                 let sel_before = self.sel;
                 self.buffer.remove_range(range.clone());
                 let sel_after = Selection::at(range.start).clamped(&self.buffer);
                 self.sel = sel_after;
                 let mut tx = Transaction::new();
                 tx.sel_before = Some(sel_before);
-                tx.push(Change::Delete { at: range.start, removed });
+                tx.push(Change::Delete {
+                    at: range.start,
+                    removed,
+                });
                 tx.sel_after = Some(sel_after);
                 self.history.commit(tx);
                 false
             }
             PendingOp::Change => {
                 let removed: String = self.buffer.rope().slice(range.clone()).to_string();
-                self.register = Register { text: removed.clone(), linewise };
+                self.register = Register {
+                    text: removed.clone(),
+                    linewise,
+                };
                 let sel_before = self.sel;
                 self.buffer.remove_range(range.clone());
                 let sel_after = Selection::at(range.start).clamped(&self.buffer);
                 self.sel = sel_after;
                 let mut tx = Transaction::new();
                 tx.sel_before = Some(sel_before);
-                tx.push(Change::Delete { at: range.start, removed });
+                tx.push(Change::Delete {
+                    at: range.start,
+                    removed,
+                });
                 self.pending_insert = Some(PendingInsert {
                     pos: InsertPos::AtCursor,
                     tx,
@@ -2505,10 +2959,8 @@ impl Editor {
                 let text: String = self.buffer.rope().slice(range.clone()).to_string();
                 osc52_copy(&text);
                 self.register = Register { text, linewise };
-                self.yank_flash = Some((
-                    range.clone(),
-                    Instant::now() + Duration::from_millis(150),
-                ));
+                self.yank_flash =
+                    Some((range.clone(), Instant::now() + Duration::from_millis(150)));
                 // Yank doesn't move cursor in Normal, but in Visual it returns to
                 // Normal mode with cursor at start of selection (Vim quirk).
                 if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
@@ -2518,11 +2970,18 @@ impl Editor {
             }
             PendingOp::SwapCase => {
                 let source: String = self.buffer.rope().slice(range.clone()).to_string();
-                let replacement: String = source.chars().map(|c| {
-                    if c.is_uppercase() { c.to_lowercase().next().unwrap_or(c) }
-                    else if c.is_lowercase() { c.to_uppercase().next().unwrap_or(c) }
-                    else { c }
-                }).collect();
+                let replacement: String = source
+                    .chars()
+                    .map(|c| {
+                        if c.is_uppercase() {
+                            c.to_lowercase().next().unwrap_or(c)
+                        } else if c.is_lowercase() {
+                            c.to_uppercase().next().unwrap_or(c)
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
                 self.replace_range(range, &source, &replacement);
                 false
             }
@@ -2563,11 +3022,18 @@ impl Editor {
         self.buffer.remove_range(range.clone());
         self.buffer.insert_str(range.start, new_text);
         let new_len = new_text.chars().count();
-        self.sel = Selection::at(range.start + new_len.saturating_sub(1).max(0)).clamped(&self.buffer);
+        self.sel =
+            Selection::at(range.start + new_len.saturating_sub(1).max(0)).clamped(&self.buffer);
         let mut tx = Transaction::new();
         tx.sel_before = Some(sel_before);
-        tx.push(Change::Delete { at: range.start, removed: old.to_string() });
-        tx.push(Change::Insert { at: range.start, text: new_text.to_string() });
+        tx.push(Change::Delete {
+            at: range.start,
+            removed: old.to_string(),
+        });
+        tx.push(Change::Insert {
+            at: range.start,
+            text: new_text.to_string(),
+        });
         tx.sel_after = Some(self.sel);
         self.history.commit(tx);
     }
@@ -2576,7 +3042,9 @@ impl Editor {
     fn indent_range(&mut self, range: std::ops::Range<usize>, right: bool) {
         let (first_line, _) = self.buffer.char_to_line_col(range.start);
         let (mut last_line, _) = self.buffer.char_to_line_col(range.end.saturating_sub(1));
-        if range.end == 0 { last_line = first_line; }
+        if range.end == 0 {
+            last_line = first_line;
+        }
         let sel_before = self.sel;
         let mut tx = Transaction::new();
         tx.sel_before = Some(sel_before);
@@ -2586,7 +3054,10 @@ impl Editor {
             let start = self.buffer.line_to_char(line);
             if right {
                 self.buffer.insert_str(start, "    ");
-                tx.push(Change::Insert { at: start, text: "    ".into() });
+                tx.push(Change::Insert {
+                    at: start,
+                    text: "    ".into(),
+                });
             } else {
                 let line_text: String = self.buffer.rope().line(line).chars().collect();
                 let to_strip = line_text.chars().take_while(|c| *c == ' ').take(4).count();
@@ -2608,13 +3079,19 @@ impl Editor {
     /// already starts with the language's line-comment prefix, uncomment;
     /// otherwise comment by inserting at the minimum indent column.
     fn toggle_comment_range(&mut self, range: std::ops::Range<usize>) {
-        let Some(prefix) = self.syntax.as_ref().and_then(|s| s.language().line_comment()) else {
+        let Some(prefix) = self
+            .syntax
+            .as_ref()
+            .and_then(|s| s.language().line_comment())
+        else {
             self.msg = "No line comment for this language".into();
             return;
         };
         let (first_line, _) = self.buffer.char_to_line_col(range.start);
         let (mut last_line, _) = self.buffer.char_to_line_col(range.end.saturating_sub(1));
-        if range.end == 0 { last_line = first_line; }
+        if range.end == 0 {
+            last_line = first_line;
+        }
 
         let line_text = |buf: &Buffer, line: usize| -> String {
             let raw: String = buf.rope().line(line).chars().collect();
@@ -2627,14 +3104,24 @@ impl Editor {
         for line in first_line..=last_line {
             let text = line_text(&self.buffer, line);
             let indent = text.chars().take_while(|c| c.is_whitespace()).count();
-            if indent == text.chars().count() { continue; }
+            if indent == text.chars().count() {
+                continue;
+            }
             any_non_blank = true;
-            if indent < min_indent { min_indent = indent; }
+            if indent < min_indent {
+                min_indent = indent;
+            }
             let after_indent: String = text.chars().skip(indent).collect();
-            if !after_indent.starts_with(prefix) { all_commented = false; }
+            if !after_indent.starts_with(prefix) {
+                all_commented = false;
+            }
         }
-        if !any_non_blank { return; }
-        if min_indent == usize::MAX { min_indent = 0; }
+        if !any_non_blank {
+            return;
+        }
+        if min_indent == usize::MAX {
+            min_indent = 0;
+        }
 
         let sel_before = self.sel;
         let mut tx = Transaction::new();
@@ -2645,32 +3132,48 @@ impl Editor {
             for line in (first_line..=last_line).rev() {
                 let text = line_text(&self.buffer, line);
                 let indent = text.chars().take_while(|c| c.is_whitespace()).count();
-                if indent == text.chars().count() { continue; }
+                if indent == text.chars().count() {
+                    continue;
+                }
                 let after_indent: String = text.chars().skip(indent).collect();
-                if !after_indent.starts_with(prefix) { continue; }
+                if !after_indent.starts_with(prefix) {
+                    continue;
+                }
                 let line_start = self.buffer.line_to_char(line);
                 let remove_start = line_start + indent;
-                let trailing_space =
-                    if after_indent.chars().nth(prefix_chars) == Some(' ') { 1 } else { 0 };
+                let trailing_space = if after_indent.chars().nth(prefix_chars) == Some(' ') {
+                    1
+                } else {
+                    0
+                };
                 let remove_count = prefix_chars + trailing_space;
                 let removed: String = self
                     .buffer
                     .rope()
                     .slice(remove_start..(remove_start + remove_count))
                     .to_string();
-                self.buffer.remove_range(remove_start..(remove_start + remove_count));
-                tx.push(Change::Delete { at: remove_start, removed });
+                self.buffer
+                    .remove_range(remove_start..(remove_start + remove_count));
+                tx.push(Change::Delete {
+                    at: remove_start,
+                    removed,
+                });
             }
         } else {
             let to_insert = format!("{} ", prefix);
             for line in (first_line..=last_line).rev() {
                 let text = line_text(&self.buffer, line);
                 let indent = text.chars().take_while(|c| c.is_whitespace()).count();
-                if indent == text.chars().count() { continue; }
+                if indent == text.chars().count() {
+                    continue;
+                }
                 let line_start = self.buffer.line_to_char(line);
                 let insert_at = line_start + min_indent;
                 self.buffer.insert_str(insert_at, &to_insert);
-                tx.push(Change::Insert { at: insert_at, text: to_insert.clone() });
+                tx.push(Change::Insert {
+                    at: insert_at,
+                    text: to_insert.clone(),
+                });
             }
         }
 
@@ -2696,14 +3199,27 @@ impl Editor {
         if self.register.linewise {
             let (line, _) = self.buffer.char_to_line_col(self.sel.head);
             insert_at = if after {
-                self.buffer.line_to_char(line) + self.buffer.line_len_chars(line) + if line + 1 < self.buffer.len_lines() { 1 } else { 0 }
+                self.buffer.line_to_char(line)
+                    + self.buffer.line_len_chars(line)
+                    + if line + 1 < self.buffer.len_lines() {
+                        1
+                    } else {
+                        0
+                    }
             } else {
                 self.buffer.line_to_char(line)
             };
             // Ensure the pasted block ends with a newline for clean line boundary.
-            let to_insert = if text.ends_with('\n') { text.clone() } else { format!("{text}\n") };
+            let to_insert = if text.ends_with('\n') {
+                text.clone()
+            } else {
+                format!("{text}\n")
+            };
             self.buffer.insert_str(insert_at, &to_insert);
-            tx.push(Change::Insert { at: insert_at, text: to_insert.clone() });
+            tx.push(Change::Insert {
+                at: insert_at,
+                text: to_insert.clone(),
+            });
             cursor_after = insert_at;
         } else {
             let (line, col) = self.buffer.char_to_line_col(self.sel.head);
@@ -2714,7 +3230,10 @@ impl Editor {
                 self.sel.head
             };
             self.buffer.insert_str(insert_at, &text);
-            tx.push(Change::Insert { at: insert_at, text: text.clone() });
+            tx.push(Change::Insert {
+                at: insert_at,
+                text: text.clone(),
+            });
             let n = text.chars().count();
             cursor_after = insert_at + n.saturating_sub(1).max(0);
         }
@@ -2746,17 +3265,28 @@ impl Editor {
                 let start = self.buffer.line_to_char(line);
                 let end_line = (line + count - 1).min(self.buffer.len_lines().saturating_sub(1));
                 let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
-                let end = if end < self.buffer.len_chars() { end + 1 } else { end };
+                let end = if end < self.buffer.len_chars() {
+                    end + 1
+                } else {
+                    end
+                };
                 self.apply_operator_with_kind(op, start..end, true);
             }
-            RepeatAction::OperateObject { op, object, kind, count: _ } => {
+            RepeatAction::OperateObject {
+                op,
+                object,
+                kind,
+                count: _,
+            } => {
                 if let Some(range) = text_object_range(&self.buffer, self.sel.head, object, kind) {
                     self.apply_operator(op, range);
                 }
             }
             RepeatAction::InsertBurst { pos, text } => {
                 self.enter_insert(pos);
-                for c in text.chars() { self.insert_char_in_session(c); }
+                for c in text.chars() {
+                    self.insert_char_in_session(c);
+                }
                 self.leave_insert();
             }
             RepeatAction::DeleteChars { forward, count } => {
@@ -2765,7 +3295,11 @@ impl Editor {
                     self.apply_operator(PendingOp::Delete, range);
                 }
             }
-            RepeatAction::ChangeMotion { motion, count, text } => {
+            RepeatAction::ChangeMotion {
+                motion,
+                count,
+                text,
+            } => {
                 // Re-evaluate the motion at the current cursor, delete that
                 // range as a Change (which enters insert), then synthesize the
                 // typed text and leave insert. The whole thing collapses into
@@ -2779,9 +3313,9 @@ impl Editor {
                 let inclusive = matches!(
                     m,
                     Motion::LineEnd
-                    | Motion::WordEnd
-                    | Motion::FindChar(_, _, FindKind::On)
-                    | Motion::MatchBracket
+                        | Motion::WordEnd
+                        | Motion::FindChar(_, _, FindKind::On)
+                        | Motion::MatchBracket
                 );
                 let range = if self.sel.head <= target.head {
                     let end = if inclusive {
@@ -2794,13 +3328,17 @@ impl Editor {
                     target.head..self.sel.head
                 };
                 self.apply_operator(PendingOp::Change, range);
-                for c in text.chars() { self.insert_char_in_session(c); }
+                for c in text.chars() {
+                    self.insert_char_in_session(c);
+                }
                 self.leave_insert();
             }
             RepeatAction::ChangeObject { object, kind, text } => {
                 if let Some(range) = text_object_range(&self.buffer, self.sel.head, object, kind) {
                     self.apply_operator(PendingOp::Change, range);
-                    for c in text.chars() { self.insert_char_in_session(c); }
+                    for c in text.chars() {
+                        self.insert_char_in_session(c);
+                    }
                     self.leave_insert();
                 }
             }
@@ -2811,11 +3349,15 @@ impl Editor {
                 let end_line = (line + count - 1).min(self.buffer.len_lines().saturating_sub(1));
                 let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
                 self.apply_operator_with_kind(PendingOp::Change, start..end, true);
-                for c in text.chars() { self.insert_char_in_session(c); }
+                for c in text.chars() {
+                    self.insert_char_in_session(c);
+                }
                 self.leave_insert();
             }
             RepeatAction::Paste { after, count } => {
-                for _ in 0..count.max(1) { self.paste(after); }
+                for _ in 0..count.max(1) {
+                    self.paste(after);
+                }
             }
         }
     }
@@ -2845,14 +3387,19 @@ impl Editor {
         self.sel.anchor = self.sel.head;
         if let Some(pi) = self.pending_insert.as_mut() {
             let text = c.to_string();
-            pi.tx.push(Change::Insert { at, text: text.clone() });
+            pi.tx.push(Change::Insert {
+                at,
+                text: text.clone(),
+            });
             pi.typed.push(c);
         }
     }
 
     /// Backspace in Insert mode. Records the deletion.
     fn backspace_in_session(&mut self) {
-        if self.sel.head == 0 { return; }
+        if self.sel.head == 0 {
+            return;
+        }
         let at = self.sel.head - 1;
         let removed: String = self.buffer.rope().char(at).to_string();
         self.buffer.remove_range(at..self.sel.head);
@@ -2893,7 +3440,10 @@ impl Editor {
         self.mode = Mode::Normal;
         // Vim moves cursor left on leaving insert (unless at line start).
         let (_, col) = self.buffer.char_to_line_col(self.sel.head);
-        if col > 0 { self.sel.head -= 1; self.sel.anchor = self.sel.head; }
+        if col > 0 {
+            self.sel.head -= 1;
+            self.sel.anchor = self.sel.head;
+        }
     }
 
     /// Handle a single key event for the current mode.
@@ -2912,7 +3462,9 @@ impl Editor {
 
         // Global: Ctrl-C always returns to Normal (escape hatch).
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-            if self.mode == Mode::Insert { self.leave_insert(); }
+            if self.mode == Mode::Insert {
+                self.leave_insert();
+            }
             self.mode = Mode::Normal;
             self.keys = NormalKeyState::default();
             self.cmdline.clear();
@@ -2994,8 +3546,8 @@ impl Editor {
                         // Cursor move closes any completion popup and breaks
                         // the insert session for `.`-repeat parity.
                         self.completion_popup = None;
-                        self.sel = apply_motion(&self.buffer, self.sel, motion, 1)
-                            .clamped(&self.buffer);
+                        self.sel =
+                            apply_motion(&self.buffer, self.sel, motion, 1).clamped(&self.buffer);
                         if let Some(pi) = self.pending_insert.as_mut() {
                             pi.typed.clear();
                             pi.start = self.sel.head;
@@ -3016,8 +3568,14 @@ impl Editor {
                         if self.pending_leader {
                             self.pending_leader = false;
                             match c {
-                                'f' => { self.open_files_picker(); return; }
-                                'g' => { self.open_grep_picker(""); return; }
+                                'f' => {
+                                    self.open_files_picker();
+                                    return;
+                                }
+                                'g' => {
+                                    self.open_grep_picker("");
+                                    return;
+                                }
                                 _ => return,
                             }
                         }
@@ -3057,7 +3615,9 @@ impl Editor {
                             _ => None,
                         };
                         if let Some(o) = obj {
-                            if let Some(range) = text_object_range(&self.buffer, self.sel.head, o, kind) {
+                            if let Some(range) =
+                                text_object_range(&self.buffer, self.sel.head, o, kind)
+                            {
                                 // Replace the visual selection with the object's
                                 // range, head positioned at the last included char.
                                 self.sel.anchor = range.start;
@@ -3068,8 +3628,14 @@ impl Editor {
                         }
                         return;
                     }
-                    if c == 'i' { self.visual_object_kind = Some(TextObjectKind::Inner); return; }
-                    if c == 'a' { self.visual_object_kind = Some(TextObjectKind::Around); return; }
+                    if c == 'i' {
+                        self.visual_object_kind = Some(TextObjectKind::Inner);
+                        return;
+                    }
+                    if c == 'a' {
+                        self.visual_object_kind = Some(TextObjectKind::Around);
+                        return;
+                    }
                     // `gc`: toggle line comments on the visual selection. The
                     // first `g` keystroke routes through handle_normal_char and
                     // sets keys.prefix; we intercept the follow-up `c` here so
@@ -3095,7 +3661,9 @@ impl Editor {
                         let range = self.visual_range();
                         let linewise = self.mode == Mode::VisualLine;
                         let entered_insert = self.apply_operator_with_kind(op, range, linewise);
-                        if !entered_insert { self.mode = Mode::Normal; }
+                        if !entered_insert {
+                            self.mode = Mode::Normal;
+                        }
                         self.sel.anchor = self.sel.head;
                         return;
                     }
@@ -3115,10 +3683,24 @@ impl Editor {
                         return;
                     }
                     // Toggle between linewise and charwise.
-                    if c == 'v' && self.mode == Mode::VisualLine { self.mode = Mode::Visual; return; }
-                    if c == 'V' && self.mode == Mode::Visual { self.mode = Mode::VisualLine; return; }
-                    if c == 'v' && self.mode == Mode::Visual { self.mode = Mode::Normal; self.sel.anchor = self.sel.head; return; }
-                    if c == 'V' && self.mode == Mode::VisualLine { self.mode = Mode::Normal; self.sel.anchor = self.sel.head; return; }
+                    if c == 'v' && self.mode == Mode::VisualLine {
+                        self.mode = Mode::Visual;
+                        return;
+                    }
+                    if c == 'V' && self.mode == Mode::Visual {
+                        self.mode = Mode::VisualLine;
+                        return;
+                    }
+                    if c == 'v' && self.mode == Mode::Visual {
+                        self.mode = Mode::Normal;
+                        self.sel.anchor = self.sel.head;
+                        return;
+                    }
+                    if c == 'V' && self.mode == Mode::VisualLine {
+                        self.mode = Mode::Normal;
+                        self.sel.anchor = self.sel.head;
+                        return;
+                    }
                     // Otherwise: a motion or text-object; extend selection.
                     let action = handle_normal_char(&mut self.keys, c);
                     self.dispatch(action);
@@ -3131,62 +3713,103 @@ impl Editor {
                 // Ctrl-Space: primary trigger (doesn't conflict with zellij's
                 // default Ctrl-N). Ctrl-N / Ctrl-P kept as fallback for users
                 // outside zellij.
-                let is_trigger = (ctrl && matches!(k.code, KeyCode::Char(' ')))
-                    || k.code == KeyCode::Char('\0'); // some terminals send NUL for Ctrl-Space
+                let is_trigger =
+                    (ctrl && matches!(k.code, KeyCode::Char(' '))) || k.code == KeyCode::Char('\0'); // some terminals send NUL for Ctrl-Space
                 if is_trigger {
-                    if popup_open { self.move_completion_selection(1); }
-                    else { self.request_completion(); }
+                    if popup_open {
+                        self.move_completion_selection(1);
+                    } else {
+                        self.request_completion();
+                    }
                     return;
                 }
                 if ctrl && matches!(k.code, KeyCode::Char('n')) {
-                    if popup_open { self.move_completion_selection(1); }
-                    else { self.request_completion(); }
+                    if popup_open {
+                        self.move_completion_selection(1);
+                    } else {
+                        self.request_completion();
+                    }
                     return;
                 }
                 if ctrl && matches!(k.code, KeyCode::Char('p')) {
-                    if popup_open { self.move_completion_selection(-1); }
-                    else { self.request_completion(); }
+                    if popup_open {
+                        self.move_completion_selection(-1);
+                    } else {
+                        self.request_completion();
+                    }
                     return;
                 }
 
                 // Popup-only navigation / accept.
                 if popup_open {
                     match k.code {
-                        KeyCode::Down => { self.move_completion_selection(1); return; }
-                        KeyCode::Up => { self.move_completion_selection(-1); return; }
-                        KeyCode::Tab | KeyCode::Enter => { self.accept_completion(); return; }
-                        KeyCode::Esc => { self.completion_popup = None; return; }
+                        KeyCode::Down => {
+                            self.move_completion_selection(1);
+                            return;
+                        }
+                        KeyCode::Up => {
+                            self.move_completion_selection(-1);
+                            return;
+                        }
+                        KeyCode::Tab | KeyCode::Enter => {
+                            self.accept_completion();
+                            return;
+                        }
+                        KeyCode::Esc => {
+                            self.completion_popup = None;
+                            return;
+                        }
                         _ => {}
                     }
                 }
 
                 match k.code {
-                    KeyCode::Esc => { self.leave_insert(); }
+                    KeyCode::Esc => {
+                        self.leave_insert();
+                    }
                     KeyCode::Char(c) => {
                         self.insert_char_in_session(c);
-                        if self.completion_popup.is_some() { self.refilter_completions(); }
+                        if self.completion_popup.is_some() {
+                            self.refilter_completions();
+                        }
                     }
-                    KeyCode::Enter => { self.insert_char_in_session('\n'); }
+                    KeyCode::Enter => {
+                        self.insert_char_in_session('\n');
+                    }
                     KeyCode::Backspace => {
                         self.backspace_in_session();
-                        if self.completion_popup.is_some() { self.refilter_completions(); }
+                        if self.completion_popup.is_some() {
+                            self.refilter_completions();
+                        }
                     }
                     KeyCode::Tab => {
-                        for _ in 0..4 { self.insert_char_in_session(' '); }
+                        for _ in 0..4 {
+                            self.insert_char_in_session(' ');
+                        }
                     }
                     _ => {}
                 }
             }
             Mode::Command => match k.code {
-                KeyCode::Esc => { self.mode = Mode::Normal; self.cmdline.clear(); self.cmdline_prompt = ':'; }
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.cmdline.clear();
+                    self.cmdline_prompt = ':';
+                }
                 KeyCode::Enter => {
                     let cmd = std::mem::take(&mut self.cmdline);
                     let prompt = self.cmdline_prompt;
                     self.mode = Mode::Normal;
                     self.cmdline_prompt = ':';
                     match prompt {
-                        '/' => { self.push_jump(); self.do_search(&cmd, SearchDirection::Forward); }
-                        '?' => { self.push_jump(); self.do_search(&cmd, SearchDirection::Backward); }
+                        '/' => {
+                            self.push_jump();
+                            self.do_search(&cmd, SearchDirection::Forward);
+                        }
+                        '?' => {
+                            self.push_jump();
+                            self.do_search(&cmd, SearchDirection::Backward);
+                        }
                         _ => self.run_ex(&cmd),
                     }
                 }
@@ -3196,7 +3819,9 @@ impl Editor {
                         self.cmdline_prompt = ':';
                     }
                 }
-                KeyCode::Char(c) => { self.cmdline.push(c); }
+                KeyCode::Char(c) => {
+                    self.cmdline.push(c);
+                }
                 _ => {}
             },
         }
@@ -3249,12 +3874,12 @@ impl Editor {
             // `view_top` back to the cursor and the scroll would feel like a
             // no-op once the cursor was on-screen.
             MouseEventKind::ScrollUp => {
-                self.sel = apply_motion(&self.buffer, self.sel, Motion::Up, 1)
-                    .clamped(&self.buffer);
+                self.sel =
+                    apply_motion(&self.buffer, self.sel, Motion::Up, 1).clamped(&self.buffer);
             }
             MouseEventKind::ScrollDown => {
-                self.sel = apply_motion(&self.buffer, self.sel, Motion::Down, 1)
-                    .clamped(&self.buffer);
+                self.sel =
+                    apply_motion(&self.buffer, self.sel, Motion::Down, 1).clamped(&self.buffer);
             }
             _ => {}
         }
@@ -3270,16 +3895,14 @@ impl Editor {
     pub fn set_picker_geometry_for_test(&mut self, rect: Rect, scroll: usize) {
         self.last_picker_rect = Some(rect);
         self.last_picker_scroll = scroll;
+        self.last_picker_list_rows = rect.height.saturating_sub(1) as usize;
     }
 
     /// Translate absolute terminal (col, row) to a buffer char offset, or
     /// None if the click was outside the content area / past EOF.
     fn click_to_char(&self, col: u16, row: u16) -> Option<usize> {
         let rect = self.last_content_rect?;
-        if col < rect.x
-            || row < rect.y
-            || col >= rect.x + rect.width
-            || row >= rect.y + rect.height
+        if col < rect.x || row < rect.y || col >= rect.x + rect.width || row >= rect.y + rect.height
         {
             return None;
         }
@@ -3300,8 +3923,12 @@ impl Editor {
 
 /// "E:2 W:1 " if the active buffer has diagnostics, else empty.
 fn diag_summary(ed: &Editor) -> String {
-    let Some(path) = ed.buffer.path() else { return String::new() };
-    let Some(diags) = ed.diagnostics.get(path) else { return String::new() };
+    let Some(path) = ed.buffer.path() else {
+        return String::new();
+    };
+    let Some(diags) = ed.diagnostics.get(path) else {
+        return String::new();
+    };
     let (mut e, mut w) = (0u32, 0u32);
     for d in diags {
         match d.severity.unwrap_or(DiagnosticSeverity::INFORMATION) {
@@ -3360,7 +3987,9 @@ fn apply_text_edits_to_buffer_tx(
     edits: &[vix_lsp::lsp_types::TextEdit],
     tx: &mut Transaction,
 ) {
-    if edits.is_empty() { return; }
+    if edits.is_empty() {
+        return;
+    }
     let mut sorted: Vec<_> = edits.iter().collect();
     sorted.sort_by(|a, b| {
         let ak = (a.range.start.line, a.range.start.character);
@@ -3378,11 +4007,17 @@ fn apply_text_edits_to_buffer_tx(
             if start_char < end_char {
                 let removed: String = buf.rope().slice(start_char..end_char).to_string();
                 buf.remove_range(start_char..end_char);
-                tx.push(Change::Delete { at: start_char, removed });
+                tx.push(Change::Delete {
+                    at: start_char,
+                    removed,
+                });
             }
             if !e.new_text.is_empty() {
                 buf.insert_str(start_char, &e.new_text);
-                tx.push(Change::Insert { at: start_char, text: e.new_text.clone() });
+                tx.push(Change::Insert {
+                    at: start_char,
+                    text: e.new_text.clone(),
+                });
             }
         }
     }
@@ -3395,7 +4030,9 @@ fn osc52_copy(text: &str) {
     use std::io::Write;
     // Skip pathologically large yanks. Most terminals cap OSC 52 around
     // 8-100KB; blasting a huge sequence can jam the terminal.
-    if text.len() > 100_000 { return; }
+    if text.len() > 100_000 {
+        return;
+    }
     let b64 = base64_encode(text.as_bytes());
     let mut out = std::io::stdout();
     let _ = write!(out, "\x1b]52;c;{b64}\x07");
@@ -3404,8 +4041,7 @@ fn osc52_copy(text: &str) {
 
 /// Minimal RFC 4648 base64 encoder. Used for OSC 52 clipboard writes.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in chunks.by_ref() {
@@ -3439,7 +4075,9 @@ fn base64_encode(input: &[u8]) -> String {
 fn regex_escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if ".+*?()[]{}|^$\\/".contains(c) { out.push('\\'); }
+        if ".+*?()[]{}|^$\\/".contains(c) {
+            out.push('\\');
+        }
         out.push(c);
     }
     out
@@ -3467,7 +4105,9 @@ fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     ed.sync_lsp_changes();
     // Decay transient yank-flash overlay.
     if let Some((_, until)) = ed.yank_flash.as_ref() {
-        if Instant::now() >= *until { ed.yank_flash = None; }
+        if Instant::now() >= *until {
+            ed.yank_flash = None;
+        }
     }
 
     // Take the highlight cache out of `ed` so we can pass `&mut ed` and the
@@ -3488,11 +4128,14 @@ fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
         render_picker(f, content_area, ed);
     } else {
         ed.last_picker_rect = None;
+        ed.last_picker_list_rows = 0;
     }
 }
 
 fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
-    let Some(text) = ed.hover_popup.as_deref() else { return };
+    let Some(text) = ed.hover_popup.as_deref() else {
+        return;
+    };
     let max_w = (area.width as u32 * 2 / 3).max(30).min(area.width as u32) as u16;
     // Wrap text to max_w - 2 (1 col padding each side).
     let inner_w = max_w.saturating_sub(2).max(10) as usize;
@@ -3514,7 +4157,9 @@ fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
                 .unwrap_or(remaining.len())..];
         }
     }
-    let h = (wrapped.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+    let h = (wrapped.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
     let w = max_w;
     let x = area.x + area.width.saturating_sub(w) - 1;
     let y = area.y + 1;
@@ -3525,13 +4170,19 @@ fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     f.render_widget(Paragraph::new(blank).style(bg), rect);
 
     let mut lines: Vec<Line> = Vec::with_capacity(h as usize);
-    lines.push(Line::styled(" hover ".to_string() + &" ".repeat((w as usize).saturating_sub(7)),
-        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)));
+    lines.push(Line::styled(
+        " hover ".to_string() + &" ".repeat((w as usize).saturating_sub(7)),
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
     for l in wrapped.iter().take((h as usize).saturating_sub(2)) {
         let pad = (w as usize).saturating_sub(l.chars().count() + 1);
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {}{}", l, " ".repeat(pad)), bg),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {}{}", l, " ".repeat(pad)),
+            bg,
+        )]));
     }
     while lines.len() < h as usize {
         lines.push(Line::styled(" ".repeat(w as usize), bg));
@@ -3543,8 +4194,12 @@ fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
 /// if there's room, else above.
 fn render_completion_popup(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     use vix_lsp::lsp_types::CompletionItemKind;
-    let Some(popup) = ed.completion_popup.as_ref() else { return };
-    if popup.visible.is_empty() { return; }
+    let Some(popup) = ed.completion_popup.as_ref() else {
+        return;
+    };
+    if popup.visible.is_empty() {
+        return;
+    }
 
     let (cursor_line, cursor_col) = ed.buffer.char_to_line_col(ed.sel.head);
     let total_lines = ed.buffer.len_lines();
@@ -3579,11 +4234,16 @@ fn render_completion_popup(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
         (anchor_y.saturating_sub(h), h)
     };
     let x = anchor_x.min(area.x + area.width.saturating_sub(width));
-    if h == 0 || width == 0 { return; }
+    if h == 0 || width == 0 {
+        return;
+    }
     let rect = Rect::new(x, y, width, h);
 
     let bg = Style::default().bg(Color::Rgb(30, 30, 40)).fg(Color::White);
-    let sel_bg = Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD);
+    let sel_bg = Style::default()
+        .bg(Color::Blue)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
 
     // Scroll the visible slice so `selected` is always in view.
     let start = popup
@@ -3680,15 +4340,24 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans:
         if let Some((q, _)) = ed.last_search.as_ref() {
             if let Ok(re) = compile_search(q, Case::Smart) {
                 find_all_in_lines(&ed.buffer, &re, ed.view_top, ed.view_top + rows)
-            } else { Vec::new() }
-        } else { Vec::new() }
-    } else { Vec::new() };
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(rows);
     for screen_row in 0..rows {
         let line_idx = ed.view_top + screen_row;
         if line_idx >= total_lines {
-            lines.push(Line::from(Span::styled("~", Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                "~",
+                Style::default().fg(Color::DarkGray),
+            )));
             continue;
         }
 
@@ -3743,7 +4412,9 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans:
         for &(s, e) in &highlights {
             let rel_s = s.saturating_sub(line_start_char);
             let rel_e = e.saturating_sub(line_start_char).min(chars.len());
-            if rel_s >= chars.len() { continue; }
+            if rel_s >= chars.len() {
+                continue;
+            }
             for slot in styles.iter_mut().take(rel_e).skip(rel_s) {
                 *slot = Some(hl_style);
             }
@@ -3753,9 +4424,7 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans:
         if matches!(ed.mode, Mode::Visual | Mode::VisualLine) {
             let vrange = ed.visual_range();
             let sel_style = Style::default().bg(Color::Blue).fg(Color::White);
-            if vrange.start < line_start_char + chars.len() + 1
-                && vrange.end > line_start_char
-            {
+            if vrange.start < line_start_char + chars.len() + 1 && vrange.end > line_start_char {
                 let rel_s = vrange.start.saturating_sub(line_start_char);
                 let rel_e = vrange.end.saturating_sub(line_start_char).min(chars.len());
                 let rel_s = rel_s.min(chars.len());
@@ -3784,7 +4453,9 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans:
             let base = styles[i];
             let style = if is_cursor {
                 Some(match ed.mode {
-                    Mode::Insert => Style::default().add_modifier(Modifier::UNDERLINED).fg(Color::White),
+                    Mode::Insert => Style::default()
+                        .add_modifier(Modifier::UNDERLINED)
+                        .fg(Color::White),
                     _ => Style::default().add_modifier(Modifier::REVERSED),
                 })
             } else {
@@ -3811,7 +4482,9 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans:
         // If cursor is past the end of the line, draw a cursor placeholder.
         if line_idx == cursor_line && cursor_col >= chars.len() {
             let cursor_style = match ed.mode {
-                Mode::Insert => Style::default().add_modifier(Modifier::UNDERLINED).fg(Color::White),
+                Mode::Insert => Style::default()
+                    .add_modifier(Modifier::UNDERLINED)
+                    .fg(Color::White),
                 _ => Style::default().add_modifier(Modifier::REVERSED),
             };
             spans.push(Span::styled(" ", cursor_style));
@@ -3826,12 +4499,28 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans:
 fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let (line, col) = ed.buffer.char_to_line_col(ed.sel.head);
     let mode_style = match ed.mode {
-        Mode::Normal => Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD),
-        Mode::Insert => Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD),
-        Mode::Visual | Mode::VisualLine => Style::default().bg(Color::Magenta).fg(Color::Black).add_modifier(Modifier::BOLD),
-        Mode::Command => Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD),
+        Mode::Normal => Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        Mode::Insert => Style::default()
+            .bg(Color::Green)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+        Mode::Visual | Mode::VisualLine => Style::default()
+            .bg(Color::Magenta)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+        Mode::Command => Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
     };
-    let path = ed.buffer.path().map(|p| p.display().to_string()).unwrap_or_else(|| "[No Name]".into());
+    let path = ed
+        .buffer
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "[No Name]".into());
     let dirty = if ed.buffer.dirty() { " [+]" } else { "" };
     let buf_count = ed.other_buffers.len() + 1;
     let buf_info = if buf_count > 1 {
@@ -3857,7 +4546,10 @@ fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let middle = format!(" {}{}{}", path, dirty, " ".repeat(middle_pad));
     let line_widget = Line::from(vec![
         Span::styled(left_mode, mode_style),
-        Span::styled(middle, Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(
+            middle,
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
         Span::styled(right, Style::default().bg(Color::DarkGray).fg(Color::White)),
     ]);
     f.render_widget(Paragraph::new(line_widget), area);
@@ -3866,6 +4558,7 @@ fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
 fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     let Some(p) = ed.picker.as_ref() else {
         ed.last_picker_rect = None;
+        ed.last_picker_list_rows = 0;
         return;
     };
 
@@ -3896,18 +4589,44 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
         PickerKind::Grep => " <Tab>=files ",
         _ => "",
     };
-    let count = format!("{}{}/{} ", toggle_hint, p.matches.len(), p.items.len());
-    let header_pad =
-        (w as usize).saturating_sub(prompt.len() + count.len());
+    let mode_hint = match p.mode {
+        PickerMode::Input => " <Enter>=browse ",
+        PickerMode::Browse => " j/k <Enter>=open <Esc>=input ",
+    };
+    let count = format!(
+        "{}{}{}/{} ",
+        toggle_hint,
+        mode_hint,
+        p.matches.len(),
+        p.items.len()
+    );
+    let header_pad = (w as usize).saturating_sub(prompt.len() + count.len());
     let header = Line::from(vec![
-        Span::styled(prompt, Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            prompt,
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" ".repeat(header_pad), Style::default().bg(Color::DarkGray)),
         Span::styled(count, Style::default().bg(Color::DarkGray).fg(Color::Gray)),
     ]);
 
-    let list_rows = (h as usize).saturating_sub(1);
+    let selected_item = p
+        .matches
+        .get(p.selected)
+        .map(|&(item_idx, _)| &p.items[item_idx]);
+    let detail_rows = if selected_item.is_some() && h >= 8 {
+        2usize.min((h as usize).saturating_sub(2))
+    } else {
+        0
+    };
+    let list_rows = (h as usize).saturating_sub(1 + detail_rows);
     // Scroll window so `selected` is visible.
-    let scroll = if p.selected >= list_rows {
+    let scroll = if list_rows == 0 {
+        0
+    } else if p.selected >= list_rows {
         p.selected + 1 - list_rows
     } else {
         0
@@ -3922,15 +4641,15 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
                 let item = &p.items[item_idx];
                 let is_sel = idx == p.selected;
                 let style = if is_sel {
-                    Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     bg
                 };
-                let mut text = item.display.clone();
-                if text.chars().count() > w as usize {
-                    text = text.chars().take(w as usize).collect();
-                }
-                let pad = (w as usize).saturating_sub(text.chars().count());
+                let text = fit_picker_row(item, w as usize);
+                let pad = (w as usize).saturating_sub(count_chars(&text));
                 lines.push(Line::from(vec![
                     Span::styled(text, style),
                     Span::styled(" ".repeat(pad), style),
@@ -3939,10 +4658,31 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
             None => lines.push(Line::raw("")),
         }
     }
+    if detail_rows > 0 {
+        let detail_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+        let inner_w = (w as usize).saturating_sub(2);
+        let detail = selected_item
+            .map(|item| item.display.as_str())
+            .unwrap_or("");
+        let wrapped = wrap_picker_detail(detail, inner_w, detail_rows);
+        for row in 0..detail_rows {
+            let text = wrapped.get(row).map(String::as_str).unwrap_or("");
+            let content = format!("  {text}");
+            let pad = (w as usize).saturating_sub(count_chars(&content));
+            lines.push(Line::from(vec![
+                Span::styled(content, detail_style),
+                Span::styled(" ".repeat(pad), detail_style),
+            ]));
+        }
+    }
+    while lines.len() < h as usize {
+        lines.push(Line::raw(""));
+    }
     f.render_widget(Paragraph::new(lines), overlay);
 
     ed.last_picker_rect = Some(overlay);
     ed.last_picker_scroll = scroll;
+    ed.last_picker_list_rows = list_rows;
 }
 
 fn render_cmdline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
@@ -3985,7 +4725,11 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
 
     // Always restore terminal even on error.
     terminal::disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableMouseCapture, terminal::LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableMouseCapture,
+        terminal::LeaveAlternateScreen
+    )?;
     term.show_cursor()?;
     result
 }
@@ -3998,8 +4742,14 @@ mod tests {
     fn edit(sl: u32, sc: u32, el: u32, ec: u32, text: &str) -> TextEdit {
         TextEdit {
             range: Range {
-                start: Position { line: sl, character: sc },
-                end: Position { line: el, character: ec },
+                start: Position {
+                    line: sl,
+                    character: sc,
+                },
+                end: Position {
+                    line: el,
+                    character: ec,
+                },
             },
             new_text: text.into(),
         }
@@ -4029,8 +4779,10 @@ mod tests {
 
         // last_change must still point at the original `dw` action.
         match (&before, &ed.last_change) {
-            (Some(RepeatAction::Operate { op: op_a, .. }), Some(RepeatAction::Operate { op: op_b, .. }))
-                if op_a == op_b => {}
+            (
+                Some(RepeatAction::Operate { op: op_a, .. }),
+                Some(RepeatAction::Operate { op: op_b, .. }),
+            ) if op_a == op_b => {}
             _ => panic!("LSP edit polluted last_change: {:?}", ed.last_change),
         }
 
@@ -4051,5 +4803,76 @@ mod tests {
         assert_eq!(ed.buffer.rope().to_string(), "bar\n");
         // Dot-repeat is still the original dw.
         assert!(matches!(ed.last_change, Some(RepeatAction::Operate { .. })));
+    }
+
+    #[test]
+    fn picker_path_fit_preserves_tail() {
+        let row = fit_path_display("crates/tui/src/render_picker.rs", 24);
+        assert!(count_chars(&row) <= 24, "row too wide: {row}");
+        assert!(row.contains("..."), "expected ellipsis: {row}");
+        assert!(
+            row.ends_with("render_picker.rs"),
+            "lost filename tail: {row}"
+        );
+    }
+
+    #[test]
+    fn picker_grep_fit_keeps_line_and_snippet() {
+        let row = fit_grep_display(
+            "crates/tui/src/render_picker.rs:128: let a_really_long_symbol_name = value;",
+            128,
+            40,
+        );
+        assert!(count_chars(&row) <= 40, "row too wide: {row}");
+        assert!(row.contains(":128: "), "lost line marker: {row}");
+        assert!(row.contains("let"), "lost snippet start: {row}");
+        assert!(row.contains("..."), "expected truncation marker: {row}");
+    }
+
+    #[test]
+    fn picker_detail_wrap_marks_truncated_text() {
+        let rows = wrap_picker_detail("abcdefghijklmnopqrstuvwxyz", 10, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| count_chars(row) <= 10));
+        assert!(
+            rows[1].ends_with("..."),
+            "missing truncation marker: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn picker_click_below_list_rows_is_ignored() {
+        let mut ed = Editor::new(Buffer::empty());
+        let items: Vec<PickerItem> = ["alpha.rs", "beta.rs"]
+            .into_iter()
+            .map(|display| PickerItem {
+                display: display.to_string(),
+                value: PickerValue::File(display.into()),
+                haystack: Utf32String::from(display),
+            })
+            .collect();
+        ed.picker = Some(Picker {
+            kind: PickerKind::Files,
+            mode: PickerMode::Input,
+            query: String::new(),
+            items,
+            matches: vec![(0, 0), (1, 0)],
+            selected: 0,
+            scroll: 0,
+            cached_files: None,
+        });
+        ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
+        ed.last_picker_scroll = 0;
+        ed.last_picker_list_rows = 1;
+
+        ed.handle_picker_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let picker = ed.picker.as_ref().expect("picker should stay open");
+        assert_eq!(picker.selected, 0);
     }
 }

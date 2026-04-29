@@ -89,8 +89,14 @@ fn lsp_edit_is_undoable() {
     let mut h = Harness::with_text("hello\n");
     let edit = TextEdit {
         range: Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 0, character: 5 },
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 5,
+            },
         },
         new_text: "world".into(),
     };

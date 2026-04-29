@@ -41,7 +41,11 @@ edition = "2021"
     let mut got = false;
     while Instant::now() < deadline {
         while let Some(ev) = client.try_recv() {
-            if let ServerEvent::Diagnostics { uri: u, diagnostics } = ev {
+            if let ServerEvent::Diagnostics {
+                uri: u,
+                diagnostics,
+            } = ev
+            {
                 if u == uri && !diagnostics.is_empty() {
                     got = true;
                     break;

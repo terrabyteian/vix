@@ -29,19 +29,36 @@ pub enum RepeatAction {
     /// `i/I/a/A/o/O<text><Esc>` — enter insert mode a particular way, then type text.
     InsertBurst { pos: InsertPos, text: String },
     /// `dw`, `yw`, `>j` — operator over a motion.
-    Operate { op: PendingOp, motion: Motion, count: usize },
+    Operate {
+        op: PendingOp,
+        motion: Motion,
+        count: usize,
+    },
     /// `dd`, `yy`, `<<` — operator on whole lines.
     OperateLine { op: PendingOp, count: usize },
     /// `diw`, `ci"`, `ya(` — operator over a text object.
-    OperateObject { op: PendingOp, object: TextObject, kind: TextObjectKind, count: usize },
+    OperateObject {
+        op: PendingOp,
+        object: TextObject,
+        kind: TextObjectKind,
+        count: usize,
+    },
     /// `x` / `X` — delete chars on the current line.
     DeleteChars { forward: bool, count: usize },
     /// `c<motion>...<Esc>` — change over a motion plus the typed replacement.
     /// Replayed as: re-evaluate the motion at the cursor, delete that range,
     /// re-type the recorded text.
-    ChangeMotion { motion: Motion, count: usize, text: String },
+    ChangeMotion {
+        motion: Motion,
+        count: usize,
+        text: String,
+    },
     /// `c<text-object>...<Esc>` — change over a text object plus typed text.
-    ChangeObject { object: TextObject, kind: TextObjectKind, text: String },
+    ChangeObject {
+        object: TextObject,
+        kind: TextObjectKind,
+        text: String,
+    },
     /// `cc...<Esc>` — change whole lines plus typed text.
     ChangeLine { count: usize, text: String },
     /// `p` / `P` — paste the unnamed register.
@@ -69,8 +86,14 @@ impl Change {
 
     fn invert(&self) -> Change {
         match self {
-            Change::Insert { at, text } => Change::Delete { at: *at, removed: text.clone() },
-            Change::Delete { at, removed } => Change::Insert { at: *at, text: removed.clone() },
+            Change::Insert { at, text } => Change::Delete {
+                at: *at,
+                removed: text.clone(),
+            },
+            Change::Delete { at, removed } => Change::Insert {
+                at: *at,
+                text: removed.clone(),
+            },
         }
     }
 }
@@ -83,15 +106,23 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn is_empty(&self) -> bool { self.changes.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
 
-    pub fn push(&mut self, c: Change) { self.changes.push(c); }
+    pub fn push(&mut self, c: Change) {
+        self.changes.push(c);
+    }
 
     /// Apply this transaction to the buffer.
     pub fn apply(&self, buf: &mut Buffer) {
-        for c in &self.changes { c.apply(buf); }
+        for c in &self.changes {
+            c.apply(buf);
+        }
     }
 
     /// Return the inverse transaction (for undo).
@@ -115,11 +146,15 @@ pub struct History {
 }
 
 impl History {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Record a completed transaction. Clears the redo stack.
     pub fn commit(&mut self, tx: Transaction) {
-        if tx.is_empty() { return; }
+        if tx.is_empty() {
+            return;
+        }
         self.done.push(tx);
         self.undone.clear();
     }
@@ -143,8 +178,12 @@ impl History {
         restore
     }
 
-    pub fn can_undo(&self) -> bool { !self.done.is_empty() }
-    pub fn can_redo(&self) -> bool { !self.undone.is_empty() }
+    pub fn can_undo(&self) -> bool {
+        !self.done.is_empty()
+    }
+    pub fn can_redo(&self) -> bool {
+        !self.undone.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -158,7 +197,10 @@ mod tests {
 
         let mut tx = Transaction::new();
         tx.sel_before = Some(Selection::at(5));
-        tx.push(Change::Insert { at: 5, text: " world".into() });
+        tx.push(Change::Insert {
+            at: 5,
+            text: " world".into(),
+        });
         tx.sel_after = Some(Selection::at(11));
         tx.apply(&mut buf);
         hist.commit(tx);
@@ -181,8 +223,14 @@ mod tests {
 
         let mut tx = Transaction::new();
         tx.sel_before = Some(Selection::at(0));
-        tx.push(Change::Delete { at: 0, removed: "a".into() });
-        tx.push(Change::Insert { at: 0, text: "X".into() });
+        tx.push(Change::Delete {
+            at: 0,
+            removed: "a".into(),
+        });
+        tx.push(Change::Insert {
+            at: 0,
+            text: "X".into(),
+        });
         tx.sel_after = Some(Selection::at(1));
         tx.apply(&mut buf);
         hist.commit(tx);
@@ -198,7 +246,10 @@ mod tests {
         let mut hist = History::new();
 
         let mut tx1 = Transaction::new();
-        tx1.push(Change::Insert { at: 1, text: "b".into() });
+        tx1.push(Change::Insert {
+            at: 1,
+            text: "b".into(),
+        });
         tx1.apply(&mut buf);
         hist.commit(tx1);
 
@@ -206,7 +257,10 @@ mod tests {
         assert!(hist.can_redo());
 
         let mut tx2 = Transaction::new();
-        tx2.push(Change::Insert { at: 1, text: "c".into() });
+        tx2.push(Change::Insert {
+            at: 1,
+            text: "c".into(),
+        });
         tx2.apply(&mut buf);
         hist.commit(tx2);
 

@@ -15,7 +15,11 @@ pub struct Selection {
 
 impl Selection {
     pub fn at(pos: usize) -> Self {
-        Self { anchor: pos, head: pos, virt_col: None }
+        Self {
+            anchor: pos,
+            head: pos,
+            virt_col: None,
+        }
     }
 
     pub fn range(&self) -> std::ops::Range<usize> {
@@ -34,7 +38,9 @@ impl Selection {
         r.start..end
     }
 
-    pub fn is_empty(&self) -> bool { self.anchor == self.head }
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
 
     /// Clamp head into [0, len_chars]. Returns self for chaining.
     pub fn clamped(mut self, buf: &Buffer) -> Self {
@@ -52,7 +58,11 @@ impl Selection {
 
     /// Move both anchor and head to `pos`.
     pub fn move_to(self, pos: usize) -> Self {
-        Self { anchor: pos, head: pos, virt_col: self.virt_col }
+        Self {
+            anchor: pos,
+            head: pos,
+            virt_col: self.virt_col,
+        }
     }
 
     pub fn with_virt_col(mut self, col: Option<usize>) -> Self {
@@ -67,9 +77,17 @@ mod tests {
 
     #[test]
     fn range_is_normalized() {
-        let s = Selection { anchor: 5, head: 2, virt_col: None };
+        let s = Selection {
+            anchor: 5,
+            head: 2,
+            virt_col: None,
+        };
         assert_eq!(s.range(), 2..5);
-        let s = Selection { anchor: 2, head: 5, virt_col: None };
+        let s = Selection {
+            anchor: 2,
+            head: 5,
+            virt_col: None,
+        };
         assert_eq!(s.range(), 2..5);
     }
 

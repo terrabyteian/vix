@@ -65,7 +65,10 @@ fn dirty_buffer_parks_when_switching() {
     h.assert_text("on disk\n");
     // Cycling back must restore the dirty state.
     h.cmd("bp");
-    assert!(h.dirty(), "parked dirty buffer should still be dirty after returning");
+    assert!(
+        h.dirty(),
+        "parked dirty buffer should still be dirty after returning"
+    );
     h.assert_text("startingdirty\n");
 }
 
@@ -98,7 +101,10 @@ fn tab_cycles_buffers_alt_tab_style() {
     h.assert_text("beta file\n");
     h.keys("<Tab>");
     let after_one = h.text();
-    assert_ne!(after_one, "beta file\n", "Tab should advance to a different buffer");
+    assert_ne!(
+        after_one, "beta file\n",
+        "Tab should advance to a different buffer"
+    );
     // Two more tabs should wrap back to beta (3 buffers total).
     h.keys("<Tab><Tab>");
     h.assert_text("beta file\n");

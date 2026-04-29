@@ -272,7 +272,9 @@ impl SyntaxState {
         let query = Query::new(&ts_lang, query_str)?;
         let capture_names = query.capture_names();
         let name_idx = capture_names.iter().position(|n| *n == "name");
-        let Some(name_idx) = name_idx else { return Ok(Vec::new()) };
+        let Some(name_idx) = name_idx else {
+            return Ok(Vec::new());
+        };
         let mut cursor = QueryCursor::new();
         let mut out: Vec<Symbol> = Vec::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source);
@@ -344,7 +346,9 @@ fn symbol_query(lang: Language) -> Option<&'static str> {
 
 fn symbol_kinds(lang: Language) -> &'static [&'static str] {
     match lang {
-        Language::Rust => &["fn", "struct", "enum", "trait", "const", "static", "macro", "mod"],
+        Language::Rust => &[
+            "fn", "struct", "enum", "trait", "const", "static", "macro", "mod",
+        ],
         Language::Python => &["fn", "class"],
         Language::JavaScript => &["fn", "class", "method"],
         Language::TypeScript | Language::Tsx => &["fn", "class", "interface", "type", "method"],
@@ -536,7 +540,10 @@ mod tests {
         let spans = s.highlight(src).unwrap();
         assert!(!spans.is_empty(), "expected spans for fn");
         // Find the "fn" keyword span.
-        let kw_idx = HIGHLIGHT_NAMES.iter().position(|n| *n == "keyword").unwrap();
+        let kw_idx = HIGHLIGHT_NAMES
+            .iter()
+            .position(|n| *n == "keyword")
+            .unwrap();
         let has_kw = spans
             .iter()
             .any(|s| s.scope == kw_idx && &src[s.range.clone()] == b"fn");
@@ -548,9 +555,15 @@ mod tests {
         let mut s = SyntaxState::new(Language::Hcl).unwrap();
         let src = b"resource \"aws_instance\" \"web\" {\n  ami = \"ami-123\"\n}\n";
         let spans = s.highlight(src).unwrap();
-        let kw = HIGHLIGHT_NAMES.iter().position(|n| *n == "keyword").unwrap();
+        let kw = HIGHLIGHT_NAMES
+            .iter()
+            .position(|n| *n == "keyword")
+            .unwrap();
         let str_idx = HIGHLIGHT_NAMES.iter().position(|n| *n == "string").unwrap();
-        let prop = HIGHLIGHT_NAMES.iter().position(|n| *n == "property").unwrap();
+        let prop = HIGHLIGHT_NAMES
+            .iter()
+            .position(|n| *n == "property")
+            .unwrap();
         assert!(
             spans
                 .iter()

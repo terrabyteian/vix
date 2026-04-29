@@ -40,7 +40,9 @@ pub fn scan_files(root: &Path) -> Vec<FileItem> {
         .build()
         .flatten()
     {
-        let Some(ft) = entry.file_type() else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
         if !ft.is_file() {
             continue;
         }
@@ -88,7 +90,9 @@ pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
                 Ok(e) => e,
                 Err(_) => return WalkState::Continue,
             };
-            let Some(ft) = entry.file_type() else { return WalkState::Continue };
+            let Some(ft) = entry.file_type() else {
+                return WalkState::Continue;
+            };
             if !ft.is_file() {
                 return WalkState::Continue;
             }
@@ -127,11 +131,7 @@ pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
 /// Score a corpus against `query` and return the top-N by score, descending.
 /// Items with no match are filtered out. On empty query, returns the first
 /// `limit` items in input order (score 0).
-pub fn score<T: Clone>(
-    items: &[(T, Utf32String)],
-    query: &str,
-    limit: usize,
-) -> Vec<(T, u32)> {
+pub fn score<T: Clone>(items: &[(T, Utf32String)], query: &str, limit: usize) -> Vec<(T, u32)> {
     if query.is_empty() {
         return items
             .iter()
@@ -158,15 +158,11 @@ mod tests {
 
     #[test]
     fn score_orders_by_quality() {
-        let items: Vec<(String, Utf32String)> = [
-            "src/main.rs",
-            "src/foo/bar.rs",
-            "Cargo.toml",
-            "README.md",
-        ]
-        .iter()
-        .map(|s| (s.to_string(), Utf32String::from(*s)))
-        .collect();
+        let items: Vec<(String, Utf32String)> =
+            ["src/main.rs", "src/foo/bar.rs", "Cargo.toml", "README.md"]
+                .iter()
+                .map(|s| (s.to_string(), Utf32String::from(*s)))
+                .collect();
         let hits = score(&items, "main", 10);
         assert!(!hits.is_empty());
         assert!(
@@ -204,7 +200,11 @@ mod tests {
         let hits = grep(&dir, "NEEDLE").unwrap();
         let _ = fs::remove_dir_all(&dir);
 
-        assert_eq!(hits.len(), 3, "expected 3 hits across 2 files; got {hits:?}");
+        assert_eq!(
+            hits.len(),
+            3,
+            "expected 3 hits across 2 files; got {hits:?}"
+        );
         let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
         assert!(texts.contains(&"beta NEEDLE here"));
         assert!(texts.contains(&"first NEEDLE"));

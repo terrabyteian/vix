@@ -88,8 +88,14 @@ fn lsp_edit_does_not_pollute_dot() {
     // Apply an LSP-style edit directly.
     let edit = TextEdit {
         range: Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 0, character: 0 },
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 0,
+            },
         },
         new_text: "qux ".into(),
     };

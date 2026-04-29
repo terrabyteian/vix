@@ -28,11 +28,23 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn empty() -> Self {
-        Self { rope: Rope::new(), path: None, dirty: false, version: 0, scratch: false }
+        Self {
+            rope: Rope::new(),
+            path: None,
+            dirty: false,
+            version: 0,
+            scratch: false,
+        }
     }
 
     pub fn from_text(s: &str) -> Self {
-        Self { rope: Rope::from_str(s), path: None, dirty: false, version: 0, scratch: false }
+        Self {
+            rope: Rope::from_str(s),
+            path: None,
+            dirty: false,
+            version: 0,
+            scratch: false,
+        }
     }
 
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, BufferError> {
@@ -52,7 +64,13 @@ impl Buffer {
         } else {
             Rope::new()
         };
-        Ok(Self { rope, path: Some(p), dirty: false, version: 0, scratch: false })
+        Ok(Self {
+            rope,
+            path: Some(p),
+            dirty: false,
+            version: 0,
+            scratch: false,
+        })
     }
 
     pub fn save(&mut self) -> Result<(), BufferError> {
@@ -72,22 +90,40 @@ impl Buffer {
         Ok(())
     }
 
-    pub fn rope(&self) -> &Rope { &self.rope }
+    pub fn rope(&self) -> &Rope {
+        &self.rope
+    }
     pub fn rope_mut(&mut self) -> &mut Rope {
         self.dirty = true;
         self.version = self.version.wrapping_add(1);
         &mut self.rope
     }
 
-    pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
-    pub fn set_path<P: AsRef<Path>>(&mut self, p: P) { self.path = Some(p.as_ref().to_path_buf()); }
-    pub fn dirty(&self) -> bool { self.dirty }
-    pub fn version(&self) -> u64 { self.version }
-    pub fn is_scratch(&self) -> bool { self.scratch }
-    pub fn set_scratch(&mut self, v: bool) { self.scratch = v; }
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+    pub fn set_path<P: AsRef<Path>>(&mut self, p: P) {
+        self.path = Some(p.as_ref().to_path_buf());
+    }
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+    pub fn is_scratch(&self) -> bool {
+        self.scratch
+    }
+    pub fn set_scratch(&mut self, v: bool) {
+        self.scratch = v;
+    }
 
-    pub fn len_chars(&self) -> usize { self.rope.len_chars() }
-    pub fn len_lines(&self) -> usize { self.rope.len_lines() }
+    pub fn len_chars(&self) -> usize {
+        self.rope.len_chars()
+    }
+    pub fn len_lines(&self) -> usize {
+        self.rope.len_lines()
+    }
 
     /// Return (line, column) for a char offset. Column is char-based (0-indexed).
     pub fn char_to_line_col(&self, ch: usize) -> (usize, usize) {
@@ -110,7 +146,11 @@ impl Buffer {
         let slice = self.rope.line(line);
         let len = slice.len_chars();
         // Strip trailing \n if present (ropey includes it in line slices).
-        if len > 0 && slice.char(len - 1) == '\n' { len - 1 } else { len }
+        if len > 0 && slice.char(len - 1) == '\n' {
+            len - 1
+        } else {
+            len
+        }
     }
 
     pub fn insert_char(&mut self, ch: usize, c: char) {

@@ -119,6 +119,49 @@ fn esc_with_empty_query_closes_immediately() {
 }
 
 #[test]
+fn enter_switches_picker_to_browse_before_selecting() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>f");
+    h.keys("<CR>");
+    assert!(h.picker_open(), "first enter should enter browse mode");
+    h.keys("<CR>");
+    assert!(
+        !h.picker_open(),
+        "second enter should open the selected row"
+    );
+}
+
+#[test]
+fn jk_moves_selection_in_picker_browse_mode() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>f<CR>");
+    let before = h.editor.picker_selected_for_test();
+    h.keys("j");
+    assert_eq!(h.editor.picker_selected_for_test(), before + 1);
+    h.keys("k");
+    assert_eq!(h.editor.picker_selected_for_test(), before);
+}
+
+#[test]
+fn jk_still_types_in_picker_input_mode() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>fjk");
+    assert_eq!(h.picker_query(), Some("jk"));
+}
+
+#[test]
+fn esc_returns_picker_from_browse_to_input() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>fal<CR><Esc>p");
+    assert!(h.picker_open());
+    assert_eq!(h.picker_query(), Some("alp"));
+}
+
+#[test]
 fn ex_files_command_opens_unified_picker() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
@@ -162,11 +205,17 @@ fn first_click_focuses_second_click_activates() {
     // Click on row 2 (second list row) — the default selection is row 0,
     // so this is a focus-only click; picker stays open with new selection.
     h.click(5, 2);
-    assert!(h.picker_open(), "first click on a non-selected row should only focus");
+    assert!(
+        h.picker_open(),
+        "first click on a non-selected row should only focus"
+    );
     assert_eq!(h.editor.picker_selected_for_test(), 1);
     // Clicking the same row again activates and closes the picker.
     h.click(5, 2);
-    assert!(!h.picker_open(), "second click on the focused row should activate");
+    assert!(
+        !h.picker_open(),
+        "second click on the focused row should activate"
+    );
 }
 
 #[test]
@@ -177,7 +226,10 @@ fn click_on_already_selected_row_activates_immediately() {
     h.set_picker_geometry(Rect::new(0, 0, 40, 12), 0);
     // Row 1 is the first list row, which matches the default selection (0).
     h.click(5, 1);
-    assert!(!h.picker_open(), "click on the currently-selected row should activate");
+    assert!(
+        !h.picker_open(),
+        "click on the currently-selected row should activate"
+    );
 }
 
 #[test]
@@ -188,7 +240,10 @@ fn click_outside_picker_is_ignored() {
     h.set_picker_geometry(Rect::new(10, 5, 40, 12), 0);
     // Click well above the overlay.
     h.click(0, 0);
-    assert!(h.picker_open(), "click outside overlay should not close picker");
+    assert!(
+        h.picker_open(),
+        "click outside overlay should not close picker"
+    );
 }
 
 #[test]

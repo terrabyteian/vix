@@ -26,7 +26,7 @@ fn yiw_is_charwise() {
 fn dd_then_p_pastes_below() {
     let mut h = Harness::with_text("alpha\nbeta\ngamma\n");
     h.keys("dd"); // active line is now "beta"
-    h.keys("p");  // paste below current line
+    h.keys("p"); // paste below current line
     h.assert_text("beta\nalpha\ngamma\n");
 }
 
@@ -43,7 +43,7 @@ fn dd_then_capital_P_pastes_above() {
 fn charwise_p_pastes_after_cursor() {
     let mut h = Harness::with_text("ab\n");
     h.keys("yl"); // yank single char 'a'
-    h.keys("p");  // paste after → ab → a a b? Actually paste "a" after 'a' → "aab\n"
+    h.keys("p"); // paste after → ab → a a b? Actually paste "a" after 'a' → "aab\n"
     h.assert_text("aab\n");
 }
 

@@ -4,9 +4,9 @@
 pub enum Mode {
     Normal,
     Insert,
-    Visual,       // charwise visual
-    VisualLine,   // V
-    Command,      // `:` ex command entry
+    Visual,     // charwise visual
+    VisualLine, // V
+    Command,    // `:` ex command entry
 }
 
 impl Mode {
