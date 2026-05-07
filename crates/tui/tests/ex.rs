@@ -80,6 +80,53 @@ fn edit_loads_a_new_path() {
 }
 
 #[test]
+fn edit_reloads_current_buffer_from_disk() {
+    let dir = tempdir();
+    let path = dir.join("reload.txt");
+    fs::write(&path, "v1\n").unwrap();
+    let mut h = Harness::with_text_and_path("v1\n", path.clone());
+    fs::write(&path, "v2\n").unwrap();
+    h.cmd("e");
+    h.assert_text("v2\n");
+    assert!(!h.dirty());
+}
+
+#[test]
+fn edit_refuses_to_reload_dirty_buffer() {
+    let dir = tempdir();
+    let path = dir.join("dirty.txt");
+    fs::write(&path, "v1\n").unwrap();
+    let mut h = Harness::with_text_and_path("v1\n", path.clone());
+    h.keys("Adirty<Esc>");
+    fs::write(&path, "v2\n").unwrap();
+    h.cmd("e");
+    // Dirty + no force → buffer untouched, error reported.
+    assert!(h.text().contains("dirty"));
+    assert!(h.msg().contains("E37"));
+    assert!(h.dirty());
+}
+
+#[test]
+fn edit_force_reloads_dirty_buffer() {
+    let dir = tempdir();
+    let path = dir.join("force_reload.txt");
+    fs::write(&path, "v1\n").unwrap();
+    let mut h = Harness::with_text_and_path("v1\n", path.clone());
+    h.keys("Adirty<Esc>");
+    fs::write(&path, "v2\n").unwrap();
+    h.cmd("e!");
+    h.assert_text("v2\n");
+    assert!(!h.dirty());
+}
+
+#[test]
+fn edit_without_path_reports_error() {
+    let mut h = Harness::with_text("scratch\n");
+    h.cmd("e");
+    assert!(h.msg().contains("E32"));
+}
+
+#[test]
 fn substitute_no_pattern_yields_error() {
     let mut h = Harness::with_text("foo\n");
     h.cmd("%s");

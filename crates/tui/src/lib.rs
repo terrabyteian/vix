@@ -11,7 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 use std::collections::HashMap;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use vix_core::{
@@ -30,7 +30,7 @@ use vix_lsp::lsp_types::{
 use vix_lsp::{
     parse_response, path_to_uri, server_for_path, uri_to_path, LspClient, RequestId, ServerEvent,
 };
-use vix_picker::{grep, scan_files, score, GrepItem, Utf32String};
+use vix_picker::{grep, match_indices, scan_files, score, GrepItem, Utf32String};
 use vix_syntax::{HlSpan, Language, Symbol, SyntaxState, HIGHLIGHT_NAMES};
 
 /// What action triggered the current Insert session — determines how `.`
@@ -257,6 +257,29 @@ struct Picker {
     /// cleared whenever the `items` vector is replaced (Tab toggle, grep
     /// refresh). Only Files/Grep pickers populate this.
     marked: std::collections::HashSet<usize>,
+    /// Cached file preview for the currently-highlighted Files/Grep row.
+    /// Holds the file's line-split source plus syntax spans so we don't
+    /// re-read or re-parse on every render. Replaced when the highlighted
+    /// row points at a different path.
+    preview: Option<PreviewCache>,
+}
+
+/// Cached file preview data. Built lazily for the currently-selected
+/// Files/Grep row and reused across renders until the selection moves to
+/// a different path.
+struct PreviewCache {
+    path: PathBuf,
+    /// File contents split by newline. Each entry omits the trailing `\n`.
+    lines: Vec<String>,
+    /// Byte offset where each line *starts* in the file. `len() == lines.len() + 1`,
+    /// with the final entry equal to the file size — gives an exclusive end
+    /// for the last line via simple subtraction.
+    line_byte_starts: Vec<usize>,
+    /// Tree-sitter highlight spans for the file (whole-file byte ranges).
+    spans: Vec<HlSpan>,
+    /// True if the file was too large or unreadable; `lines` then carries a
+    /// short placeholder. We still cache so repeated renders don't retry I/O.
+    placeholder: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +296,15 @@ enum PickerKind {
     Buffers,
     CodeActions,
     Jumps,
+}
+
+/// Picker kinds that take over the full screen (with side preview pane)
+/// rather than rendering as a centered overlay.
+fn is_fullscreen_picker_kind(kind: &PickerKind) -> bool {
+    matches!(
+        kind,
+        PickerKind::Files | PickerKind::Grep | PickerKind::Buffers
+    )
 }
 
 #[derive(Clone)]
@@ -1114,6 +1146,7 @@ impl Editor {
             cached_files: None,
             pending_g: false,
             marked: std::collections::HashSet::new(),
+            preview: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1451,6 +1484,7 @@ impl Editor {
             cached_files: Some(cached_files),
             pending_g: false,
             marked: std::collections::HashSet::new(),
+            preview: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1566,6 +1600,7 @@ impl Editor {
             cached_files: None,
             pending_g: false,
             marked: std::collections::HashSet::new(),
+            preview: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1590,6 +1625,11 @@ impl Editor {
             Toggle,
             // Re-score (Files) or re-grep (Grep) after the query changed.
             Refresh,
+            // Buffer-picker management actions; idx is into the buffer list
+            // (0 = active, 1.. = parked), not the picker match list.
+            BufferSave(usize),
+            BufferClose(usize, bool),
+            BufferReload(usize, bool),
         }
 
         let post = {
@@ -1680,6 +1720,20 @@ impl Editor {
                     Post::None
                 }
                 KeyCode::Char(c) if p.mode == PickerMode::Browse => {
+                    let is_buffers = matches!(p.kind, PickerKind::Buffers);
+                    // Buffer-picker management actions resolve to a Post so
+                    // we can release the &mut borrow before mutating.
+                    let buf_action_idx = if is_buffers && matches!(c, 's' | 'q' | 'Q' | 'r' | 'R') {
+                        p.matches.get(p.selected).and_then(|&(item_idx, _)| {
+                            if let PickerValue::BufferIndex(idx) = p.items[item_idx].value {
+                                Some(idx)
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
                     match c {
                         'j' => p.move_selection(1),
                         'k' => p.move_selection(-1),
@@ -1707,7 +1761,14 @@ impl Editor {
                         }
                         _ => {}
                     }
-                    Post::None
+                    match (c, buf_action_idx) {
+                        ('s', Some(idx)) => Post::BufferSave(idx),
+                        ('q', Some(idx)) => Post::BufferClose(idx, false),
+                        ('Q', Some(idx)) => Post::BufferClose(idx, true),
+                        ('r', Some(idx)) => Post::BufferReload(idx, false),
+                        ('R', Some(idx)) => Post::BufferReload(idx, true),
+                        _ => Post::None,
+                    }
                 }
                 KeyCode::Char(c) => {
                     p.query.push(c);
@@ -1750,6 +1811,24 @@ impl Editor {
                     p.rescore();
                 }
             }
+            Post::BufferSave(idx) => {
+                self.save_buffer_at_index(idx);
+                self.refresh_buffers_picker_items();
+            }
+            Post::BufferClose(idx, force) => {
+                self.close_buffer_at_index(idx, force);
+                if self.quit {
+                    // Last buffer just closed → editor is exiting; tear down
+                    // the picker so the final frame doesn't render over us.
+                    self.picker = None;
+                } else {
+                    self.refresh_buffers_picker_items();
+                }
+            }
+            Post::BufferReload(idx, force) => {
+                self.reload_buffer_at_index(idx, force);
+                self.refresh_buffers_picker_items();
+            }
         }
         true
     }
@@ -1787,12 +1866,18 @@ impl Editor {
                     {
                         return;
                     }
-                    let row_in_overlay = me.row - rect.y;
-                    // Row 0 is the header; list rows start at 1.
-                    if row_in_overlay == 0 {
+                    let row_in_rect = me.row - rect.y;
+                    // For overlay pickers, row 0 of `rect` is the header; for
+                    // the fullscreen picker, `rect` already starts at the
+                    // first list row. Distinguish via picker kind.
+                    let is_fullscreen = is_fullscreen_picker_kind(&p.kind);
+                    let list_row = if is_fullscreen {
+                        row_in_rect as usize
+                    } else if row_in_rect == 0 {
                         return;
-                    }
-                    let list_row = (row_in_overlay - 1) as usize;
+                    } else {
+                        (row_in_rect - 1) as usize
+                    };
                     if list_row >= self.last_picker_list_rows {
                         return;
                     }
@@ -1880,6 +1965,56 @@ impl Editor {
         self.push_jump();
         self.add_or_switch_buffer(buf);
         self.msg = format!("help: {slug}");
+    }
+
+    /// `:e` / `:e!` — reload the active buffer from disk. Refuses if there
+    /// are unsaved changes unless `force` is true. Cursor is preserved by
+    /// char-offset (clamped to the new length); history and pending state
+    /// are reset since the buffer is now a fresh read from disk.
+    fn reload_buffer(&mut self, force: bool) {
+        let Some(path) = self.buffer.path().map(|p| p.to_path_buf()) else {
+            self.msg = "E32: No file name".into();
+            return;
+        };
+        if self.buffer.is_scratch() {
+            self.msg = "E382: scratch buffer cannot be reloaded".into();
+            return;
+        }
+        if !force && self.buffer.dirty() {
+            self.msg = "E37: No write since last change (add ! to override)".into();
+            return;
+        }
+        let new_buf = match Buffer::load(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.msg = format!("error: {e}");
+                return;
+            }
+        };
+        let prev_head = self.sel.head;
+        self.buffer = new_buf;
+        self.history = History::new();
+        self.pending_insert = None;
+        self.last_change = None;
+        let len = self.buffer.len_chars();
+        self.sel = Selection::at(prev_head.min(len)).clamped(&self.buffer);
+        self.view_top = 0;
+        self.syntax = self
+            .buffer
+            .path()
+            .and_then(Language::from_path)
+            .and_then(|l| SyntaxState::new(l).ok());
+        self.invalidate_syntax_cache();
+        // Tell LSP the document is gone so a fresh `didOpen` (via
+        // `ensure_lsp_open`) re-syncs server state with the on-disk content.
+        if let Some(doc) = self.lsp_docs.remove(&path) {
+            if let Some(client) = self.lsp_clients.get(&doc.server_cmd) {
+                client.did_close(doc.uri);
+            }
+        }
+        self.diagnostics.remove(&path);
+        self.ensure_lsp_open();
+        self.msg = format!("\"{}\" reloaded", path.display());
     }
 
     fn open_path(&mut self, path: &std::path::Path) {
@@ -2073,6 +2208,118 @@ impl Editor {
         }
     }
 
+    /// Save the buffer at `idx` (0 = active, 1.. = parked). Active buffer
+    /// runs the LSP-format pass; parked buffers just write the rope to disk.
+    fn save_buffer_at_index(&mut self, idx: usize) {
+        if idx == 0 {
+            self.format_and_save();
+            return;
+        }
+        let Some(park) = self.other_buffers.get_mut(idx - 1) else {
+            return;
+        };
+        if park.buffer.is_scratch() {
+            self.msg = "E13: scratch buffer not writable".into();
+            return;
+        }
+        match park.buffer.save() {
+            Ok(()) => {
+                self.msg = format!(
+                    "\"{}\" written",
+                    park.buffer
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                )
+            }
+            Err(e) => self.msg = format!("error: {e}"),
+        }
+    }
+
+    /// Close the buffer at `idx`. For a parked buffer, refuses if dirty
+    /// unless `force`. For the active buffer, delegates to `close_buffer`.
+    fn close_buffer_at_index(&mut self, idx: usize, force: bool) {
+        if idx == 0 {
+            self.close_buffer(force);
+            return;
+        }
+        let Some(park) = self.other_buffers.get(idx - 1) else {
+            return;
+        };
+        if !force && park.buffer.dirty() {
+            self.msg = "E89: No write since last change (use Q to force)".into();
+            return;
+        }
+        // Detach LSP doc state for the closing buffer's path so a subsequent
+        // re-open sends a fresh `didOpen`.
+        let path = park.buffer.path().map(|p| p.to_path_buf());
+        self.other_buffers.remove(idx - 1);
+        if let Some(p) = path {
+            if let Some(doc) = self.lsp_docs.remove(&p) {
+                if let Some(client) = self.lsp_clients.get(&doc.server_cmd) {
+                    client.did_close(doc.uri);
+                }
+            }
+            self.diagnostics.remove(&p);
+        }
+    }
+
+    /// Reload the buffer at `idx` from disk. Refuses if dirty unless `force`.
+    fn reload_buffer_at_index(&mut self, idx: usize, force: bool) {
+        if idx == 0 {
+            self.reload_buffer(force);
+            return;
+        }
+        let park_idx = idx - 1;
+        let path = {
+            let Some(park) = self.other_buffers.get(park_idx) else {
+                return;
+            };
+            if park.buffer.is_scratch() {
+                self.msg = "E382: scratch buffer cannot be reloaded".into();
+                return;
+            }
+            if !force && park.buffer.dirty() {
+                self.msg = "E37: No write since last change (use R to force)".into();
+                return;
+            }
+            match park.buffer.path().map(|p| p.to_path_buf()) {
+                Some(p) => p,
+                None => {
+                    self.msg = "E32: No file name".into();
+                    return;
+                }
+            }
+        };
+        let new_buf = match Buffer::load(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.msg = format!("error: {e}");
+                return;
+            }
+        };
+        if let Some(park) = self.other_buffers.get_mut(park_idx) {
+            let len = new_buf.len_chars();
+            park.buffer = new_buf;
+            park.history = History::new();
+            park.pending_insert = None;
+            park.last_change = None;
+            park.sel = Selection::at(park.sel.head.min(len)).clamped(&park.buffer);
+            park.view_top = 0;
+            park.syntax = Language::from_path(path.as_path())
+                .and_then(|l| SyntaxState::new(l).ok());
+            park.syntax_cache.clear();
+            park.syntax_version = None;
+        }
+        if let Some(doc) = self.lsp_docs.remove(&path) {
+            if let Some(client) = self.lsp_clients.get(&doc.server_cmd) {
+                client.did_close(doc.uri);
+            }
+        }
+        self.diagnostics.remove(&path);
+        self.msg = format!("\"{}\" reloaded", path.display());
+    }
+
     /// True if any buffer (active or parked) has unsaved edits.
     fn any_buffer_dirty(&self) -> bool {
         self.buffer.dirty() || self.other_buffers.iter().any(|b| b.buffer.dirty())
@@ -2229,6 +2476,7 @@ impl Editor {
             cached_files: None,
             pending_g: false,
             marked: std::collections::HashSet::new(),
+            preview: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -2265,6 +2513,28 @@ impl Editor {
 
     /// Open the buffer picker: lists all live buffers for fuzzy selection.
     fn open_buffers_picker(&mut self) {
+        let items = self.buffer_picker_items();
+        let mut p = Picker {
+            kind: PickerKind::Buffers,
+            mode: PickerMode::Input,
+            query: String::new(),
+            items,
+            matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
+            preview: None,
+        };
+        p.rescore();
+        self.picker = Some(p);
+    }
+
+    /// Build the item list for the buffer picker from the current set of
+    /// active + parked buffers. Used both on initial open and after a
+    /// management action (save/reload/close) so labels reflect new state.
+    fn buffer_picker_items(&self) -> Vec<PickerItem> {
         let mut items: Vec<PickerItem> = Vec::with_capacity(self.buffer_count());
         let active_label = label_for_buffer(&self.buffer, 0, true);
         items.push(PickerItem {
@@ -2280,20 +2550,25 @@ impl Editor {
                 haystack: Utf32String::from(label.as_str()),
             });
         }
-        let mut p = Picker {
-            kind: PickerKind::Buffers,
-            mode: PickerMode::Input,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-        };
-        p.rescore();
-        self.picker = Some(p);
+        items
+    }
+
+    /// Rebuild the buffer picker's items in place. No-op if the picker isn't
+    /// the Buffers kind. Drops the cached preview so the next render rebuilds
+    /// it against any reloaded content.
+    fn refresh_buffers_picker_items(&mut self) {
+        if !matches!(
+            self.picker.as_ref().map(|p| &p.kind),
+            Some(PickerKind::Buffers)
+        ) {
+            return;
+        }
+        let items = self.buffer_picker_items();
+        if let Some(p) = self.picker.as_mut() {
+            p.items = items;
+            p.preview = None;
+            p.rescore();
+        }
     }
 
     /// Returns the line index of the match on success so the caller can
@@ -2502,6 +2777,12 @@ impl Editor {
             "bd!" | "bdelete!" => {
                 self.close_buffer(true);
             }
+            "e" | "edit" => {
+                self.reload_buffer(false);
+            }
+            "e!" | "edit!" => {
+                self.reload_buffer(true);
+            }
             "" => {}
             _ => {
                 if let Some(rest) = cmd.strip_prefix("Grep") {
@@ -2510,7 +2791,10 @@ impl Editor {
                     cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h "))
                 {
                     self.open_help_doc(rest.trim());
-                } else if let Some(rest) = cmd.strip_prefix("e ") {
+                } else if let Some(rest) = cmd
+                    .strip_prefix("e ")
+                    .or_else(|| cmd.strip_prefix("e! "))
+                {
                     let path = std::path::PathBuf::from(rest.trim());
                     self.open_path(&path);
                 } else if let Some(rest) = cmd.strip_prefix("b ") {
@@ -3713,6 +3997,10 @@ impl Editor {
                                     self.open_grep_picker("");
                                     return;
                                 }
+                                'b' => {
+                                    self.open_buffers_picker();
+                                    return;
+                                }
                                 _ => return,
                             }
                         }
@@ -4229,6 +4517,22 @@ fn regex_escape_like(s: &str) -> String {
 
 fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let area = f.area();
+
+    // Files / Grep / Buffers picker takes the whole screen — skip drawing
+    // the editor, statusline, and cmdline so we don't peek through.
+    let fullscreen_picker = ed
+        .picker
+        .as_ref()
+        .map(|p| is_fullscreen_picker_kind(&p.kind))
+        .unwrap_or(false);
+    if fullscreen_picker {
+        // LSP sync still useful — keeps server state consistent across the
+        // (potentially long) picker session.
+        ed.sync_lsp_changes();
+        render_picker_fullscreen(f, area, ed);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4705,6 +5009,19 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
         ed.last_picker_list_rows = 0;
         return;
     };
+    if is_fullscreen_picker_kind(&p.kind) {
+        render_picker_fullscreen(f, area, ed);
+    } else {
+        render_picker_overlay(f, area, ed);
+    }
+}
+
+fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
+    let Some(p) = ed.picker.as_ref() else {
+        ed.last_picker_rect = None;
+        ed.last_picker_list_rows = 0;
+        return;
+    };
 
     // Centered overlay: ~80% wide, 2/3 tall. Clamp to minimums so it renders
     // on small terminals too.
@@ -4856,6 +5173,770 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     ed.last_picker_list_rows = list_rows;
 }
 
+// --- Fullscreen Files / Grep picker ----------------------------------------
+
+const PICKER_ACCENT: Color = Color::Cyan;
+const PICKER_ACCENT_HI: Color = Color::LightCyan;
+const PICKER_BORDER: Color = Color::DarkGray;
+const PICKER_DIM: Color = Color::Gray;
+
+/// Cap the file size we'll attempt to read for previews. Keeps a single
+/// keystroke from triggering a multi-MB read on a stray binary.
+const PREVIEW_MAX_BYTES: usize = 256 * 1024;
+
+impl PreviewCache {
+    fn placeholder(path: &Path, msg: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            lines: vec![msg.to_string()],
+            line_byte_starts: vec![0, msg.len()],
+            spans: Vec::new(),
+            placeholder: true,
+        }
+    }
+}
+
+/// Read `path` into a `PreviewCache`. Returns a placeholder cache when the
+/// file is too large, binary-looking, non-UTF8, or unreadable — so the
+/// preview pane always has *something* to show.
+fn build_preview(path: &Path) -> PreviewCache {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return PreviewCache::placeholder(path, &format!("(cannot read: {e})")),
+    };
+    if bytes.len() > PREVIEW_MAX_BYTES {
+        return PreviewCache::placeholder(path, "(file too large to preview)");
+    }
+    if bytes.iter().take(1024).any(|&b| b == 0) {
+        return PreviewCache::placeholder(path, "(binary file)");
+    }
+    let source = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return PreviewCache::placeholder(path, "(non-utf8 file)"),
+    };
+    build_preview_from_text(path, &source)
+}
+
+/// Build a `PreviewCache` from in-memory text. `path` is used for display
+/// and language routing — callers pass the buffer's real path when there
+/// is one, or a synthetic placeholder otherwise.
+fn build_preview_from_text(path: &Path, source: &str) -> PreviewCache {
+    if source.len() > PREVIEW_MAX_BYTES {
+        return PreviewCache::placeholder(path, "(buffer too large to preview)");
+    }
+    // Manual line split: `str::lines` would also strip `\r`, but we'd lose the
+    // ability to map line indices back to byte offsets the syntax spans use.
+    let mut lines: Vec<String> = Vec::new();
+    let mut line_byte_starts: Vec<usize> = vec![0];
+    let src_bytes = source.as_bytes();
+    let mut start = 0usize;
+    for i in 0..src_bytes.len() {
+        if src_bytes[i] == b'\n' {
+            let end = if i > 0 && src_bytes[i - 1] == b'\r' {
+                i - 1
+            } else {
+                i
+            };
+            lines.push(source[start..end].to_string());
+            line_byte_starts.push(i + 1);
+            start = i + 1;
+        }
+    }
+    if start < src_bytes.len() {
+        lines.push(source[start..].to_string());
+    }
+    line_byte_starts.push(src_bytes.len());
+
+    let spans = Language::from_path(path)
+        .and_then(|lang| SyntaxState::new(lang).ok())
+        .and_then(|mut s| s.highlight(source.as_bytes()).ok())
+        .unwrap_or_default();
+
+    PreviewCache {
+        path: path.to_path_buf(),
+        lines,
+        line_byte_starts,
+        spans,
+        placeholder: false,
+    }
+}
+
+/// If the picker is showing a fullscreen-kind selection whose target differs
+/// from the cached preview, rebuild the cache. Cheap when the selection
+/// hasn't moved.
+fn refresh_preview(ed: &mut Editor) {
+    let kind = match ed.picker.as_ref().map(|p| p.kind.clone()) {
+        Some(k) => k,
+        None => return,
+    };
+    if !is_fullscreen_picker_kind(&kind) {
+        if let Some(p) = ed.picker.as_mut() {
+            p.preview = None;
+        }
+        return;
+    }
+    match kind {
+        PickerKind::Files | PickerKind::Grep => {
+            let Some(p) = ed.picker.as_mut() else {
+                return;
+            };
+            let target_path: Option<PathBuf> = p
+                .matches
+                .get(p.selected)
+                .and_then(|&(idx, _)| match &p.items[idx].value {
+                    PickerValue::File(path) => Some(path.clone()),
+                    PickerValue::GrepHit { path, .. } => Some(path.clone()),
+                    _ => None,
+                });
+            let Some(target) = target_path else {
+                p.preview = None;
+                return;
+            };
+            if let Some(cache) = p.preview.as_ref() {
+                if cache.path == target {
+                    return;
+                }
+            }
+            p.preview = Some(build_preview(&target));
+        }
+        PickerKind::Buffers => {
+            // Resolve the highlighted buffer index, release the &mut p
+            // borrow, then read the buffer and rebuild the cache from the
+            // rope. The rope view is what the user actually wants — it
+            // reflects unsaved edits.
+            let buffer_idx: Option<usize> = ed
+                .picker
+                .as_ref()
+                .and_then(|p| p.matches.get(p.selected).map(|&(i, _)| i))
+                .and_then(|item_idx| {
+                    let p = ed.picker.as_ref()?;
+                    if let PickerValue::BufferIndex(idx) = p.items[item_idx].value {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                });
+            let Some(idx) = buffer_idx else {
+                if let Some(p) = ed.picker.as_mut() {
+                    p.preview = None;
+                }
+                return;
+            };
+            let cache = build_preview_for_buffer_idx(ed, idx);
+            if let Some(p) = ed.picker.as_mut() {
+                p.preview = Some(cache);
+            }
+        }
+        _ => {
+            if let Some(p) = ed.picker.as_mut() {
+                p.preview = None;
+            }
+        }
+    }
+}
+
+/// Build a `PreviewCache` for the buffer at `idx` (0 = active, 1.. = parked).
+/// Always rebuilds from the live rope so dirty changes show through. Falls
+/// back to a synthetic display path for unnamed buffers so syntax routing
+/// and the preview header still have *something* to show.
+fn build_preview_for_buffer_idx(ed: &Editor, idx: usize) -> PreviewCache {
+    let buf: &Buffer = if idx == 0 {
+        &ed.buffer
+    } else {
+        match ed.other_buffers.get(idx - 1) {
+            Some(b) => &b.buffer,
+            None => return PreviewCache::placeholder(Path::new("[gone]"), "(buffer no longer exists)"),
+        }
+    };
+    let synthetic = PathBuf::from("[No Name]");
+    let path: &Path = buf.path().unwrap_or(synthetic.as_path());
+    let text = buf.rope().to_string();
+    build_preview_from_text(path, &text)
+}
+
+/// Picker-time helper: the line number to anchor the preview around for the
+/// currently-highlighted item. Files anchor at line 0; grep hits at the hit
+/// line.
+fn picker_preview_anchor_line(p: &Picker) -> usize {
+    p.matches
+        .get(p.selected)
+        .and_then(|&(idx, _)| match &p.items[idx].value {
+            PickerValue::GrepHit { line, .. } => Some(line.saturating_sub(1) as usize),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// Subtle two-step accent pulse driven by wall-clock time. The picker is the
+/// only source of redraw cadence here, but the run loop polls every 100ms,
+/// so colors change roughly twice per second when nothing else triggers a
+/// redraw.
+fn picker_pulse_accent() -> Color {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if (ms / 600) % 2 == 0 {
+        PICKER_ACCENT
+    } else {
+        PICKER_ACCENT_HI
+    }
+}
+
+/// Pad a string out to `width` columns (assuming 1 char = 1 col). Truncates
+/// with `…` when the string would overflow.
+fn pad_or_trunc(s: &str, width: usize) -> String {
+    let n = count_chars(s);
+    if n == width {
+        s.to_string()
+    } else if n < width {
+        format!("{}{}", s, " ".repeat(width - n))
+    } else if width <= 1 {
+        take_start(s, width)
+    } else {
+        format!("{}…", take_start(s, width - 1))
+    }
+}
+
+fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
+    // Tiny terminal — fall back to the overlay so we don't render garbage.
+    if area.width < 50 || area.height < 12 {
+        render_picker_overlay(f, area, ed);
+        return;
+    }
+
+    refresh_preview(ed);
+
+    let Some(p) = ed.picker.as_ref() else {
+        ed.last_picker_rect = None;
+        ed.last_picker_list_rows = 0;
+        return;
+    };
+
+    let w = area.width as usize;
+    let h = area.height as usize;
+
+    // --- Layout slots ---------------------------------------------------------
+    // 0: tabs/breadcrumb · 1: prompt · 2: top sep · 3..h-2: body · h-2: bot sep
+    // h-1: footer
+    let body_top = 3u16;
+    let body_bottom = (h as u16).saturating_sub(2);
+    let body_h = body_bottom.saturating_sub(body_top) as usize;
+
+    // Body split: ~38% list, rest preview, with one separator column.
+    let split_enabled = w >= 80;
+    let list_w = if split_enabled {
+        ((w as u32 * 38 / 100).max(28).min((w as u32).saturating_sub(40))) as usize
+    } else {
+        w
+    };
+    let sep_col = list_w as u16;
+    let preview_x = (list_w as u16) + 1;
+    let preview_w = if split_enabled {
+        w.saturating_sub(list_w + 1)
+    } else {
+        0
+    };
+
+    // Wipe the whole area to a clean Reset background. The editor view, status
+    // line, and command line are not drawn under us when the fullscreen picker
+    // is active (see `render`), so we own every cell here.
+    let blank: Vec<Line> = (0..h).map(|_| Line::raw(" ".repeat(w))).collect();
+    f.render_widget(Paragraph::new(blank), area);
+
+    // --- Row 0: tabs + breadcrumb + counts -----------------------------------
+    let is_buffers = matches!(p.kind, PickerKind::Buffers);
+    let mode_files = matches!(p.kind, PickerKind::Files);
+    let cwd_str = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    // Trim deep cwds — ".../<last 30>" — so wide screens don't blow out.
+    let cwd_disp = if count_chars(&cwd_str) > 36 {
+        format!("…{}", take_end(&cwd_str, 35))
+    } else {
+        cwd_str
+    };
+    let counts = format!(" {} / {} ", p.matches.len(), p.items.len());
+    let bread = format!(" {}  ", cwd_disp);
+    let active_style = Style::default()
+        .fg(picker_pulse_accent())
+        .add_modifier(Modifier::BOLD);
+    let inactive_style = Style::default().fg(PICKER_DIM);
+    let tab_row = if is_buffers {
+        // No Files↔Grep toggle here; show a single "Buffers" title.
+        let title = " [Buffers] ";
+        let title_used = count_chars(title);
+        let right_used = count_chars(&counts) + count_chars(&bread);
+        let middle_pad = w.saturating_sub(title_used + right_used);
+        Line::from(vec![
+            Span::styled(title, active_style),
+            Span::raw(" ".repeat(middle_pad)),
+            Span::styled(bread, Style::default().fg(PICKER_DIM)),
+            Span::styled(
+                counts,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        // " [Files]  Grep " or "  Files  [Grep] " — square brackets call out the active.
+        let files_tab = if mode_files { " [Files] " } else { "  Files  " };
+        let grep_tab = if mode_files { "  Grep  " } else { " [Grep] " };
+        let tabs_used = count_chars(files_tab) + count_chars(grep_tab);
+        let right_used = count_chars(&counts) + count_chars(&bread);
+        let middle_pad = w.saturating_sub(tabs_used + right_used);
+        Line::from(vec![
+            Span::styled(
+                files_tab,
+                if mode_files { active_style } else { inactive_style },
+            ),
+            Span::styled(
+                grep_tab,
+                if mode_files { inactive_style } else { active_style },
+            ),
+            Span::raw(" ".repeat(middle_pad)),
+            Span::styled(bread, Style::default().fg(PICKER_DIM)),
+            Span::styled(
+                counts,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+    f.render_widget(
+        Paragraph::new(tab_row),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    // --- Row 1: prompt -------------------------------------------------------
+    let arrow_style = Style::default()
+        .fg(picker_pulse_accent())
+        .add_modifier(Modifier::BOLD);
+    // Caret only blinks while in Input mode; Browse mode shows none.
+    let caret = if matches!(p.mode, PickerMode::Input) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if (ms / 500) % 2 == 0 {
+            "▏"
+        } else {
+            " "
+        }
+    } else {
+        ""
+    };
+    let prompt_line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("❯ ", arrow_style),
+        Span::styled(
+            p.query.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(caret, Style::default().fg(picker_pulse_accent())),
+    ]);
+    f.render_widget(
+        Paragraph::new(prompt_line),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+
+    // --- Row 2: top separator ------------------------------------------------
+    let sep = Line::from(Span::styled(
+        "─".repeat(w),
+        Style::default().fg(PICKER_BORDER),
+    ));
+    f.render_widget(
+        Paragraph::new(sep.clone()),
+        Rect::new(area.x, area.y + 2, area.width, 1),
+    );
+
+    // --- Body: list pane ------------------------------------------------------
+    let selected = p.selected;
+    let scroll = if body_h == 0 {
+        0
+    } else if selected >= body_h {
+        selected + 1 - body_h
+    } else {
+        0
+    };
+    let mut list_lines: Vec<Line> = Vec::with_capacity(body_h);
+    // Width budget for the row text after the gutter.
+    // Layout per row: " ▶ ●  <text> "  where ▶ is selection, ● is mark
+    // gutter. Reserve 4 cells for "▶  " + mark + 1 trailing space.
+    let row_chrome = 4usize;
+    let content_w = list_w.saturating_sub(row_chrome + 1);
+
+    for row in 0..body_h {
+        let match_idx = scroll + row;
+        let Some(&(item_idx, _)) = p.matches.get(match_idx) else {
+            list_lines.push(Line::raw(""));
+            continue;
+        };
+        let item = &p.items[item_idx];
+        let is_sel = match_idx == selected;
+        let is_marked = p.marked.contains(&item_idx);
+        let row_style = if is_sel {
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        let sel_glyph = if is_sel { "▶" } else { " " };
+        let mark_glyph = if is_marked { "●" } else { " " };
+        let displayed = fit_picker_row(item, content_w);
+
+        // fzf-style match highlight: bold-yellow the chars in the row that
+        // matched the live query. Only safe when the row wasn't truncated —
+        // path/grep fitters don't expose the input→display char map.
+        let highlight_chars: std::collections::HashSet<usize> = if !p.query.is_empty()
+            && displayed == item.display
+        {
+            match_indices(&item.haystack, &p.query)
+                .into_iter()
+                .map(|i| i as usize)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(Span::styled(format!(" {sel_glyph} "), row_style));
+        spans.push(Span::styled(
+            mark_glyph.to_string(),
+            if is_marked && !is_sel {
+                Style::default().fg(picker_pulse_accent())
+            } else {
+                row_style
+            },
+        ));
+        spans.push(Span::styled(" ".to_string(), row_style));
+        if highlight_chars.is_empty() {
+            spans.push(Span::styled(displayed.clone(), row_style));
+        } else {
+            for (i, c) in displayed.chars().enumerate() {
+                let style = if highlight_chars.contains(&i) {
+                    if is_sel {
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    }
+                } else {
+                    row_style
+                };
+                spans.push(Span::styled(c.to_string(), style));
+            }
+        }
+        // Pad row out to list width so the selection background covers it.
+        let used = row_chrome + count_chars(&displayed);
+        let pad = list_w.saturating_sub(used);
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), row_style));
+        }
+        list_lines.push(Line::from(spans));
+    }
+    f.render_widget(
+        Paragraph::new(list_lines),
+        Rect::new(area.x, area.y + body_top, list_w as u16, body_h as u16),
+    );
+
+    // --- Body: vertical separator + preview pane -----------------------------
+    if split_enabled {
+        let sep_col_lines: Vec<Line> = (0..body_h)
+            .map(|_| Line::from(Span::styled("│", Style::default().fg(PICKER_BORDER))))
+            .collect();
+        f.render_widget(
+            Paragraph::new(sep_col_lines),
+            Rect::new(area.x + sep_col, area.y + body_top, 1, body_h as u16),
+        );
+
+        render_picker_preview_pane(
+            f,
+            Rect::new(
+                area.x + preview_x,
+                area.y + body_top,
+                preview_w as u16,
+                body_h as u16,
+            ),
+            p,
+        );
+    }
+
+    // --- Bottom separator -----------------------------------------------------
+    f.render_widget(
+        Paragraph::new(sep),
+        Rect::new(area.x, area.y + body_bottom, area.width, 1),
+    );
+
+    // --- Footer hints --------------------------------------------------------
+    let mode_label = match p.mode {
+        PickerMode::Input => " input ",
+        PickerMode::Browse => " browse ",
+    };
+    let footer_body = if is_buffers {
+        match p.mode {
+            PickerMode::Input => "· <CR> browse · <Esc> close".to_string(),
+            PickerMode::Browse => {
+                "· j/k nav · <CR> switch · s save · q/Q close · r/R reload · <Esc> close"
+                    .to_string()
+            }
+        }
+    } else {
+        let toggle = match p.kind {
+            PickerKind::Files => "<Tab> grep",
+            _ => "<Tab> files",
+        };
+        let nav = match p.mode {
+            PickerMode::Input => "<CR> browse",
+            PickerMode::Browse => "j/k nav · <Space> mark · <CR> open",
+        };
+        format!("· {toggle} · {nav} · <Esc> close")
+    };
+    let mark_status = if !p.marked.is_empty() {
+        format!(" [{} marked] ", p.marked.len())
+    } else {
+        String::new()
+    };
+    let footer_left = format!("{mode_label}{footer_body}");
+    let footer_pad = w
+        .saturating_sub(count_chars(&footer_left) + count_chars(&mark_status))
+        .max(0);
+    let footer_line = Line::from(vec![
+        Span::styled(
+            mode_label.to_string(),
+            Style::default()
+                .bg(picker_pulse_accent())
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(footer_body, Style::default().fg(PICKER_DIM)),
+        Span::raw(" ".repeat(footer_pad)),
+        Span::styled(
+            mark_status,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer_line),
+        Rect::new(area.x, area.y + (h as u16 - 1), area.width, 1),
+    );
+
+    // --- Mouse hit-test bookkeeping ------------------------------------------
+    // `last_picker_rect` is the *list* area (not including chrome) so the
+    // mouse handler can map row → match index without subtracting a header.
+    ed.last_picker_rect = Some(Rect::new(
+        area.x,
+        area.y + body_top,
+        list_w as u16,
+        body_h as u16,
+    ));
+    ed.last_picker_scroll = scroll;
+    ed.last_picker_list_rows = body_h;
+}
+
+/// Draw the preview pane for the highlighted Files/Grep row. Caller positions
+/// the rect; we own every cell inside it.
+fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: &Picker) {
+    let w = area.width as usize;
+    let h = area.height as usize;
+    if w < 8 || h < 3 {
+        return;
+    }
+
+    let Some(cache) = p.preview.as_ref() else {
+        // No selection → empty pane (paragraph would write spaces, but the
+        // background wipe in render_picker_fullscreen already cleared us).
+        return;
+    };
+
+    // Pane header: file name, dimmed, with a thin bottom rule.
+    let header_text = pad_or_trunc(
+        &format!(
+            " {} ",
+            cache
+                .path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+        w,
+    );
+    let header_line = Line::from(Span::styled(
+        header_text,
+        Style::default()
+            .fg(PICKER_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(
+        Paragraph::new(header_line),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let rule = Line::from(Span::styled(
+        "─".repeat(w),
+        Style::default().fg(PICKER_BORDER),
+    ));
+    f.render_widget(
+        Paragraph::new(rule),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+
+    let body_h = h.saturating_sub(2);
+    if body_h == 0 {
+        return;
+    }
+    let body_y = area.y + 2;
+
+    // Anchor: files start at line 0; grep hits put the matched line ~1/3 down.
+    let anchor = picker_preview_anchor_line(p);
+    let anchor = anchor.min(cache.lines.len().saturating_sub(1));
+    let view_top = if matches!(
+        p.matches
+            .get(p.selected)
+            .map(|&(i, _)| &p.items[i].value),
+        Some(PickerValue::GrepHit { .. })
+    ) {
+        let third = body_h / 3;
+        anchor.saturating_sub(third)
+    } else {
+        0
+    };
+
+    let line_num_w = (cache.lines.len()).to_string().len().max(3);
+    let content_w = w.saturating_sub(line_num_w + 2);
+
+    let mut body_lines: Vec<Line> = Vec::with_capacity(body_h);
+    for row in 0..body_h {
+        let line_idx = view_top + row;
+        if line_idx >= cache.lines.len() {
+            body_lines.push(Line::from(Span::styled(
+                "~",
+                Style::default().fg(PICKER_BORDER),
+            )));
+            continue;
+        }
+        let line_text = &cache.lines[line_idx];
+        let chars: Vec<char> = line_text.chars().collect();
+        let visible_chars: Vec<char> = chars.iter().take(content_w).copied().collect();
+
+        // Decide if this row is the grep hit line — if so, give it a subtle
+        // background so the user's eye snaps to it.
+        let is_hit_line = !cache.placeholder
+            && line_idx == anchor
+            && matches!(
+                p.matches
+                    .get(p.selected)
+                    .map(|&(i, _)| &p.items[i].value),
+                Some(PickerValue::GrepHit { .. })
+            );
+
+        let row_bg = if is_hit_line {
+            Some(Color::DarkGray)
+        } else {
+            None
+        };
+        let mut row_spans: Vec<Span> = Vec::new();
+        let num_text = format!(" {:>w$} ", line_idx + 1, w = line_num_w);
+        let num_text_chars = count_chars(&num_text);
+        let num_style = if is_hit_line {
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(picker_pulse_accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(PICKER_BORDER)
+        };
+        row_spans.push(Span::styled(num_text, num_style));
+
+        // Per-char styling: syntax base layer, plus optional row background.
+        let line_byte_start = cache.line_byte_starts[line_idx];
+        let line_text_byte_end = line_byte_start + line_text.len();
+
+        let base_bg = row_bg;
+        if cache.placeholder {
+            row_spans.push(Span::styled(
+                line_text.clone(),
+                Style::default().fg(PICKER_DIM),
+            ));
+        } else {
+            // Build per-char styles for visible chars only.
+            let mut styles: Vec<Style> = vec![Style::default(); visible_chars.len()];
+            for s in &cache.spans {
+                if s.range.end <= line_byte_start || s.range.start >= line_text_byte_end {
+                    continue;
+                }
+                let Some(style) = scope_style(s.scope) else {
+                    continue;
+                };
+                let line_chars_start = char_index_in_byte_range(
+                    line_text,
+                    s.range.start.saturating_sub(line_byte_start),
+                );
+                let line_chars_end = char_index_in_byte_range(
+                    line_text,
+                    s.range.end.saturating_sub(line_byte_start),
+                );
+                for slot in styles
+                    .iter_mut()
+                    .take(line_chars_end.min(visible_chars.len()))
+                    .skip(line_chars_start.min(visible_chars.len()))
+                {
+                    *slot = style;
+                }
+            }
+            for (i, c) in visible_chars.iter().enumerate() {
+                let mut style = styles[i];
+                if let Some(bg) = base_bg {
+                    style = style.bg(bg);
+                }
+                if is_hit_line {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                row_spans.push(Span::styled(c.to_string(), style));
+            }
+        }
+
+        // Pad row out so the bg color stretches if a hit line.
+        let used = num_text_chars + visible_chars.len();
+        let pad = w.saturating_sub(used);
+        if pad > 0 {
+            let pad_style = if let Some(bg) = base_bg {
+                Style::default().bg(bg)
+            } else {
+                Style::default()
+            };
+            row_spans.push(Span::styled(" ".repeat(pad), pad_style));
+        }
+        body_lines.push(Line::from(row_spans));
+    }
+    f.render_widget(
+        Paragraph::new(body_lines),
+        Rect::new(area.x, body_y, area.width, body_h as u16),
+    );
+}
+
+/// Map a byte offset within a UTF-8 string to its char index. Clamps to
+/// `s.chars().count()` if the byte is at or past the end.
+fn char_index_in_byte_range(s: &str, byte_offset: usize) -> usize {
+    if byte_offset >= s.len() {
+        return s.chars().count();
+    }
+    s[..byte_offset].chars().count()
+}
+
 fn render_cmdline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let content = match ed.mode {
         Mode::Command => format!("{}{}", ed.cmdline_prompt, ed.cmdline),
@@ -4908,7 +5989,91 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
     use vix_lsp::lsp_types::{Position, Range, TextEdit};
+
+    /// Build a Files picker over an in-memory item list, render it through a
+    /// 100x30 TestBackend, and confirm we don't panic and that the list rect
+    /// reaches the configured terminal width. Drives the new fullscreen
+    /// renderer end-to-end (split layout + preview).
+    #[test]
+    fn fullscreen_picker_renders_without_panic() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let items: Vec<PickerItem> = ["src/main.rs", "src/lib.rs", "Cargo.toml"]
+            .iter()
+            .map(|p| PickerItem {
+                display: p.to_string(),
+                value: PickerValue::File((*p).into()),
+                haystack: Utf32String::from(*p),
+            })
+            .collect();
+        let mut picker = Picker {
+            kind: PickerKind::Files,
+            mode: PickerMode::Input,
+            query: String::new(),
+            items,
+            matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
+            preview: None,
+        };
+        picker.rescore();
+        ed.picker = Some(picker);
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+
+        // The list rect should now point at a non-empty area inside the body.
+        let rect = ed.last_picker_rect.expect("expected picker rect set");
+        assert!(rect.width > 0);
+        assert!(rect.height > 0);
+        // Body starts at y=3 (tabs / prompt / separator).
+        assert_eq!(rect.y, 3);
+    }
+
+    /// Narrow terminal: the renderer should fall back to the overlay layout
+    /// instead of trying to fit a split pane in too few columns.
+    #[test]
+    fn narrow_terminal_falls_back_to_overlay() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let items: Vec<PickerItem> = ["a.rs", "b.rs"]
+            .iter()
+            .map(|p| PickerItem {
+                display: p.to_string(),
+                value: PickerValue::File((*p).into()),
+                haystack: Utf32String::from(*p),
+            })
+            .collect();
+        let mut picker = Picker {
+            kind: PickerKind::Files,
+            mode: PickerMode::Input,
+            query: String::new(),
+            items,
+            matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
+            preview: None,
+        };
+        picker.rescore();
+        ed.picker = Some(picker);
+
+        let backend = TestBackend::new(40, 14);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+        // Overlay layout sets the rect inside the centered floating box,
+        // so width is bounded by 80% of the area, not the full terminal.
+        let rect = ed.last_picker_rect.expect("expected picker rect set");
+        assert!(rect.width as u32 <= (40 * 4 / 5));
+    }
+
+
 
     fn edit(sl: u32, sc: u32, el: u32, ec: u32, text: &str) -> TextEdit {
         TextEdit {
@@ -5033,6 +6198,7 @@ mod tests {
             cached_files: None,
             pending_g: false,
             marked: std::collections::HashSet::new(),
+            preview: None,
         });
         ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
         ed.last_picker_scroll = 0;

@@ -128,6 +128,22 @@ pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
     Ok(rx.iter().collect())
 }
 
+/// Compute the matched character positions for `haystack` against `query`.
+/// Returns char indices into `haystack`, sorted and deduped. Empty query →
+/// empty vec. Used by the picker UI to bold matched chars in a row.
+pub fn match_indices(haystack: &Utf32String, query: &str) -> Vec<u32> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut indices: Vec<u32> = Vec::new();
+    pattern.indices(haystack.slice(..), &mut matcher, &mut indices);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// Score a corpus against `query` and return the top-N by score, descending.
 /// Items with no match are filtered out. On empty query, returns the first
 /// `limit` items in input order (score 0).

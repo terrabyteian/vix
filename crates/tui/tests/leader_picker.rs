@@ -201,17 +201,18 @@ fn first_click_focuses_second_click_activates() {
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
     assert!(h.picker_open());
-    h.set_picker_geometry(Rect::new(0, 0, 40, 12), 0);
-    // Click on row 2 (second list row) — the default selection is row 0,
-    // so this is a focus-only click; picker stays open with new selection.
-    h.click(5, 2);
+    // Fullscreen picker geometry: list pane only (no header inside the rect).
+    h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
+    // Click on the second list row — default selection is row 0, so this is
+    // a focus-only click; picker stays open with new selection.
+    h.click(5, 4);
     assert!(
         h.picker_open(),
         "first click on a non-selected row should only focus"
     );
     assert_eq!(h.editor.picker_selected_for_test(), 1);
     // Clicking the same row again activates and closes the picker.
-    h.click(5, 2);
+    h.click(5, 4);
     assert!(
         !h.picker_open(),
         "second click on the focused row should activate"
@@ -223,9 +224,9 @@ fn click_on_already_selected_row_activates_immediately() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
-    h.set_picker_geometry(Rect::new(0, 0, 40, 12), 0);
-    // Row 1 is the first list row, which matches the default selection (0).
-    h.click(5, 1);
+    h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
+    // Row 3 is the first list row in the rect, matching default selection 0.
+    h.click(5, 3);
     assert!(
         !h.picker_open(),
         "click on the currently-selected row should activate"
@@ -247,13 +248,20 @@ fn click_outside_picker_is_ignored() {
 }
 
 #[test]
-fn click_on_header_row_is_ignored() {
+fn click_above_list_area_is_ignored() {
+    // The fullscreen picker reserves rows 0..2 for chrome (tabs / prompt /
+    // separator). `last_picker_rect` is the list area, so clicks above it
+    // fall outside the rect and are ignored — same behavior the old
+    // overlay enforced via a "row 0 is header" check.
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
-    h.set_picker_geometry(Rect::new(0, 0, 40, 12), 0);
-    h.click(5, 0); // header row
-    assert!(h.picker_open(), "click on header row should not activate");
+    h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
+    h.click(5, 0); // chrome row, above the list
+    assert!(
+        h.picker_open(),
+        "click above the list should not activate"
+    );
 }
 
 #[test]
