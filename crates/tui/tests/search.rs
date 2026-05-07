@@ -131,3 +131,69 @@ fn search_then_dw_deletes_match() {
     h.keys("dw");
     h.assert_text("alpha charlie\n");
 }
+
+#[test]
+fn forward_search_pins_match_to_top_of_viewport() {
+    // 30 lines: only one of them matches; the cursor starts at line 0 so
+    // `view_top` would normally stay at 0. The fresh-search scroll should
+    // pull line 20 up to be the first row in the pane.
+    let mut text = String::new();
+    for i in 0..30 {
+        if i == 20 {
+            text.push_str("needle here\n");
+        } else {
+            text.push_str("filler\n");
+        }
+    }
+    let mut h = Harness::with_text(&text);
+    h.keys("/needle<CR>");
+    h.assert_cursor(20, 0);
+    assert_eq!(
+        h.view_top(),
+        20,
+        "fresh `/` search should put the matched line at the top of the viewport"
+    );
+}
+
+#[test]
+fn n_after_initial_search_does_not_repin_to_top() {
+    // Two matches across many lines. Initial `/` pins match #1 to the top;
+    // pressing `n` should *not* pin again — leave the existing scroll
+    // adjustment to `ensure_cursor_visible` so n/N feels like normal
+    // navigation rather than re-anchoring on every press.
+    let mut text = String::new();
+    for i in 0..40 {
+        if i == 5 || i == 30 {
+            text.push_str("needle here\n");
+        } else {
+            text.push_str("filler\n");
+        }
+    }
+    let mut h = Harness::with_text(&text);
+    h.keys("/needle<CR>");
+    assert_eq!(h.view_top(), 5);
+    // `n` advances to line 30. With a fresh-only pin, view_top should be
+    // wherever ensure_cursor_visible lands it — strictly less than 30.
+    h.keys("n");
+    h.assert_cursor(30, 0);
+    assert!(
+        h.view_top() < 30,
+        "n should not pin the next match to the top; got view_top = {}",
+        h.view_top()
+    );
+}
+
+#[test]
+fn no_match_does_not_change_view_top() {
+    let mut text = String::new();
+    for _ in 0..30 {
+        text.push_str("filler\n");
+    }
+    let mut h = Harness::with_text(&text);
+    // Scroll the viewport down a few lines first, then run a search that
+    // misses — view_top should be untouched on no-match.
+    h.keys("10j");
+    let before = h.view_top();
+    h.keys("/qzxq<CR>");
+    assert_eq!(h.view_top(), before);
+}

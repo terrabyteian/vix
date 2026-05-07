@@ -251,6 +251,8 @@ fn decode_token(tok: &str) -> KeyEvent {
         "down" => return key(KeyCode::Down),
         "left" => return key(KeyCode::Left),
         "right" => return key(KeyCode::Right),
+        "pageup" | "pgup" => return key(KeyCode::PageUp),
+        "pagedown" | "pgdn" => return key(KeyCode::PageDown),
         "lt" => return key(KeyCode::Char('<')),
         "gt" => return key(KeyCode::Char('>')),
         "nul" => return key_mod(KeyCode::Char(' '), KeyModifiers::CONTROL),
@@ -288,6 +290,8 @@ fn decode_token(tok: &str) -> KeyEvent {
         "down" => KeyCode::Down,
         "left" => KeyCode::Left,
         "right" => KeyCode::Right,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdn" => KeyCode::PageDown,
         other => panic!("unknown key token: <{other}>"),
     };
     key_mod(code, mods)

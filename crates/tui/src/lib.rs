@@ -249,6 +249,14 @@ struct Picker {
     /// rescan the tree on every flip. Populated for the unified
     /// Files/Grep picker; left `None` for other picker kinds.
     cached_files: Option<Vec<PickerItem>>,
+    /// Set after a single `g` in Browse mode; the next `g` jumps to top.
+    /// Cleared by any other key.
+    pending_g: bool,
+    /// Item indices marked by `<Space>` in Browse mode for batch opening.
+    /// Item indices (not match indices) so marks survive query rescoring;
+    /// cleared whenever the `items` vector is replaced (Tab toggle, grep
+    /// refresh). Only Files/Grep pickers populate this.
+    marked: std::collections::HashSet<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -563,6 +571,10 @@ impl Editor {
     #[doc(hidden)]
     pub fn picker_selected_for_test(&self) -> usize {
         self.picker.as_ref().map(|p| p.selected).unwrap_or(0)
+    }
+    #[doc(hidden)]
+    pub fn picker_marked_count_for_test(&self) -> usize {
+        self.picker.as_ref().map(|p| p.marked.len()).unwrap_or(0)
     }
     pub fn picker_kind_label(&self) -> Option<&'static str> {
         self.picker.as_ref().map(|p| match p.kind {
@@ -1100,6 +1112,8 @@ impl Editor {
             selected: 0,
             scroll: 0,
             cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -1435,6 +1449,8 @@ impl Editor {
             selected: 0,
             scroll: 0,
             cached_files: Some(cached_files),
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -1480,6 +1496,9 @@ impl Editor {
         }
         p.selected = 0;
         p.scroll = 0;
+        // Item indices change when the items list is replaced, so any
+        // previously-marked entries now point at the wrong rows.
+        p.marked.clear();
         p.rescore();
     }
 
@@ -1500,6 +1519,7 @@ impl Editor {
             return;
         };
         p.items = new_items;
+        p.marked.clear();
         p.rescore();
     }
 
@@ -1544,6 +1564,8 @@ impl Editor {
             selected: 0,
             scroll: 0,
             cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -1564,6 +1586,7 @@ impl Editor {
             None,
             Close,
             Select(PickerValue),
+            SelectMany(Vec<PickerValue>),
             Toggle,
             // Re-score (Files) or re-grep (Grep) after the query changed.
             Refresh,
@@ -1573,6 +1596,9 @@ impl Editor {
             let Some(p) = self.picker.as_mut() else {
                 return false;
             };
+            // Any keypress consumes the pending-`g` state. The 'g' branch
+            // below re-arms it on demand.
+            let was_pending_g = std::mem::replace(&mut p.pending_g, false);
             let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
             match k.code {
                 KeyCode::Esc => {
@@ -1597,6 +1623,31 @@ impl Editor {
                     if p.mode == PickerMode::Input {
                         p.mode = PickerMode::Browse;
                         Post::None
+                    } else if !p.marked.is_empty() {
+                        // Batch-open: collect marked items in match order so
+                        // the last-marked-in-list ends up active. Items not
+                        // currently visible (filtered out by the live query)
+                        // are still picked up — we walk all items, not just
+                        // the match list.
+                        let mut values: Vec<PickerValue> = p
+                            .matches
+                            .iter()
+                            .filter(|(item_idx, _)| p.marked.contains(item_idx))
+                            .map(|(item_idx, _)| p.items[*item_idx].value.clone())
+                            .collect();
+                        // Pick up any marked items that the current query
+                        // filters out, so a mark made earlier doesn't get
+                        // silently dropped.
+                        for &item_idx in &p.marked {
+                            if !p.matches.iter().any(|(i, _)| *i == item_idx) {
+                                values.push(p.items[item_idx].value.clone());
+                            }
+                        }
+                        if values.is_empty() {
+                            Post::Close
+                        } else {
+                            Post::SelectMany(values)
+                        }
                     } else if let Some(&(idx, _)) = p.matches.get(p.selected) {
                         Post::Select(p.items[idx].value.clone())
                     } else {
@@ -1632,6 +1683,28 @@ impl Editor {
                     match c {
                         'j' => p.move_selection(1),
                         'k' => p.move_selection(-1),
+                        'g' => {
+                            if was_pending_g {
+                                p.selected = 0;
+                            } else {
+                                p.pending_g = true;
+                            }
+                        }
+                        'G' => {
+                            p.selected = p.matches.len().saturating_sub(1);
+                        }
+                        // Multi-select: only meaningful for Files/Grep, since
+                        // those are the kinds that can be opened in batch.
+                        ' ' if is_unified => {
+                            if let Some(&(item_idx, _)) = p.matches.get(p.selected) {
+                                if !p.marked.insert(item_idx) {
+                                    p.marked.remove(&item_idx);
+                                }
+                            }
+                        }
+                        'c' if is_unified => {
+                            p.marked.clear();
+                        }
                         _ => {}
                     }
                     Post::None
@@ -1652,6 +1725,16 @@ impl Editor {
             Post::Select(v) => {
                 self.picker = None;
                 self.pick_result(v);
+            }
+            Post::SelectMany(values) => {
+                self.picker = None;
+                // Open each selected item in turn. `pick_result` parks the
+                // active buffer before swapping to the new one, so all
+                // earlier selections remain reachable via `:b`/buffer
+                // picker, and the cursor lands on whichever opened last.
+                for v in values {
+                    self.pick_result(v);
+                }
             }
             Post::Toggle => {
                 self.toggle_picker_mode();
@@ -2144,6 +2227,8 @@ impl Editor {
             selected: 0,
             scroll: 0,
             cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -2204,20 +2289,25 @@ impl Editor {
             selected: 0,
             scroll: 0,
             cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
         };
         p.rescore();
         self.picker = Some(p);
     }
 
-    fn do_search(&mut self, query: &str, dir: SearchDirection) {
+    /// Returns the line index of the match on success so the caller can
+    /// adjust the viewport (e.g. pin the first match to the top of the
+    /// pane on a fresh `/` search).
+    fn do_search(&mut self, query: &str, dir: SearchDirection) -> Option<usize> {
         if query.is_empty() {
-            return;
+            return None;
         }
         let re = match compile_search(query, Case::Smart) {
             Ok(r) => r,
             Err(e) => {
                 self.msg = format!("E: {e}");
-                return;
+                return None;
             }
         };
         // Vim starts search from cursor + 1 for forward, cursor for backward.
@@ -2236,9 +2326,11 @@ impl Editor {
                 self.sel = Selection::at(s).clamped(&self.buffer);
                 self.last_search = Some((query.to_string(), dir));
                 self.hl_search = true;
+                Some(self.cursor_line())
             }
             None => {
                 self.msg = format!("E486: Pattern not found: {query}");
+                None
             }
         }
     }
@@ -2331,6 +2423,16 @@ impl Editor {
             self.view_top = line;
         } else if line >= self.view_top + viewport_rows {
             self.view_top = line + 1 - viewport_rows;
+        }
+    }
+
+    /// Lines to jump on PageUp / PageDown — vim's `<C-f>`/`<C-b>` convention
+    /// (viewport height − 2, leaving two rows of context across the jump).
+    /// Falls back to 10 if no frame has rendered yet.
+    fn page_step(&self) -> usize {
+        match self.last_content_rect {
+            Some(r) => (r.height as usize).saturating_sub(2).max(1),
+            None => 10,
         }
     }
 
@@ -3559,6 +3661,41 @@ impl Editor {
             }
         }
 
+        // PageUp / PageDown: jump the cursor by ~one screen. `ensure_cursor_visible`
+        // at render time pulls `view_top` along, the same way mouse-wheel scroll
+        // works. No vim keymap entry, so we move the cursor directly.
+        if matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
+            if self.mode == Mode::Command {
+                return;
+            }
+            let step = self.page_step();
+            let motion = if k.code == KeyCode::PageUp {
+                Motion::Up
+            } else {
+                Motion::Down
+            };
+            self.completion_popup = None;
+            let new_sel = apply_motion(&self.buffer, self.sel, motion, step);
+            self.sel = if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
+                // Extend: keep anchor, move head only — same as Action::Move.
+                Selection {
+                    anchor: self.sel.anchor,
+                    head: new_sel.head,
+                    virt_col: new_sel.virt_col,
+                }
+            } else {
+                new_sel
+            }
+            .clamped(&self.buffer);
+            if self.mode == Mode::Insert {
+                if let Some(pi) = self.pending_insert.as_mut() {
+                    pi.typed.clear();
+                    pi.start = self.sel.head;
+                }
+            }
+            return;
+        }
+
         match self.mode {
             Mode::Normal => {
                 if let KeyCode::Char(c) = k.code {
@@ -3804,11 +3941,18 @@ impl Editor {
                     match prompt {
                         '/' => {
                             self.push_jump();
-                            self.do_search(&cmd, SearchDirection::Forward);
+                            if let Some(line) = self.do_search(&cmd, SearchDirection::Forward) {
+                                // Pin the first hit to the top of the
+                                // viewport so it's easy to skim the
+                                // following matches with `n`.
+                                self.view_top = line;
+                            }
                         }
                         '?' => {
                             self.push_jump();
-                            self.do_search(&cmd, SearchDirection::Backward);
+                            if let Some(line) = self.do_search(&cmd, SearchDirection::Backward) {
+                                self.view_top = line;
+                            }
                         }
                         _ => self.run_ex(&cmd),
                     }
@@ -4589,14 +4733,27 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
         PickerKind::Grep => " <Tab>=files ",
         _ => "",
     };
+    let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
     let mode_hint = match p.mode {
         PickerMode::Input => " <Enter>=browse ",
-        PickerMode::Browse => " j/k <Enter>=open <Esc>=input ",
+        PickerMode::Browse => {
+            if is_unified {
+                " j/k <Space>=mark c=clear <Enter>=open "
+            } else {
+                " j/k <Enter>=open <Esc>=input "
+            }
+        }
+    };
+    let mark_hint = if is_unified && !p.marked.is_empty() {
+        format!(" [{}m] ", p.marked.len())
+    } else {
+        String::new()
     };
     let count = format!(
-        "{}{}{}/{} ",
+        "{}{}{}{}/{} ",
         toggle_hint,
         mode_hint,
+        mark_hint,
         p.matches.len(),
         p.items.len()
     );
@@ -4648,10 +4805,24 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
                 } else {
                     bg
                 };
-                let text = fit_picker_row(item, w as usize);
-                let pad = (w as usize).saturating_sub(count_chars(&text));
+                // 2-char left gutter on Files/Grep so marks have somewhere
+                // to render. Other pickers don't support multi-select, so
+                // we leave their layout untouched.
+                let (gutter, content_w) = if is_unified {
+                    let g = if p.marked.contains(&item_idx) {
+                        "● "
+                    } else {
+                        "  "
+                    };
+                    (g, (w as usize).saturating_sub(2))
+                } else {
+                    ("", w as usize)
+                };
+                let text = fit_picker_row(item, content_w);
+                let row_text = format!("{gutter}{text}");
+                let pad = (w as usize).saturating_sub(count_chars(&row_text));
                 lines.push(Line::from(vec![
-                    Span::styled(text, style),
+                    Span::styled(row_text, style),
                     Span::styled(" ".repeat(pad), style),
                 ]));
             }
@@ -4860,6 +5031,8 @@ mod tests {
             selected: 0,
             scroll: 0,
             cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
         });
         ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
         ed.last_picker_scroll = 0;
