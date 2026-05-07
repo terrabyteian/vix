@@ -100,12 +100,13 @@ $BIN /tmp/big.rs
 $BIN tests/fixtures/project/src/main.rs
 ```
 
-- [ ] `:Files` (or whatever the bound key is) opens the file picker. Type a
-      query — results filter incrementally with no visible lag.
-- [ ] `<CR>` switches the picker from input mode to browse mode; `j` / `k`
-      move the selection there; a second `<CR>` opens the selected file.
-- [ ] `<Esc>` in browse mode returns to input mode; `<Esc>` in input mode
-      clears the query first, then closes.
+- [ ] `:Files` (or whatever the bound key is) opens the file picker in
+      browse (nav) mode; `j` / `k` move the selection, `<CR>` opens the
+      highlighted row.
+- [ ] `/` from browse enters input mode where typing filters results
+      incrementally with no visible lag.
+- [ ] `<Esc>` or `<CR>` from input returns to browse mode with the query
+      preserved. A second `<Esc>` from browse closes the picker.
 - [ ] `:Buffers` lists the active + parked buffers; selecting one switches to
       it without disturbing the unnamed register.
 - [ ] `:Grep foo` opens grep results; entries show `file:line` and a snippet.

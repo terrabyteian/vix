@@ -44,14 +44,14 @@ fn buffers_picker_has_one_item_per_buffer() {
 }
 
 #[test]
-fn cr_then_cr_switches_to_highlighted_buffer() {
-    // First <CR> moves picker into Browse mode; second <CR> activates the
-    // highlighted (default: the currently-active row).
+fn cr_switches_to_highlighted_buffer() {
+    // Picker opens in Browse (nav) mode; <CR> activates the highlighted row
+    // (default: the currently-active buffer).
     let a = tmpfile("alpha buf\n");
     let mut h = Harness::with_text_and_path("active\n", "active.txt");
     h.cmd(&format!("e {}", a.display()));
     h.assert_text("alpha buf\n");
-    h.keys("<Space>b<CR><CR>");
+    h.keys("<Space>b<CR>");
     // Still on the active buffer (row 0 was selected by default).
     assert!(!h.picker_open());
     h.assert_text("alpha buf\n");
@@ -64,7 +64,7 @@ fn j_then_cr_switches_to_parked_buffer() {
     h.cmd(&format!("e {}", a.display()));
     // Buffer "starting" is now parked at idx 1; "parked content" is active.
     h.assert_text("parked content\n");
-    h.keys("<Space>b<CR>j<CR>");
+    h.keys("<Space>bj<CR>");
     assert!(!h.picker_open());
     h.assert_text("starting\n");
 }
@@ -75,7 +75,7 @@ fn s_saves_active_dirty_buffer_from_picker() {
     let mut h = Harness::with_text_and_path("on disk\n", &p);
     h.keys("Adirty<Esc>");
     assert!(h.dirty());
-    h.keys("<Space>b<CR>s");
+    h.keys("<Space>bs");
     assert!(h.picker_open(), "picker stays open after save");
     assert!(!h.dirty(), "save should clear dirty flag");
     assert_eq!(fs::read_to_string(&p).unwrap(), "on diskdirty\n");
@@ -87,7 +87,7 @@ fn q_refuses_to_close_dirty_active_buffer() {
     let mut h = Harness::with_text_and_path("file\n", &p);
     h.keys("Adirty<Esc>");
     assert!(h.dirty());
-    h.keys("<Space>b<CR>q");
+    h.keys("<Space>bq");
     // Picker should still be open with a complaint message.
     assert!(h.picker_open());
     assert!(h.msg().contains("E89"), "expected E89, got {:?}", h.msg());
@@ -105,7 +105,7 @@ fn capital_q_force_closes_dirty_buffer() {
     h.keys("Adirty<Esc>");
     assert!(h.dirty());
     let before = h.buffer_count();
-    h.keys("<Space>b<CR>Q");
+    h.keys("<Space>bQ");
     // Active buffer was force-closed; one of the parked buffers takes over.
     assert!(h.picker_open(), "picker stays open after force-close");
     assert_eq!(h.buffer_count(), before - 1);
@@ -118,7 +118,7 @@ fn r_refuses_to_reload_dirty_buffer() {
     let mut h = Harness::with_text_and_path("on disk\n", &p);
     h.keys("Adirty<Esc>");
     assert!(h.dirty());
-    h.keys("<Space>b<CR>r");
+    h.keys("<Space>br");
     assert!(h.picker_open());
     assert!(h.msg().contains("E37"), "expected E37, got {:?}", h.msg());
     // Buffer text unchanged.
@@ -131,7 +131,7 @@ fn capital_r_force_reloads_from_disk() {
     let mut h = Harness::with_text_and_path("disk text\n", &p);
     h.keys("Adirty<Esc>");
     assert!(h.dirty());
-    h.keys("<Space>b<CR>R");
+    h.keys("<Space>bR");
     assert!(h.picker_open());
     assert!(!h.dirty());
     assert_eq!(h.text(), "disk text\n");
@@ -142,7 +142,7 @@ fn close_only_buffer_quits_editor() {
     let p = tmpfile("clean\n");
     let mut h = Harness::with_text_and_path("clean\n", &p);
     assert!(!h.dirty());
-    h.keys("<Space>b<CR>q");
+    h.keys("<Space>bq");
     // The picker must be torn down because the editor is exiting.
     assert!(h.quit_requested());
     assert!(!h.picker_open());
@@ -156,7 +156,7 @@ fn capital_q_on_parked_buffer_removes_it() {
     // active = "alpha" (just opened); parked = ["active"].
     let before = h.buffer_count();
     // Move down to the parked buffer (row 1) then force-close.
-    h.keys("<Space>b<CR>jQ");
+    h.keys("<Space>bjQ");
     assert!(h.picker_open());
     assert_eq!(h.buffer_count(), before - 1);
 }
@@ -176,7 +176,7 @@ fn save_on_parked_buffer_writes_to_disk() {
     assert_eq!(h.text(), "a contents\n");
     // Picker order: row 0 = active (a contents), row 1 = parked origin.
     // `js` moves to row 1 then saves it.
-    h.keys("<Space>b<CR>js");
+    h.keys("<Space>bjs");
     assert!(h.picker_open());
     assert_eq!(
         fs::read_to_string(&origin_path).unwrap(),

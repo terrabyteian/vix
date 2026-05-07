@@ -1137,7 +1137,7 @@ impl Editor {
         self.pending_code_actions = actions;
         let mut p = Picker {
             kind: PickerKind::CodeActions,
-            mode: PickerMode::Input,
+            mode: PickerMode::Browse,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -1475,7 +1475,7 @@ impl Editor {
         };
         let mut p = Picker {
             kind: initial,
-            mode: PickerMode::Input,
+            mode: PickerMode::Browse,
             query: initial_query.to_string(),
             items,
             matches: Vec::new(),
@@ -1591,7 +1591,7 @@ impl Editor {
             .collect();
         let mut p = Picker {
             kind: PickerKind::Symbols,
-            mode: PickerMode::Input,
+            mode: PickerMode::Browse,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -1642,12 +1642,9 @@ impl Editor {
             let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
             match k.code {
                 KeyCode::Esc => {
-                    if p.mode == PickerMode::Browse {
-                        p.mode = PickerMode::Input;
+                    if p.mode == PickerMode::Input {
+                        p.mode = PickerMode::Browse;
                         Post::None
-                    } else if is_unified && !p.query.is_empty() {
-                        p.query.clear();
-                        Post::Refresh
                     } else {
                         Post::Close
                     }
@@ -1737,6 +1734,7 @@ impl Editor {
                     match c {
                         'j' => p.move_selection(1),
                         'k' => p.move_selection(-1),
+                        '/' => p.mode = PickerMode::Input,
                         'g' => {
                             if was_pending_g {
                                 p.selected = 0;
@@ -2467,7 +2465,7 @@ impl Editor {
         }
         let mut p = Picker {
             kind: PickerKind::Jumps,
-            mode: PickerMode::Input,
+            mode: PickerMode::Browse,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -2516,7 +2514,7 @@ impl Editor {
         let items = self.buffer_picker_items();
         let mut p = Picker {
             kind: PickerKind::Buffers,
-            mode: PickerMode::Input,
+            mode: PickerMode::Browse,
             query: String::new(),
             items,
             matches: Vec::new(),
@@ -5052,12 +5050,12 @@ fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     };
     let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
     let mode_hint = match p.mode {
-        PickerMode::Input => " <Enter>=browse ",
+        PickerMode::Input => " <Enter>/<Esc>=nav ",
         PickerMode::Browse => {
             if is_unified {
-                " j/k <Space>=mark c=clear <Enter>=open "
+                " j/k /=search <Space>=mark c=clear <Enter>=open "
             } else {
-                " j/k <Enter>=open <Esc>=input "
+                " j/k /=search <Enter>=open <Esc>=close "
             }
         }
     };
@@ -5687,9 +5685,9 @@ fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
     };
     let footer_body = if is_buffers {
         match p.mode {
-            PickerMode::Input => "· <CR> browse · <Esc> close".to_string(),
+            PickerMode::Input => "· <CR>/<Esc> nav".to_string(),
             PickerMode::Browse => {
-                "· j/k nav · <CR> switch · s save · q/Q close · r/R reload · <Esc> close"
+                "· j/k nav · / search · <CR> switch · s save · q/Q close · r/R reload · <Esc> close"
                     .to_string()
             }
         }
@@ -5699,8 +5697,8 @@ fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
             _ => "<Tab> files",
         };
         let nav = match p.mode {
-            PickerMode::Input => "<CR> browse",
-            PickerMode::Browse => "j/k nav · <Space> mark · <CR> open",
+            PickerMode::Input => "<CR>/<Esc> nav",
+            PickerMode::Browse => "j/k nav · / search · <Space> mark · <CR> open",
         };
         format!("· {toggle} · {nav} · <Esc> close")
     };
