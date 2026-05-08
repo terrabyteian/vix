@@ -541,11 +541,33 @@ impl Picker {
     /// for big result sets. We skip the fuzzy pass entirely and produce an
     /// identity match list (worker order, capped). Closer to ripgrep
     /// behavior, and zero per-result work on the UI thread.
+    ///
+    /// Files uses smart-case substring (not fuzzy) so a 100k-file corpus
+    /// stays cheap per keystroke: no nucleo pattern parse, no per-item
+    /// score, just a byte scan over the display string. Matches the user's
+    /// "real grep on filenames" mental model.
     fn rescore(&mut self) {
         if matches!(self.kind, PickerKind::Grep) {
             self.matches.clear();
             for (i, _) in self.items.iter().enumerate().take(1000) {
                 self.matches.push((i, 0));
+            }
+            if self.selected >= self.matches.len() {
+                self.selected = self.matches.len().saturating_sub(1);
+            }
+            self.scroll = 0;
+            return;
+        }
+        if matches!(self.kind, PickerKind::Files) {
+            self.matches.clear();
+            let q = &self.query;
+            for (i, it) in self.items.iter().enumerate() {
+                if substring_match_smart(&it.display, q).is_some() {
+                    self.matches.push((i, 0));
+                    if self.matches.len() >= 1000 {
+                        break;
+                    }
+                }
             }
             if self.selected >= self.matches.len() {
                 self.selected = self.matches.len().saturating_sub(1);
@@ -564,6 +586,47 @@ impl Picker {
         }
         self.scroll = 0;
     }
+}
+
+/// Smart-case substring search. Returns the byte offset of the first match
+/// in `haystack`, or `None`. An empty `query` returns `Some(0)` (so callers
+/// treat empty-query as "all match").
+///
+/// Smart case = case-sensitive when `query` contains any uppercase ASCII
+/// letter, else ASCII case-insensitive. Non-ASCII queries fall through to
+/// case-sensitive `str::find`; full Unicode case folding would mean
+/// allocating per haystack on every keystroke, which defeats the purpose.
+/// Editor targets (paths, identifiers) are predominantly ASCII so this is
+/// the right trade.
+fn substring_match_smart(haystack: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    if !query.is_ascii() || query.bytes().any(|b| b.is_ascii_uppercase()) {
+        return haystack.find(query);
+    }
+    // Query is ASCII and all-lowercase. Case-fold the haystack byte-by-byte
+    // as we scan. ASCII bytes can't appear inside UTF-8 continuation bytes,
+    // so the byte offset we return is always on a char boundary even for
+    // mixed-script haystacks.
+    let h = haystack.as_bytes();
+    let n = query.as_bytes();
+    if h.len() < n.len() {
+        return None;
+    }
+    let first = n[0];
+    'outer: for i in 0..=h.len() - n.len() {
+        if h[i].to_ascii_lowercase() != first {
+            continue;
+        }
+        for j in 1..n.len() {
+            if h[i + j].to_ascii_lowercase() != n[j] {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
 }
 
 impl Editor {
@@ -5952,14 +6015,27 @@ fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
         // rows skip this entirely: their list display is just `path:line`
         // and the query is a regex over file *contents*, so fuzzy-matching
         // the path would highlight nothing useful and waste cycles.
+        // Files uses substring (not fuzzy), so we highlight a single
+        // contiguous run starting at the match position.
         let highlight_chars: std::collections::HashSet<usize> = if !p.query.is_empty()
             && displayed == item.display
             && !matches!(p.kind, PickerKind::Grep)
         {
-            match_indices(&item.haystack, &p.query)
-                .into_iter()
-                .map(|i| i as usize)
-                .collect()
+            if matches!(p.kind, PickerKind::Files) {
+                match substring_match_smart(&item.display, &p.query) {
+                    Some(byte_off) => {
+                        let char_start = item.display[..byte_off].chars().count();
+                        let char_count = p.query.chars().count();
+                        (char_start..char_start + char_count).collect()
+                    }
+                    None => std::collections::HashSet::new(),
+                }
+            } else {
+                match_indices(&item.haystack, &p.query)
+                    .into_iter()
+                    .map(|i| i as usize)
+                    .collect()
+            }
         } else {
             std::collections::HashSet::new()
         };
