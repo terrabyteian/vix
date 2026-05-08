@@ -45,7 +45,7 @@ pub const HIGHLIGHT_NAMES: &[&str] = &[
     "variable.parameter",
 ];
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
     Python,

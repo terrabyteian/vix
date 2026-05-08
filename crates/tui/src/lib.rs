@@ -186,6 +186,11 @@ pub struct Editor {
     /// pop the file picker. The first buffer they pick should *replace*
     /// that placeholder rather than park it. Consumed on the first swap.
     discard_active_on_swap: bool,
+    /// One `SyntaxState` per language, reused across picker preview rebuilds
+    /// so we don't re-compile tree-sitter highlight queries on every j/k.
+    /// The active buffer keeps its own `syntax` field; this cache exists
+    /// purely for the picker's preview pane and any other ad-hoc highlights.
+    preview_syntax: HashMap<Language, SyntaxState>,
 }
 
 /// What we asked for — lets us interpret the response when it arrives.
@@ -262,6 +267,16 @@ struct Picker {
     /// re-read or re-parse on every render. Replaced when the highlighted
     /// row points at a different path.
     preview: Option<PreviewCache>,
+    /// `selected` value the last time `refresh_preview` ran. Used to detect
+    /// scroll movement so the preview rebuild can be debounced — see
+    /// `preview_changed_at`.
+    preview_last_seen_selected: Option<usize>,
+    /// Wall-clock when `selected` last differed from `preview_last_seen_selected`.
+    /// The preview only rebuilds after the selection has been stable for
+    /// `PREVIEW_DEBOUNCE_MS`, so j/k/scroll spam doesn't trigger a parse
+    /// per move. Initialized to picker-creation time so the first preview
+    /// builds immediately.
+    preview_changed_at: Instant,
 }
 
 /// Cached file preview data. Built lazily for the currently-selected
@@ -571,7 +586,21 @@ impl Editor {
             discard_active_on_swap: false,
             active_bid: 0,
             next_bid: 1,
+            preview_syntax: HashMap::new(),
         }
+    }
+
+    /// Get-or-create a `SyntaxState` for `lang` from the per-language cache.
+    /// Returns `None` if construction fails (bad query, etc.). Reused across
+    /// preview rebuilds so the expensive query compile happens once per
+    /// language per editor session.
+    fn cached_syntax(&mut self, lang: Language) -> Option<&mut SyntaxState> {
+        if !self.preview_syntax.contains_key(&lang) {
+            if let Ok(s) = SyntaxState::new(lang) {
+                self.preview_syntax.insert(lang, s);
+            }
+        }
+        self.preview_syntax.get_mut(&lang)
     }
 
     // --- Read-only accessors for tests / harness consumers --------------------
@@ -1147,6 +1176,8 @@ impl Editor {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -1485,6 +1516,8 @@ impl Editor {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -1601,6 +1634,8 @@ impl Editor {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -1787,12 +1822,26 @@ impl Editor {
             }
             Post::SelectMany(values) => {
                 self.picker = None;
-                // Open each selected item in turn. `pick_result` parks the
-                // active buffer before swapping to the new one, so all
-                // earlier selections remain reachable via `:b`/buffer
-                // picker, and the cursor lands on whichever opened last.
-                for v in values {
-                    self.pick_result(v);
+                // Park every selection except the last directly into
+                // `other_buffers` via `load_into_park` — that skips the
+                // tree-sitter highlight construction and LSP `didOpen`
+                // those buffers don't need until the user actually
+                // activates them. The final item goes through
+                // `pick_result`, which handles activation, jump-list
+                // bookkeeping, and grep-hit cursor placement.
+                if let Some((last, init)) = values.split_last() {
+                    for v in init {
+                        match v {
+                            PickerValue::File(path) => {
+                                self.load_into_park(path, None);
+                            }
+                            PickerValue::GrepHit { path, line } => {
+                                self.load_into_park(path, Some(*line));
+                            }
+                            other => self.pick_result(other.clone()),
+                        }
+                    }
+                    self.pick_result(last.clone());
                 }
             }
             Post::Toggle => {
@@ -2168,6 +2217,60 @@ impl Editor {
         let current = self.save_active();
         self.install_active(promoted);
         self.other_buffers.push(current);
+        // Buffers loaded via `load_into_park` have no syntax state and no
+        // `didOpen` yet — that work was deferred so a batch open didn't
+        // pay it N times. Run it now that this buffer is the active one;
+        // both calls are no-ops if the previous active already had them.
+        if self.syntax.is_none() {
+            self.syntax = self
+                .buffer
+                .path()
+                .and_then(Language::from_path)
+                .and_then(|l| SyntaxState::new(l).ok());
+            self.invalidate_syntax_cache();
+        }
+        self.ensure_lsp_open();
+    }
+
+    /// Load `path` and push it directly into `other_buffers` without parking
+    /// the current active buffer or running syntax/LSP setup. Used by batch
+    /// open (multi-select picker) so the N-1 buffers that get parked
+    /// immediately don't pay for tree-sitter highlight construction or
+    /// `didOpen` round trips. `initial_line` (1-based) seeds the cursor for
+    /// grep-hit batch opens; pass `None` to leave it at offset 0.
+    fn load_into_park(&mut self, path: &std::path::Path, initial_line: Option<u64>) {
+        if self.buffer_index_by_path(path).is_some() {
+            return;
+        }
+        let buf = match Buffer::load(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.msg = format!("error: {e}");
+                return;
+            }
+        };
+        let sel = match initial_line {
+            Some(line) => {
+                let target = (line.saturating_sub(1) as usize)
+                    .min(buf.len_lines().saturating_sub(1));
+                Selection::at(buf.line_to_char(target)).clamped(&buf)
+            }
+            None => Selection::at(0),
+        };
+        let bid = self.next_bid;
+        self.next_bid = self.next_bid.wrapping_add(1).max(1);
+        self.other_buffers.push(BufferSave {
+            buffer: buf,
+            sel,
+            history: History::new(),
+            view_top: 0,
+            syntax: None,
+            syntax_cache: Vec::new(),
+            syntax_version: None,
+            pending_insert: None,
+            last_change: None,
+            bid,
+        });
     }
 
     /// `:bn` — cycle to the next buffer (wraps). No-op with a single buffer.
@@ -2475,6 +2578,8 @@ impl Editor {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -2524,6 +2629,8 @@ impl Editor {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         };
         p.rescore();
         self.picker = Some(p);
@@ -5194,31 +5301,33 @@ impl PreviewCache {
     }
 }
 
-/// Read `path` into a `PreviewCache`. Returns a placeholder cache when the
-/// file is too large, binary-looking, non-UTF8, or unreadable — so the
-/// preview pane always has *something* to show.
-fn build_preview(path: &Path) -> PreviewCache {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => return PreviewCache::placeholder(path, &format!("(cannot read: {e})")),
-    };
+/// Read `path` and return its source text, or a fully-formed placeholder
+/// `PreviewCache` if it's unreadable / too large / binary / non-UTF8.
+///
+/// Reads at most `PREVIEW_MAX_BYTES + 1` so we don't slurp a multi-MB file
+/// just to throw it away at the size check below.
+fn read_preview_source(path: &Path) -> Result<String, PreviewCache> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .map_err(|e| PreviewCache::placeholder(path, &format!("(cannot read: {e})")))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    std::io::BufReader::new(file)
+        .take((PREVIEW_MAX_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| PreviewCache::placeholder(path, &format!("(cannot read: {e})")))?;
     if bytes.len() > PREVIEW_MAX_BYTES {
-        return PreviewCache::placeholder(path, "(file too large to preview)");
+        return Err(PreviewCache::placeholder(path, "(file too large to preview)"));
     }
     if bytes.iter().take(1024).any(|&b| b == 0) {
-        return PreviewCache::placeholder(path, "(binary file)");
+        return Err(PreviewCache::placeholder(path, "(binary file)"));
     }
-    let source = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return PreviewCache::placeholder(path, "(non-utf8 file)"),
-    };
-    build_preview_from_text(path, &source)
+    String::from_utf8(bytes).map_err(|_| PreviewCache::placeholder(path, "(non-utf8 file)"))
 }
 
-/// Build a `PreviewCache` from in-memory text. `path` is used for display
-/// and language routing — callers pass the buffer's real path when there
-/// is one, or a synthetic placeholder otherwise.
-fn build_preview_from_text(path: &Path, source: &str) -> PreviewCache {
+/// Build a `PreviewCache` from in-memory text plus precomputed syntax spans.
+/// `path` is used for display / cache key only — language routing happens
+/// in the caller, since they own the per-language `SyntaxState` cache.
+fn build_preview_from_text(path: &Path, source: &str, spans: Vec<HlSpan>) -> PreviewCache {
     if source.len() > PREVIEW_MAX_BYTES {
         return PreviewCache::placeholder(path, "(buffer too large to preview)");
     }
@@ -5245,11 +5354,6 @@ fn build_preview_from_text(path: &Path, source: &str) -> PreviewCache {
     }
     line_byte_starts.push(src_bytes.len());
 
-    let spans = Language::from_path(path)
-        .and_then(|lang| SyntaxState::new(lang).ok())
-        .and_then(|mut s| s.highlight(source.as_bytes()).ok())
-        .unwrap_or_default();
-
     PreviewCache {
         path: path.to_path_buf(),
         lines,
@@ -5259,9 +5363,28 @@ fn build_preview_from_text(path: &Path, source: &str) -> PreviewCache {
     }
 }
 
+/// Compute syntax spans for a preview, routing through the per-language
+/// `SyntaxState` cache so the query compile is one-time per language.
+fn preview_spans(ed: &mut Editor, path: &Path, source: &str) -> Vec<HlSpan> {
+    let Some(lang) = Language::from_path(path) else {
+        return Vec::new();
+    };
+    let Some(state) = ed.cached_syntax(lang) else {
+        return Vec::new();
+    };
+    state.highlight(source.as_bytes()).unwrap_or_default()
+}
+
+/// Window after a selection change before we'll rebuild the preview. Keeps
+/// fast j/k/scroll from triggering a per-move file read + parse on the
+/// render thread; the run loop's 100 ms event poll guarantees we'll be
+/// re-entered shortly after the user pauses.
+const PREVIEW_DEBOUNCE_MS: u64 = 50;
+
 /// If the picker is showing a fullscreen-kind selection whose target differs
 /// from the cached preview, rebuild the cache. Cheap when the selection
-/// hasn't moved.
+/// hasn't moved; debounced when the user is actively scrolling so the
+/// previous preview keeps showing instead of a render-time stall.
 fn refresh_preview(ed: &mut Editor) {
     let kind = match ed.picker.as_ref().map(|p| p.kind.clone()) {
         Some(k) => k,
@@ -5273,29 +5396,61 @@ fn refresh_preview(ed: &mut Editor) {
         }
         return;
     }
+
+    // Track selection movement. When `selected` differs from what we
+    // observed last refresh, reset the stability timer; the rebuild gates
+    // below will keep the existing preview visible until the timer expires.
+    // The first preview (before any cache exists) is allowed through
+    // immediately so the pane isn't blank for 50 ms on picker open.
+    let (has_cache, stable) = if let Some(p) = ed.picker.as_mut() {
+        if p.preview_last_seen_selected != Some(p.selected) {
+            p.preview_last_seen_selected = Some(p.selected);
+            p.preview_changed_at = Instant::now();
+        }
+        let stable = Instant::now().duration_since(p.preview_changed_at)
+            >= Duration::from_millis(PREVIEW_DEBOUNCE_MS);
+        (p.preview.is_some(), stable)
+    } else {
+        return;
+    };
+
     match kind {
         PickerKind::Files | PickerKind::Grep => {
-            let Some(p) = ed.picker.as_mut() else {
-                return;
-            };
-            let target_path: Option<PathBuf> = p
-                .matches
-                .get(p.selected)
-                .and_then(|&(idx, _)| match &p.items[idx].value {
-                    PickerValue::File(path) => Some(path.clone()),
-                    PickerValue::GrepHit { path, .. } => Some(path.clone()),
-                    _ => None,
-                });
+            let target_path: Option<PathBuf> = ed.picker.as_ref().and_then(|p| {
+                p.matches
+                    .get(p.selected)
+                    .and_then(|&(idx, _)| match &p.items[idx].value {
+                        PickerValue::File(path) => Some(path.clone()),
+                        PickerValue::GrepHit { path, .. } => Some(path.clone()),
+                        _ => None,
+                    })
+            });
             let Some(target) = target_path else {
-                p.preview = None;
+                if let Some(p) = ed.picker.as_mut() {
+                    p.preview = None;
+                }
                 return;
             };
-            if let Some(cache) = p.preview.as_ref() {
-                if cache.path == target {
+            if let Some(p) = ed.picker.as_ref() {
+                if p.preview.as_ref().is_some_and(|c| c.path == target) {
                     return;
                 }
             }
-            p.preview = Some(build_preview(&target));
+            // Cache miss → would rebuild. Hold off if a previous preview is
+            // still on screen and the user hasn't paused yet.
+            if has_cache && !stable {
+                return;
+            }
+            let cache = match read_preview_source(&target) {
+                Ok(source) => {
+                    let spans = preview_spans(ed, &target, &source);
+                    build_preview_from_text(&target, &source, spans)
+                }
+                Err(placeholder) => placeholder,
+            };
+            if let Some(p) = ed.picker.as_mut() {
+                p.preview = Some(cache);
+            }
         }
         PickerKind::Buffers => {
             // Resolve the highlighted buffer index, release the &mut p
@@ -5320,6 +5475,9 @@ fn refresh_preview(ed: &mut Editor) {
                 }
                 return;
             };
+            if has_cache && !stable {
+                return;
+            }
             let cache = build_preview_for_buffer_idx(ed, idx);
             if let Some(p) = ed.picker.as_mut() {
                 p.preview = Some(cache);
@@ -5337,19 +5495,31 @@ fn refresh_preview(ed: &mut Editor) {
 /// Always rebuilds from the live rope so dirty changes show through. Falls
 /// back to a synthetic display path for unnamed buffers so syntax routing
 /// and the preview header still have *something* to show.
-fn build_preview_for_buffer_idx(ed: &Editor, idx: usize) -> PreviewCache {
-    let buf: &Buffer = if idx == 0 {
-        &ed.buffer
-    } else {
-        match ed.other_buffers.get(idx - 1) {
-            Some(b) => &b.buffer,
-            None => return PreviewCache::placeholder(Path::new("[gone]"), "(buffer no longer exists)"),
-        }
+fn build_preview_for_buffer_idx(ed: &mut Editor, idx: usize) -> PreviewCache {
+    // Pull the buffer's path + text under an immutable borrow first; release
+    // the borrow before reaching for the (mutable) syntax cache.
+    let (path, text): (PathBuf, String) = {
+        let buf: &Buffer = if idx == 0 {
+            &ed.buffer
+        } else {
+            match ed.other_buffers.get(idx - 1) {
+                Some(b) => &b.buffer,
+                None => {
+                    return PreviewCache::placeholder(
+                        Path::new("[gone]"),
+                        "(buffer no longer exists)",
+                    )
+                }
+            }
+        };
+        let path = buf
+            .path()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("[No Name]"));
+        (path, buf.rope().to_string())
     };
-    let synthetic = PathBuf::from("[No Name]");
-    let path: &Path = buf.path().unwrap_or(synthetic.as_path());
-    let text = buf.rope().to_string();
-    build_preview_from_text(path, &text)
+    let spans = preview_spans(ed, &path, &text);
+    build_preview_from_text(&path, &text, spans)
 }
 
 /// Picker-time helper: the line number to anchor the preview around for the
@@ -6017,6 +6187,8 @@ mod tests {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         };
         picker.rescore();
         ed.picker = Some(picker);
@@ -6058,6 +6230,8 @@ mod tests {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         };
         picker.rescore();
         ed.picker = Some(picker);
@@ -6197,6 +6371,8 @@ mod tests {
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
         });
         ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
         ed.last_picker_scroll = 0;
