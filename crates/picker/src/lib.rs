@@ -3,6 +3,7 @@
 //! scanning and nucleo-backed scoring.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use grep_regex::RegexMatcher;
@@ -67,6 +68,25 @@ pub fn scan_files(root: &Path) -> Vec<FileItem> {
 /// pattern ripgrep itself uses. Worker threads send hits over an mpsc
 /// channel; the calling thread drains it once the walk completes.
 pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
+    grep_cancellable(root, pattern, &Arc::new(AtomicU64::new(0)), 0)
+}
+
+/// Cancellable variant of [`grep`]. The walker checks `current` against
+/// `target_gen` between files and between matched lines; when they
+/// diverge the walk quits early and returns whatever's been collected so
+/// far. Used by the picker so a fresh keystroke can supersede an
+/// in-flight grep without waiting for the old one to finish.
+///
+/// `current` is shared across grep generations: the caller bumps it
+/// whenever a newer query comes in. A worker holds the value its request
+/// was issued with (`target_gen`) and bails when the live value moves
+/// past it.
+pub fn grep_cancellable(
+    root: &Path,
+    pattern: &str,
+    current: &Arc<AtomicU64>,
+    target_gen: u64,
+) -> anyhow::Result<Vec<GrepItem>> {
     let matcher = Arc::new(RegexMatcher::new(pattern)?);
     let root: Arc<Path> = Arc::from(root.to_path_buf().into_boxed_path());
     let (tx, rx) = mpsc::channel::<GrepItem>();
@@ -84,8 +104,15 @@ pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
         let tx = tx.clone();
         let matcher = Arc::clone(&matcher);
         let root = Arc::clone(&root);
+        let current = Arc::clone(current);
         let mut searcher = Searcher::new();
         Box::new(move |result| {
+            // Cheapest cancel check: per-file. Per-line is also wired below
+            // for files with thousands of matches, but most cancels land
+            // here on the next directory entry.
+            if current.load(Ordering::Relaxed) != target_gen {
+                return WalkState::Quit;
+            }
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => return WalkState::Continue,
@@ -102,6 +129,9 @@ pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
                 &*matcher,
                 &path,
                 UTF8(|line_no, text| {
+                    if current.load(Ordering::Relaxed) != target_gen {
+                        return Ok(false);
+                    }
                     let text = text.trim_end_matches('\n').to_string();
                     let display = format!("{}:{}: {}", rel.display(), line_no, text);
                     // Receiver hung up = caller dropped the result. Nothing
@@ -166,6 +196,35 @@ pub fn score<T: Clone>(items: &[(T, Utf32String)], query: &str, limit: usize) ->
     scored.sort_by(|a, b| b.1.cmp(&a.1));
     scored.truncate(limit);
     scored
+}
+
+/// Index-keyed variant of [`score`] that scores haystacks in place without
+/// cloning them. Writes `(item_index, score)` for matching haystacks into
+/// `out`, sorted descending by score and capped at `limit`. Reuses `out`'s
+/// existing capacity so callers can reuse the same buffer across keystrokes.
+///
+/// Empty `query` produces `(index, 0)` for the first `limit` entries in
+/// input order, matching [`score`]'s zero-query behavior.
+pub fn rescore_indices<'a, I>(haystacks: I, query: &str, limit: usize, out: &mut Vec<(usize, u32)>)
+where
+    I: IntoIterator<Item = (usize, &'a Utf32String)>,
+{
+    out.clear();
+    if query.is_empty() {
+        for (i, _) in haystacks.into_iter().take(limit) {
+            out.push((i, 0));
+        }
+        return;
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    for (i, h) in haystacks {
+        if let Some(s) = pattern.score(h.slice(..), &mut matcher) {
+            out.push((i, s));
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.truncate(limit);
 }
 
 #[cfg(test)]

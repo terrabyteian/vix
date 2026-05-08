@@ -12,6 +12,7 @@ use ratatui::Terminal;
 use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vix_core::{
@@ -30,7 +31,9 @@ use vix_lsp::lsp_types::{
 use vix_lsp::{
     parse_response, path_to_uri, server_for_path, uri_to_path, LspClient, RequestId, ServerEvent,
 };
-use vix_picker::{grep, match_indices, scan_files, score, GrepItem, Utf32String};
+use vix_picker::{
+    grep, grep_cancellable, match_indices, rescore_indices, scan_files, GrepItem, Utf32String,
+};
 use vix_syntax::{HlSpan, Language, Symbol, SyntaxState, HIGHLIGHT_NAMES};
 
 /// What action triggered the current Insert session — determines how `.`
@@ -191,6 +194,15 @@ pub struct Editor {
     /// The active buffer keeps its own `syntax` field; this cache exists
     /// purely for the picker's preview pane and any other ad-hoc highlights.
     preview_syntax: HashMap<Language, SyntaxState>,
+    /// Latest grep generation. Bumped every time we issue a new background
+    /// grep request; in-flight worker threads compare against this and
+    /// bail (`WalkState::Quit`) when a newer generation appears, so a fresh
+    /// keystroke supersedes the previous walk without waiting.
+    grep_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Receiver for the most recently spawned async grep worker. `None`
+    /// when no grep is in flight. Pumped each tick from the run loop so
+    /// results land on `picker.items` without blocking the UI thread.
+    grep_pending: Option<std::sync::mpsc::Receiver<Vec<PickerItem>>>,
 }
 
 /// What we asked for — lets us interpret the response when it arrives.
@@ -277,6 +289,12 @@ struct Picker {
     /// per move. Initialized to picker-creation time so the first preview
     /// builds immediately.
     preview_changed_at: Instant,
+    /// Set when the query changed and a rescore (Files) or regrep (Grep)
+    /// is owed. Cleared once the refresh runs. The actual rescore is
+    /// deferred until the query has been stable for
+    /// `PICKER_REFRESH_DEBOUNCE_MS` so fast typing on large corpora
+    /// doesn't trigger per-keystroke work.
+    query_dirty_at: Option<Instant>,
 }
 
 /// Cached file preview data. Built lazily for the currently-selected
@@ -364,22 +382,29 @@ fn scan_files_as_picker_items(cwd: &std::path::Path) -> Vec<PickerItem> {
 /// Run a regex grep across `cwd` and wrap results as picker items. Errors
 /// (e.g. user typed an in-progress regex like `[`) collapse to an empty
 /// list — no UX-disrupting noise during live typing.
+///
+/// The list shows `path:line` only — the matched line text is rendered in
+/// the right-side preview pane anchored at the hit, so duplicating it in
+/// the row would be visual noise.
 fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
     let hits: Vec<GrepItem> = grep(cwd, query).unwrap_or_default();
-    hits.into_iter()
-        .map(|g| {
-            let rel = g.path.strip_prefix(cwd).unwrap_or(&g.path);
-            let display = format!("{}:{}: {}", rel.display(), g.line, g.text);
-            PickerItem {
-                display,
-                value: PickerValue::GrepHit {
-                    path: g.path,
-                    line: g.line,
-                },
-                haystack: g.haystack,
-            }
-        })
-        .collect()
+    hits.into_iter().map(|g| grep_hit_to_picker_item(cwd, g)).collect()
+}
+
+/// Build a `PickerItem` for a single grep hit. Used by both the sync path
+/// (Tab toggle, initial open, Enter flush) and the async worker.
+fn grep_hit_to_picker_item(cwd: &std::path::Path, g: GrepItem) -> PickerItem {
+    let rel = g.path.strip_prefix(cwd).unwrap_or(&g.path);
+    let display = format!("{}:{}", rel.display(), g.line);
+    let haystack = Utf32String::from(display.as_str());
+    PickerItem {
+        display,
+        value: PickerValue::GrepHit {
+            path: g.path,
+            line: g.line,
+        },
+        haystack,
+    }
 }
 
 fn count_chars(s: &str) -> usize {
@@ -432,39 +457,25 @@ fn fit_path_display(path: &str, width: usize) -> String {
     format!("...{}", take_end(path, width - 3))
 }
 
+/// Fit a `path:line` grep row into `width` columns. The line marker is
+/// load-bearing, so we keep it intact and let the path fitter shave from
+/// the front of the path as needed.
 fn fit_grep_display(display: &str, line: u64, width: usize) -> String {
     if count_chars(display) <= width {
         return display.to_string();
     }
-
-    let marker = format!(":{line}: ");
-    let Some(marker_start) = display.find(&marker) else {
+    let marker = format!(":{line}");
+    let Some(marker_start) = display.rfind(&marker) else {
         return truncate_end(display, width);
     };
     let path = &display[..marker_start];
-    let snippet = &display[marker_start + marker.len()..];
     let marker_width = count_chars(&marker);
-    if width <= marker_width + 3 {
+    if width <= marker_width {
         return truncate_end(display, width);
     }
-
-    let snippet_reserve = match width {
-        0..=24 => 0,
-        25..=50 => 8,
-        _ => 16,
-    };
-    let path_budget = width
-        .saturating_sub(marker_width + snippet_reserve)
-        .max(width.saturating_sub(marker_width).min(8));
+    let path_budget = width - marker_width;
     let path_text = fit_path_display(path, path_budget);
-    let prefix = format!("{path_text}{marker}");
-    let prefix_width = count_chars(&prefix);
-    if prefix_width >= width {
-        return truncate_end(&prefix, width);
-    }
-
-    let snippet_width = width - prefix_width;
-    format!("{prefix}{}", truncate_end(snippet, snippet_width))
+    format!("{path_text}{marker}")
 }
 
 fn fit_picker_row(item: &PickerItem, width: usize) -> String {
@@ -521,15 +532,33 @@ impl Picker {
     }
 
     /// Re-score items against `self.query`. Caps visible matches at 1000 to
-    /// keep the render loop snappy on large repos.
+    /// keep the render loop snappy on large repos. Iterates `self.items` by
+    /// reference and writes directly into `self.matches`, so a keystroke
+    /// rescore on a 100k-file corpus doesn't allocate a clone per item.
+    ///
+    /// Grep is a special case: every item is already an exact regex hit, so
+    /// running nucleo over the result list would only re-rank — at real cost
+    /// for big result sets. We skip the fuzzy pass entirely and produce an
+    /// identity match list (worker order, capped). Closer to ripgrep
+    /// behavior, and zero per-result work on the UI thread.
     fn rescore(&mut self) {
-        let scored: Vec<(usize, Utf32String)> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, it)| (i, it.haystack.clone()))
-            .collect();
-        self.matches = score(&scored, &self.query, 1000);
+        if matches!(self.kind, PickerKind::Grep) {
+            self.matches.clear();
+            for (i, _) in self.items.iter().enumerate().take(1000) {
+                self.matches.push((i, 0));
+            }
+            if self.selected >= self.matches.len() {
+                self.selected = self.matches.len().saturating_sub(1);
+            }
+            self.scroll = 0;
+            return;
+        }
+        rescore_indices(
+            self.items.iter().enumerate().map(|(i, it)| (i, &it.haystack)),
+            &self.query,
+            1000,
+            &mut self.matches,
+        );
         if self.selected >= self.matches.len() {
             self.selected = self.matches.len().saturating_sub(1);
         }
@@ -587,6 +616,8 @@ impl Editor {
             active_bid: 0,
             next_bid: 1,
             preview_syntax: HashMap::new(),
+            grep_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grep_pending: None,
         }
     }
 
@@ -601,6 +632,140 @@ impl Editor {
             }
         }
         self.preview_syntax.get_mut(&lang)
+    }
+
+    /// If the picker's query has been dirty for at least
+    /// `PICKER_REFRESH_DEBOUNCE_MS`, fire the pending refresh. Files
+    /// rescore on the main thread (cheap); Grep dispatches to a worker
+    /// thread so the disk walk doesn't stall typing.
+    fn flush_picker_query_if_due(&mut self) {
+        let due = match self.picker.as_ref().and_then(|p| p.query_dirty_at) {
+            Some(t) => {
+                Instant::now().duration_since(t)
+                    >= Duration::from_millis(PICKER_REFRESH_DEBOUNCE_MS)
+            }
+            None => return,
+        };
+        if !due {
+            return;
+        }
+        if let Some(p) = self.picker.as_mut() {
+            p.query_dirty_at = None;
+        } else {
+            return;
+        }
+        let is_grep = matches!(
+            self.picker.as_ref().map(|p| &p.kind),
+            Some(PickerKind::Grep)
+        );
+        if is_grep {
+            self.start_grep_async();
+        } else if let Some(p) = self.picker.as_mut() {
+            p.rescore();
+        }
+    }
+
+    /// Force-run the deferred rescore / regrep right now. Used on
+    /// commit-style events (Enter, mouse click). Grep falls through to
+    /// a synchronous walk so the matches list reflects the current query
+    /// by the time the caller reads it; any in-flight async worker is
+    /// cancelled via the generation atomic.
+    fn flush_picker_query_now(&mut self) {
+        let dirty = self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.query_dirty_at.is_some());
+        if let Some(p) = self.picker.as_mut() {
+            p.query_dirty_at = None;
+        } else {
+            return;
+        }
+        let is_grep = matches!(
+            self.picker.as_ref().map(|p| &p.kind),
+            Some(PickerKind::Grep)
+        );
+        if is_grep {
+            // Cancel any in-flight async worker by bumping the generation;
+            // its result (if it ever arrives) won't match `grep_pending`'s
+            // expected gen, and pump_grep_results discards it. Then run
+            // sync so Enter / click can read p.matches immediately.
+            if dirty || self.grep_pending.is_some() {
+                self.grep_pending = None;
+                self.grep_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.refresh_grep_items();
+            }
+        } else if dirty {
+            if let Some(p) = self.picker.as_mut() {
+                p.rescore();
+            }
+        }
+    }
+
+    /// Spawn a worker thread that runs `grep_cancellable` for the picker's
+    /// current query. Bumps the generation atomic so any older worker
+    /// observes the change and quits its walk early. The worker sends
+    /// results back over an mpsc channel; `pump_grep_results` drains it
+    /// from the main loop.
+    fn start_grep_async(&mut self) {
+        let query = match self.picker.as_ref() {
+            Some(p) if matches!(p.kind, PickerKind::Grep) => p.query.clone(),
+            _ => return,
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let target_gen = self
+            .grep_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        let gen_arc = Arc::clone(&self.grep_gen);
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<PickerItem>>();
+        std::thread::spawn(move || {
+            let items: Vec<PickerItem> = if query.len() >= 2 {
+                grep_cancellable(&cwd, &query, &gen_arc, target_gen)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|g| grep_hit_to_picker_item(&cwd, g))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Don't bother delivering if a newer generation has been issued
+            // since — the receiver may already have been replaced.
+            if gen_arc.load(std::sync::atomic::Ordering::SeqCst) == target_gen {
+                let _ = tx.send(items);
+            }
+        });
+        // Drop any prior receiver. Its worker (if still running) will see a
+        // newer gen on its next cancel-check and quit.
+        self.grep_pending = Some(rx);
+    }
+
+    /// Drain pending grep results, if any. Called once per main-loop tick.
+    /// Applying happens only when the picker is still on Grep; otherwise we
+    /// silently drop the result so a stale walk can't repopulate a closed
+    /// or kind-toggled picker.
+    fn pump_grep_results(&mut self) {
+        let Some(rx) = self.grep_pending.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(items) => {
+                self.grep_pending = None;
+                if let Some(p) = self.picker.as_mut() {
+                    if matches!(p.kind, PickerKind::Grep) {
+                        p.items = items;
+                        p.marked.clear();
+                        p.rescore();
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Worker quit (cancelled, or its sender went out of scope
+                // without ever delivering). Nothing to do but clear.
+                self.grep_pending = None;
+            }
+        }
     }
 
     // --- Read-only accessors for tests / harness consumers --------------------
@@ -1178,6 +1343,7 @@ impl Editor {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1518,6 +1684,7 @@ impl Editor {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1636,6 +1803,7 @@ impl Editor {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -1650,6 +1818,12 @@ impl Editor {
     /// Handle a key event while the picker overlay is active. Returns true if
     /// the event was consumed; false means the picker closed itself.
     fn handle_picker_key(&mut self, k: KeyEvent) -> bool {
+        // Enter commits a pick, which reads `p.matches` — flush any pending
+        // query refresh first so the user lands on a result for the query
+        // they just finished typing, not the one on screen mid-debounce.
+        if matches!(k.code, KeyCode::Enter) {
+            self.flush_picker_query_now();
+        }
         // What to do *after* picker-internal mutation completes. Lets us
         // release the &mut borrow before calling self-mutating helpers.
         enum Post {
@@ -1848,14 +2022,11 @@ impl Editor {
                 self.toggle_picker_mode();
             }
             Post::Refresh => {
-                let is_grep = matches!(
-                    self.picker.as_ref().map(|p| &p.kind),
-                    Some(PickerKind::Grep)
-                );
-                if is_grep {
-                    self.refresh_grep_items();
-                } else if let Some(p) = self.picker.as_mut() {
-                    p.rescore();
+                // Mark the query dirty; the actual rescore / regrep is
+                // deferred to `flush_picker_query_if_due` so rapid typing
+                // doesn't pay the per-keystroke cost on large corpora.
+                if let Some(p) = self.picker.as_mut() {
+                    p.query_dirty_at = Some(Instant::now());
                 }
             }
             Post::BufferSave(idx) => {
@@ -1885,6 +2056,12 @@ impl Editor {
     /// left-click on a row activates that entry. Clicks outside the overlay
     /// or on the header row are ignored.
     fn handle_picker_mouse(&mut self, me: MouseEvent) {
+        // Left-click activates a row and reads `p.matches` to resolve it.
+        // Same rationale as Enter: flush any deferred refresh so the click
+        // lands on a result for the query the user is actually looking at.
+        if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.flush_picker_query_now();
+        }
         let selected_value: Option<PickerValue> = {
             let Some(p) = self.picker.as_mut() else {
                 return;
@@ -2580,6 +2757,7 @@ impl Editor {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -2631,6 +2809,7 @@ impl Editor {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         };
         p.rescore();
         self.picker = Some(p);
@@ -5381,6 +5560,12 @@ fn preview_spans(ed: &mut Editor, path: &Path, source: &str) -> Vec<HlSpan> {
 /// re-entered shortly after the user pauses.
 const PREVIEW_DEBOUNCE_MS: u64 = 50;
 
+/// Window after a query change before we run the deferred rescore (Files)
+/// or regrep (Grep). Tuned so fast typing on large corpora doesn't pay the
+/// per-keystroke cost: the user types, the prompt updates immediately, and
+/// the match list catches up shortly after they pause.
+const PICKER_REFRESH_DEBOUNCE_MS: u64 = 80;
+
 /// If the picker is showing a fullscreen-kind selection whose target differs
 /// from the cached preview, rebuild the cache. Cheap when the selection
 /// hasn't moved; debounced when the user is actively scrolling so the
@@ -5763,9 +5948,13 @@ fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
 
         // fzf-style match highlight: bold-yellow the chars in the row that
         // matched the live query. Only safe when the row wasn't truncated —
-        // path/grep fitters don't expose the input→display char map.
+        // path/grep fitters don't expose the input→display char map. Grep
+        // rows skip this entirely: their list display is just `path:line`
+        // and the query is a regex over file *contents*, so fuzzy-matching
+        // the path would highlight nothing useful and waste cycles.
         let highlight_chars: std::collections::HashSet<usize> = if !p.query.is_empty()
             && displayed == item.display
+            && !matches!(p.kind, PickerKind::Grep)
         {
             match_indices(&item.haystack, &p.query)
                 .into_iter()
@@ -6129,6 +6318,8 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         while !ed.quit {
             ed.drain_lsp_events();
+            ed.flush_picker_query_if_due();
+            ed.pump_grep_results();
             term.draw(|f| render(f, &mut ed))?;
             // Poll for input with a short timeout so LSP events get a chance
             // to flow in between keystrokes without blocking.
@@ -6189,6 +6380,7 @@ mod tests {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         };
         picker.rescore();
         ed.picker = Some(picker);
@@ -6232,6 +6424,7 @@ mod tests {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         };
         picker.rescore();
         ed.picker = Some(picker);
@@ -6325,15 +6518,10 @@ mod tests {
     }
 
     #[test]
-    fn picker_grep_fit_keeps_line_and_snippet() {
-        let row = fit_grep_display(
-            "crates/tui/src/render_picker.rs:128: let a_really_long_symbol_name = value;",
-            128,
-            40,
-        );
-        assert!(count_chars(&row) <= 40, "row too wide: {row}");
-        assert!(row.contains(":128: "), "lost line marker: {row}");
-        assert!(row.contains("let"), "lost snippet start: {row}");
+    fn picker_grep_fit_keeps_line_marker() {
+        let row = fit_grep_display("crates/tui/src/render_picker.rs:128", 128, 24);
+        assert!(count_chars(&row) <= 24, "row too wide: {row}");
+        assert!(row.ends_with(":128"), "lost line marker: {row}");
         assert!(row.contains("..."), "expected truncation marker: {row}");
     }
 
@@ -6373,6 +6561,7 @@ mod tests {
             preview: None,
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
+            query_dirty_at: None,
         });
         ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
         ed.last_picker_scroll = 0;
