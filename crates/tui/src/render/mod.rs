@@ -1,5 +1,4 @@
 use ratatui::layout::{Constraint, Direction, Layout};
-use std::time::Instant;
 
 use crate::picker::render::render_picker;
 use crate::picker::PickerLayout;
@@ -13,6 +12,10 @@ use content::render_content;
 use popups::{render_completion_popup, render_hover};
 use statusline::{render_cmdline, render_statusline};
 
+/// Draw one frame. State maintenance (cursor visibility, syntax cache, LSP
+/// sync, yank-flash decay) happens in `Editor::update` / `decay_yank_flash`
+/// on the main loop *before* the draw — this function only reads editor
+/// state and stashes render geometry for mouse hit-testing.
 pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let area = f.area();
 
@@ -24,9 +27,6 @@ pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
         .map(|p| matches!(p.kind.spec().layout, PickerLayout::Full))
         .unwrap_or(false);
     if fullscreen_picker {
-        // LSP sync still useful — keeps server state consistent across the
-        // (potentially long) picker session.
-        ed.sync_lsp_changes();
         render_picker(f, area, ed);
         return;
     }
@@ -43,18 +43,6 @@ pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let content_area = chunks[0];
     let statusline_area = chunks[1];
     let cmdline_area = chunks[2];
-
-    ed.ensure_cursor_visible(content_area.height as usize);
-    ed.refresh_syntax_cache();
-    // Push any pending text changes to the LSP server before rendering. The
-    // server's response (diagnostics) lands in the next event drain.
-    ed.sync_lsp_changes();
-    // Decay transient yank-flash overlay.
-    if let Some((_, until)) = ed.yank_flash.as_ref() {
-        if Instant::now() >= *until {
-            ed.yank_flash = None;
-        }
-    }
 
     // Take the highlight cache out of `ed` so we can pass `&mut ed` and the
     // borrowed cache through render_content side by side. Restored after.

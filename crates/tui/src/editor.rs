@@ -17,7 +17,7 @@ use crate::buffers::BufferSave;
 use crate::completion::CompletionPopup;
 use crate::help;
 use crate::lsp::{LspDocState, PendingRequest};
-use crate::picker::{PendingSource, Picker};
+use crate::picker::{PendingSource, Picker, PICKER_REFRESH_DEBOUNCE_MS};
 use crate::theme::Theme;
 
 /// What action triggered the current Insert session — determines how `.`
@@ -209,6 +209,11 @@ pub struct Editor {
     pub(crate) files_source: Option<PendingSource>,
     /// Centralized color/style palette. See `crate::theme`.
     pub(crate) theme: Theme,
+    /// Dirty flag for the main loop: draw a frame only when something
+    /// visible may have changed. Set by input events, LSP events, streaming
+    /// picker batches, debounce flushes, resize, and yank-flash decay;
+    /// cleared after each draw. Starts true so the first frame paints.
+    pub(crate) needs_redraw: bool,
 }
 
 impl Editor {
@@ -269,6 +274,7 @@ impl Editor {
             grep_source: None,
             files_source: None,
             theme: Theme::default_dark(),
+            needs_redraw: true,
         }
     }
 
@@ -342,6 +348,69 @@ impl Editor {
         self.push_jump();
         self.add_or_switch_buffer(buf);
         self.msg = format!("help: {slug}");
+    }
+
+    /// Mark the screen dirty: the next main-loop iteration draws a frame.
+    /// Call from any code path that changes something user-visible.
+    pub(crate) fn request_redraw(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    /// Pre-draw state maintenance, run by the main loop right before a
+    /// frame is drawn (not inside the render path): keep the cursor in
+    /// view, refresh the syntax cache after edits, and push pending buffer
+    /// changes to the LSP server. `content_rows` is the editor pane height
+    /// (terminal height minus statusline + cmdline).
+    pub(crate) fn update(&mut self, content_rows: usize) {
+        self.ensure_cursor_visible(content_rows.max(1));
+        self.refresh_syntax_cache();
+        self.sync_lsp_changes();
+    }
+
+    /// Clear an expired yank flash. Returns via `request_redraw` so the
+    /// frame that erases the highlight actually gets drawn.
+    pub(crate) fn decay_yank_flash(&mut self) {
+        if let Some((_, until)) = self.yank_flash.as_ref() {
+            if std::time::Instant::now() >= *until {
+                self.yank_flash = None;
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// The earliest wall-clock instant at which time-driven state needs a
+    /// wake-up: yank-flash expiry, the picker's query-debounce deadline, or
+    /// the preview-rebuild debounce. Derived from state each loop iteration
+    /// (never stored) so a missed set can't strand the screen stale.
+    pub(crate) fn next_wake_deadline(&self) -> Option<std::time::Instant> {
+        use std::time::Duration;
+        let mut next: Option<std::time::Instant> = None;
+        let mut consider = |t: std::time::Instant| {
+            next = Some(match next {
+                Some(cur) if cur <= t => cur,
+                _ => t,
+            });
+        };
+        if let Some((_, until)) = self.yank_flash.as_ref() {
+            consider(*until);
+        }
+        if let Some(p) = self.picker.as_ref() {
+            if let Some(dirty_at) = p.query_dirty_at {
+                consider(dirty_at + Duration::from_millis(PICKER_REFRESH_DEBOUNCE_MS));
+            }
+        }
+        // A preview rebuild owed but held by its debounce needs a wake to run.
+        if let Some(t) = crate::picker::preview::preview_wake_deadline(self) {
+            consider(t);
+        }
+        next
+    }
+
+    /// Whether any wakerless channel (LSP events, streaming scan/grep)
+    /// might deliver data that only a poll tick can pick up. Governs the
+    /// idle poll timeout: short while channels are live, long otherwise.
+    pub(crate) fn has_live_channels(&self) -> bool {
+        !self.lsp_clients.is_empty() || self.files_source.is_some() || self.grep_source.is_some()
     }
 
     /// Refresh `syntax_cache` if the buffer has mutated since the last parse.
@@ -422,5 +491,67 @@ impl Editor {
         self.last_picker_rect = Some(rect);
         self.last_picker_scroll = scroll;
         self.last_picker_list_rows = rect.height as usize;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testing::Harness;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn fresh_editor_has_no_wake_deadline_and_wants_first_frame() {
+        let h = Harness::with_text("hello\n");
+        assert!(h.editor.needs_redraw, "first frame must draw");
+        assert!(h.editor.next_wake_deadline().is_none());
+    }
+
+    #[test]
+    fn yank_flash_schedules_a_wake_and_decays_dirty() {
+        let mut h = Harness::with_text("hello world\n");
+        h.keys("yy");
+        assert!(
+            h.editor.yank_flash.is_some(),
+            "yy should set the yank flash"
+        );
+        let wake = h
+            .editor
+            .next_wake_deadline()
+            .expect("flash expiry must schedule a wake");
+        assert!(wake > Instant::now() - Duration::from_millis(1));
+        // Force-expire the flash: decay must clear it and mark the screen
+        // dirty so the erase frame is drawn.
+        h.editor.yank_flash = Some((0..1, Instant::now() - Duration::from_millis(1)));
+        h.editor.needs_redraw = false;
+        h.editor.decay_yank_flash();
+        assert!(h.editor.yank_flash.is_none());
+        assert!(h.editor.needs_redraw, "decay must request a redraw");
+        assert!(h.editor.next_wake_deadline().is_none());
+    }
+
+    #[test]
+    fn pending_picker_query_schedules_a_wake() {
+        let mut h = Harness::with_text("hello\n");
+        h.cmd("Buffers");
+        assert!(h.picker_open());
+        h.editor.needs_redraw = false;
+        h.keys("x"); // types into the query -> marks it dirty (debounced)
+        assert!(
+            h.editor.next_wake_deadline().is_some(),
+            "debounced query flush needs a timer wake"
+        );
+    }
+
+    #[test]
+    fn live_streaming_sources_shorten_the_idle_poll() {
+        let mut h = Harness::with_text("hello\n");
+        assert!(!h.editor.has_live_channels());
+        h.keys("<Space>f");
+        assert!(
+            h.editor.has_live_channels(),
+            "in-flight file scan must keep polling short"
+        );
+        h.pump_picker();
+        assert!(!h.editor.has_live_channels());
     }
 }

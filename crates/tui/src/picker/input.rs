@@ -274,6 +274,9 @@ impl Editor {
         } else if let Some(p) = self.picker.as_mut() {
             p.rescore_query_changed();
         }
+        // The debounced refresh just changed the match list (or kicked off a
+        // grep whose "scanning…" state should show).
+        self.request_redraw();
     }
 
     /// Force-run the deferred rescore right now. Used on commit-style
@@ -446,6 +449,8 @@ impl Editor {
                 p.append_matches(from_idx);
             }
         }
+        // New rows (or at least a new total in the counts line).
+        self.request_redraw();
     }
 
     /// Append one grep batch to `grep_items` (if it's still wanted) and
@@ -472,6 +477,7 @@ impl Editor {
                 p.append_matches(from_idx);
             }
         }
+        self.request_redraw();
     }
 
     /// The scan worker hung up: everything is delivered. Apply the one-time
@@ -485,6 +491,9 @@ impl Editor {
                 p.rescore_files_preserving_selection();
             }
         }
+        // The "scanning…" indicator drops (and the re-sort may have
+        // reordered rows).
+        self.request_redraw();
     }
 
     fn finish_grep_source(&mut self) {
@@ -492,6 +501,7 @@ impl Editor {
         if let Some(p) = self.picker.as_mut() {
             p.grep_items_complete = true;
         }
+        self.request_redraw();
     }
 
     /// Cancel both streaming workers and drop their channels. Called when

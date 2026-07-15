@@ -160,11 +160,16 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
     // debounce timer from now.
     if let Some(p) = ed.picker.as_mut() {
         if let Some(pos) = p.previews.iter().position(|c| c.key == target) {
-            if pos != 0 {
+            let promoted = pos != 0;
+            if promoted {
                 let c = p.previews.remove(pos);
                 p.previews.insert(0, c);
             }
             p.preview_last_seen_selected = Some(p.selected);
+            if promoted {
+                // The pane now shows a different cached file.
+                ed.request_redraw();
+            }
             return;
         }
     }
@@ -206,6 +211,26 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
         p.previews.insert(0, cache);
         p.previews.truncate(PREVIEW_LRU_CAP);
     }
+    // A fresh preview was built for the pane.
+    ed.request_redraw();
+}
+
+/// When the preview pane will need a timer wake-up: a rebuild is owed (the
+/// highlighted row's target isn't the MRU front) and is being held by the
+/// debounce. `None` when the pane is current or no preview picker is open.
+/// Derived entirely from state so the main loop can't strand a pending
+/// rebuild by missing a stored deadline.
+pub(crate) fn preview_wake_deadline(ed: &Editor) -> Option<Instant> {
+    let p = ed.picker.as_ref()?;
+    let spec = p.kind.spec();
+    if !(matches!(spec.layout, PickerLayout::Full) && spec.has_preview) {
+        return None;
+    }
+    let target = current_preview_key(ed, &p.kind)?;
+    if p.previews.first().is_some_and(|c| c.key == target) {
+        return None;
+    }
+    Some(p.preview_changed_at + Duration::from_millis(PREVIEW_DEBOUNCE_MS))
 }
 
 /// The MRU key for the picker's currently-highlighted row, or `None` when

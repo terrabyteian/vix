@@ -133,6 +133,11 @@ impl Editor {
                 batch.push((cmd.clone(), ev));
             }
         }
+        if !batch.is_empty() {
+            // Diagnostics, hover text, completions, workspace edits — every
+            // event variant can change something on screen.
+            self.request_redraw();
+        }
         for (cmd, ev) in batch {
             self.handle_lsp_event(cmd, ev);
         }
