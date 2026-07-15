@@ -236,6 +236,8 @@ fn render_compact_body(
         Span::styled(count, Style::default().bg(theme.border).fg(theme.dim)),
     ]);
     f.render_widget(Paragraph::new(header), geo.prompt);
+    // Caret past the query in the header: " {label} > " is 1 + label + 3 cols.
+    set_prompt_cursor(f, geo, 4 + count_chars(kind_label), &p.query);
 
     // Grep with a too-short query has no items; show a dim hint at the top
     // of the list instead of leaving it blank.
@@ -387,25 +389,16 @@ fn render_full_body(
     let arrow_style = Style::default()
         .fg(picker_pulse_accent(theme))
         .add_modifier(Modifier::BOLD);
-    // The picker is always in typing mode, so the caret always blinks.
-    let caret = {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        if (ms / 500) % 2 == 0 {
-            "▏"
-        } else {
-            " "
-        }
-    };
+    // Prompt = " ❯ <query>". The caret is the terminal's own cursor (set
+    // below) so it blinks natively without any redraw cadence of our own.
     let prompt_line = Line::from(vec![
         Span::raw(" "),
         Span::styled("❯ ", arrow_style),
         Span::styled(p.query.clone(), theme.picker_strong),
-        Span::styled(caret, Style::default().fg(picker_pulse_accent(theme))),
     ]);
     f.render_widget(Paragraph::new(prompt_line), geo.prompt);
+    // Caret sits just past the query: 1 leading space + 2 cols of "❯ ".
+    set_prompt_cursor(f, geo, 3, &p.query);
 
     // --- Separators (top just above list, bottom just below) -----------------
     let sep = Line::from(Span::styled(
@@ -582,6 +575,22 @@ fn render_full_body(
         ]);
         f.render_widget(Paragraph::new(footer_line), geo.footer);
     }
+}
+
+/// Place the terminal's real cursor at the end of the query in the prompt
+/// row, `prefix_cols` columns in from the prompt's left edge. ratatui hides
+/// the cursor by default each frame, so setting it here makes the caret the
+/// terminal's own — native blink, no redraw cadence. Clamped to the prompt.
+fn set_prompt_cursor(
+    f: &mut ratatui::Frame,
+    geo: &PickerGeometry,
+    prefix_cols: usize,
+    query: &str,
+) {
+    let x = (geo.prompt.x as usize + prefix_cols + count_chars(query))
+        .min(geo.prompt.x as usize + geo.prompt.width.saturating_sub(1) as usize)
+        as u16;
+    f.set_cursor_position((x, geo.prompt.y));
 }
 
 /// The dim "type N+ characters" hint shown in place of the list when a Grep
