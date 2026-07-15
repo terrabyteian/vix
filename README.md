@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh 
 Pin a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | VIX_VERSION=v0.4.0 sh
+curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | VIX_VERSION=v0.5.0 sh
 ```
 
 **Build from source** (requires Rust):

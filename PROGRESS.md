@@ -300,3 +300,64 @@ Phase 3 dogfood commands (requires the server binary on `$PATH` — `rust-analyz
 - `cargo test --workspace`: **22.314 seconds** wall time, all 251 tests passing
 - Release binary size: **9,472,912 bytes** (9.5 MB)
 - Idle CPU measurement: deferred to manual dogfood session
+
+## Fresh coat (v0.5.0) — COMPLETE ✓ (2026-07-15)
+
+Full-codebase restructure + picker redesign + theme + performance pass.
+~30 commits on `fresh-coat`; tests grew 352 → 385, clippy zero-warning,
+every phase landed green. Verify with `cargo test --workspace -- --test-threads=1`
+(parallel mode has a pre-existing chdir race between test threads).
+
+### Structure
+- `crates/tui/src/lib.rs` (6,656 lines) split into 18 focused modules via
+  move-only commits: `editor` / `app` (run loop) / `input` / `dispatch` /
+  `ex` / `search` / `buffers` / `jumps` / `lsp` / `completion` /
+  `picker/{mod,input,preview,render}` / `render/{mod,content,statusline,popups}`
+  / `theme` / `util`. lib.rs is now a 20-line declarations file.
+- Picker internals: `KindSpec` per-kind config, `Picker::new` constructor,
+  `PickerAction` (was a function-local enum), per-source item storage,
+  persistent nucleo `Scorer`, one geometry-driven renderer
+  (`compute_geometry` → Full/Compact) replacing the two divergent ones.
+
+### UX
+- Single-mode fzf-style pickers: always typing; Enter opens (acts on
+  what's on screen); Esc/Ctrl-c closes; Ctrl-Space marks + advances;
+  Alt-c clears; Ctrl-s/Ctrl-q/Alt-q/Ctrl-r/Alt-r buffer actions;
+  Home/End/PageUp/PageDown; Ctrl-u/Ctrl-w query editing. Browse/Input
+  two-mode model and `pending_g` are gone. README updated.
+- Theme system (still zero-config): `Theme::detect()` picks per terminal —
+  truecolor → curated dark RGB palette; otherwise ANSI-16; `NO_COLOR` →
+  monochrome; light backgrounds (COLORFGBG) prefer ANSI. Buffer background
+  is never painted. Pulse animation and hand-rolled caret blink removed
+  (the caret is the real terminal cursor now).
+
+### Performance
+- Streaming pickers: instant open; file scan and grep results stream in
+  batches from worker threads with generation cancellation and a
+  receiver-side gen check; zero synchronous walks left; streamed appends
+  never move the selection (ranked re-sort on completion follows the
+  highlighted item).
+- Dirty-flag main loop: draws only when something changed; wake deadlines
+  derived from state (yank flash, query/preview debounces); idle polls
+  250ms (live channels) / 1s; resize events handled (previously dropped).
+  Idle CPU ~0. Temporary safety net: forced repaint every 500ms
+  (`FORCED_REDRAW_MS` in app.rs) — delete after dogfooding.
+- Render path: syntax spans windowed via partition_point (was
+  O(rows × all spans) per frame), search-highlight scan + compiled regex
+  cached, diagnostics-by-line cached by generation, per-row scratch
+  reuse, rope line scans borrow (`Cow`) instead of allocating.
+- Viewport-limited highlighting: vix-syntax `highlight_range` runs the
+  highlights query only over the visible window on a retained parse tree
+  (scrolling = one windowed query, no reparse; edits reparse but skip the
+  whole-file query sweep). Per-byte equivalence with the full path is
+  test-enforced across all fixture languages; JS/TS/TSX stay on the full
+  path (locals queries). Preview pane: 8-slot MRU keyed by path /
+  (buffer, version), I/O moved out of the render path.
+
+### Deferred / follow-ups
+- Incremental tree-sitter reparse via `InputEdit` deltas (windowed query
+  already removed the query sweep; parse is still whole-file per edit).
+- Locals replication for JS/TS/TSX windowed highlighting.
+- Delete `FORCED_REDRAW_MS` safety net after a dogfood period.
+- Fix the parallel-test chdir race (tests that `set_current_dir` race
+  across threads; suite is verified with `--test-threads=1`).
