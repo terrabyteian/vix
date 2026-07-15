@@ -259,10 +259,7 @@ fn click_above_list_area_is_ignored() {
     h.keys("<Space>f");
     h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
     h.click(5, 0); // chrome row, above the list
-    assert!(
-        h.picker_open(),
-        "click above the list should not activate"
-    );
+    assert!(h.picker_open(), "click above the list should not activate");
 }
 
 #[test]

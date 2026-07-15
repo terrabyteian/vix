@@ -59,10 +59,6 @@ struct PendingInsert {
     pos: InsertPos,
     tx: Transaction,
     typed: String,
-    /// Cursor position where insert mode began (post-positioning for a/A/o/O).
-    /// Stored so `.` can reproduce the relative position.
-    #[allow(dead_code)]
-    start: usize,
     /// What action started this insert session.
     origin: InsertOrigin,
 }
@@ -388,7 +384,9 @@ fn scan_files_as_picker_items(cwd: &std::path::Path) -> Vec<PickerItem> {
 /// the row would be visual noise.
 fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
     let hits: Vec<GrepItem> = grep(cwd, query).unwrap_or_default();
-    hits.into_iter().map(|g| grep_hit_to_picker_item(cwd, g)).collect()
+    hits.into_iter()
+        .map(|g| grep_hit_to_picker_item(cwd, g))
+        .collect()
 }
 
 /// Build a `PickerItem` for a single grep hit. Used by both the sync path
@@ -439,14 +437,14 @@ fn fit_path_display(path: &str, width: usize) -> String {
         return take_start(path, width);
     }
 
-    let last_sep = path.rfind(|c| c == '/' || c == '\\');
+    let last_sep = path.rfind(['/', '\\']);
     let Some(last_sep) = last_sep else {
         return format!("...{}", take_end(path, width - 3));
     };
     let tail = &path[last_sep + 1..];
     let tail_len = count_chars(tail);
     if tail_len + 4 <= width {
-        let first_sep = path.find(|c| c == '/' || c == '\\').unwrap_or(last_sep);
+        let first_sep = path.find(['/', '\\']).unwrap_or(last_sep);
         let first = &path[..first_sep];
         let candidate = format!("{first}/.../{tail}");
         if count_chars(&candidate) <= width {
@@ -576,7 +574,10 @@ impl Picker {
             return;
         }
         rescore_indices(
-            self.items.iter().enumerate().map(|(i, it)| (i, &it.haystack)),
+            self.items
+                .iter()
+                .enumerate()
+                .map(|(i, it)| (i, &it.haystack)),
             &self.query,
             1000,
             &mut self.matches,
@@ -689,9 +690,9 @@ impl Editor {
     /// preview rebuilds so the expensive query compile happens once per
     /// language per editor session.
     fn cached_syntax(&mut self, lang: Language) -> Option<&mut SyntaxState> {
-        if !self.preview_syntax.contains_key(&lang) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.preview_syntax.entry(lang) {
             if let Ok(s) = SyntaxState::new(lang) {
-                self.preview_syntax.insert(lang, s);
+                e.insert(s);
             }
         }
         self.preview_syntax.get_mut(&lang)
@@ -2491,8 +2492,8 @@ impl Editor {
         };
         let sel = match initial_line {
             Some(line) => {
-                let target = (line.saturating_sub(1) as usize)
-                    .min(buf.len_lines().saturating_sub(1));
+                let target =
+                    (line.saturating_sub(1) as usize).min(buf.len_lines().saturating_sub(1));
                 Selection::at(buf.line_to_char(target)).clamped(&buf)
             }
             None => Selection::at(0),
@@ -2647,8 +2648,8 @@ impl Editor {
             park.last_change = None;
             park.sel = Selection::at(park.sel.head.min(len)).clamped(&park.buffer);
             park.view_top = 0;
-            park.syntax = Language::from_path(path.as_path())
-                .and_then(|l| SyntaxState::new(l).ok());
+            park.syntax =
+                Language::from_path(path.as_path()).and_then(|l| SyntaxState::new(l).ok());
             park.syntax_cache.clear();
             park.syntax_version = None;
         }
@@ -3138,9 +3139,8 @@ impl Editor {
                     cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h "))
                 {
                     self.open_help_doc(rest.trim());
-                } else if let Some(rest) = cmd
-                    .strip_prefix("e ")
-                    .or_else(|| cmd.strip_prefix("e! "))
+                } else if let Some(rest) =
+                    cmd.strip_prefix("e ").or_else(|| cmd.strip_prefix("e! "))
                 {
                     let path = std::path::PathBuf::from(rest.trim());
                     self.open_path(&path);
@@ -3618,7 +3618,6 @@ impl Editor {
             pos,
             tx,
             typed: String::new(),
-            start: self.sel.head,
             origin: InsertOrigin::Plain,
         });
         self.mode = Mode::Insert;
@@ -3678,7 +3677,6 @@ impl Editor {
                     pos: InsertPos::AtCursor,
                     tx,
                     typed: String::new(),
-                    start: self.sel.head,
                     // The caller (Operate / OperateLine / OperateObject) overwrites
                     // this with the appropriate origin so `.` replays the full
                     // change (deletion + typed text). Default to Plain in case
@@ -4283,7 +4281,6 @@ impl Editor {
                             apply_motion(&self.buffer, self.sel, motion, 1).clamped(&self.buffer);
                         if let Some(pi) = self.pending_insert.as_mut() {
                             pi.typed.clear();
-                            pi.start = self.sel.head;
                         }
                         return;
                     }
@@ -4321,7 +4318,6 @@ impl Editor {
             if self.mode == Mode::Insert {
                 if let Some(pi) = self.pending_insert.as_mut() {
                     pi.typed.clear();
-                    pi.start = self.sel.head;
                 }
             }
             return;
@@ -5558,7 +5554,10 @@ fn read_preview_source(path: &Path) -> Result<String, PreviewCache> {
         .read_to_end(&mut bytes)
         .map_err(|e| PreviewCache::placeholder(path, &format!("(cannot read: {e})")))?;
     if bytes.len() > PREVIEW_MAX_BYTES {
-        return Err(PreviewCache::placeholder(path, "(file too large to preview)"));
+        return Err(PreviewCache::placeholder(
+            path,
+            "(file too large to preview)",
+        ));
     }
     if bytes.iter().take(1024).any(|&b| b == 0) {
         return Err(PreviewCache::placeholder(path, "(binary file)"));
@@ -5842,7 +5841,9 @@ fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
     // Body split: ~38% list, rest preview, with one separator column.
     let split_enabled = w >= 80;
     let list_w = if split_enabled {
-        ((w as u32 * 38 / 100).max(28).min((w as u32).saturating_sub(40))) as usize
+        ((w as u32 * 38 / 100)
+            .max(28)
+            .min((w as u32).saturating_sub(40))) as usize
     } else {
         w
     };
@@ -5906,11 +5907,19 @@ fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
         Line::from(vec![
             Span::styled(
                 files_tab,
-                if mode_files { active_style } else { inactive_style },
+                if mode_files {
+                    active_style
+                } else {
+                    inactive_style
+                },
             ),
             Span::styled(
                 grep_tab,
-                if mode_files { inactive_style } else { active_style },
+                if mode_files {
+                    inactive_style
+                } else {
+                    active_style
+                },
             ),
             Span::raw(" ".repeat(middle_pad)),
             Span::styled(bread, Style::default().fg(PICKER_DIM)),
@@ -6237,9 +6246,7 @@ fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: &Picker) {
     let anchor = picker_preview_anchor_line(p);
     let anchor = anchor.min(cache.lines.len().saturating_sub(1));
     let view_top = if matches!(
-        p.matches
-            .get(p.selected)
-            .map(|&(i, _)| &p.items[i].value),
+        p.matches.get(p.selected).map(|&(i, _)| &p.items[i].value),
         Some(PickerValue::GrepHit { .. })
     ) {
         let third = body_h / 3;
@@ -6270,9 +6277,7 @@ fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: &Picker) {
         let is_hit_line = !cache.placeholder
             && line_idx == anchor
             && matches!(
-                p.matches
-                    .get(p.selected)
-                    .map(|&(i, _)| &p.items[i].value),
+                p.matches.get(p.selected).map(|&(i, _)| &p.items[i].value),
                 Some(PickerValue::GrepHit { .. })
             );
 
@@ -6513,8 +6518,6 @@ mod tests {
         let rect = ed.last_picker_rect.expect("expected picker rect set");
         assert!(rect.width as u32 <= (40 * 4 / 5));
     }
-
-
 
     fn edit(sl: u32, sc: u32, el: u32, ec: u32, text: &str) -> TextEdit {
         TextEdit {

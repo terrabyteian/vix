@@ -230,9 +230,6 @@ pub struct LspClient {
     holding: Mutex<VecDeque<ServerEvent>>,
     next_id: AtomicI64,
     config: ServerConfig,
-    /// Root URI sent in `initialize`.
-    #[allow(dead_code)]
-    root: Uri,
 }
 
 impl LspClient {
@@ -290,7 +287,6 @@ impl LspClient {
             holding: Mutex::new(VecDeque::new()),
             next_id: AtomicI64::new(1),
             config,
-            root: root_url,
         })
     }
 

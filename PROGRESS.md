@@ -284,3 +284,19 @@ Phase 3 dogfood commands (requires the server binary on `$PATH` — `rust-analyz
 - Open a .rs/.py/.ts/.go file — server spawns lazily; diagnostics appear in the gutter + statusline within a few seconds
 - `K` — hover at cursor (popup top-right; any key dismisses)
 - `gd` — goto-definition; loads the target file in a new buffer if needed
+
+## Fresh-coat baseline (2026-07-14)
+
+### Delivered
+- **Clippy warning fixes**:
+  - Line 442: `path.rfind(|c| c == '/' || c == '\\')` → `path.rfind(['/', '\\'])`
+  - Line 449: `path.find(|c| c == '/' || c == '\\')` → `path.find(['/', '\\'])`
+  - Line 692: Replaced `contains_key` + conditional insert with entry-API form using `Entry::Vacant`
+- **Removed dead fields**:
+  - `PendingInsert::start` field (crates/tui/src/lib.rs) — removed field, `#[allow(dead_code)]` attribute, doc comment, and all 2 initializers
+  - `LspClient::root` field (crates/lsp/src/lib.rs) — removed field, `#[allow(dead_code)]` attribute, doc comment, and initializer
+
+### Baseline metrics
+- `cargo test --workspace`: **22.314 seconds** wall time, all 251 tests passing
+- Release binary size: **9,472,912 bytes** (9.5 MB)
+- Idle CPU measurement: deferred to manual dogfood session
