@@ -6,6 +6,7 @@
 
 use crate::buffer::Buffer;
 use regex::Regex;
+use std::borrow::Cow;
 
 /// Case sensitivity strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -32,7 +33,11 @@ pub fn find_forward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, usi
     let total_lines = buf.len_lines();
     let (start_line, start_col) = buf.char_to_line_col(from);
     for line in start_line..total_lines {
-        let line_text: String = buf.rope().line(line).chars().collect();
+        let line_slice = buf.rope().line(line);
+        let line_text: Cow<str> = line_slice
+            .as_str()
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(line_slice.chars().collect()));
         // Search from `col` on the first line, from 0 on subsequent lines.
         let search_from_bytes = if line == start_line {
             // Convert start_col (char) to byte offset within line_text.
@@ -64,7 +69,11 @@ pub fn find_forward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, usi
 pub fn find_backward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, usize)> {
     let (start_line, start_col) = buf.char_to_line_col(from);
     for line in (0..=start_line).rev() {
-        let line_text: String = buf.rope().line(line).chars().collect();
+        let line_slice = buf.rope().line(line);
+        let line_text: Cow<str> = line_slice
+            .as_str()
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(line_slice.chars().collect()));
         let max_byte = if line == start_line {
             line_text
                 .char_indices()
@@ -103,7 +112,11 @@ pub fn find_all_in_lines(
     let mut out = Vec::new();
     let last = end_line.min(buf.len_lines());
     for line in start_line..last {
-        let line_text: String = buf.rope().line(line).chars().collect();
+        let line_slice = buf.rope().line(line);
+        let line_text: Cow<str> = line_slice
+            .as_str()
+            .map(Cow::Borrowed)
+            .unwrap_or_else(|| Cow::Owned(line_slice.chars().collect()));
         let line_start = buf.line_to_char(line);
         for m in re.find_iter(&line_text) {
             let s = line_start + byte_to_char_in(&line_text, m.start());
