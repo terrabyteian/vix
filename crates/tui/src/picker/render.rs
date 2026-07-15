@@ -7,7 +7,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::picker::preview::refresh_preview;
 use crate::picker::{
     fit_picker_row, substring_match_smart, wrap_picker_detail, Picker, PickerItem, PickerKind,
     PickerLayout, PickerValue,
@@ -152,12 +151,8 @@ pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
     let geo = compute_geometry(kind.clone(), area);
     let is_compact = geo.tabs_row.is_none();
 
-    // Preview I/O: only for a wide fullscreen picker that shows a pane.
-    // (Moved to the main loop in a later phase; still here so the renderer
-    // stays self-contained for now.)
-    if !is_compact && kind.spec().has_preview {
-        refresh_preview(ed);
-    }
+    // Preview I/O happens in the main loop (`refresh_preview`), not here — the
+    // renderer only reads `p.previews`.
 
     let theme = ed.theme.clone();
     let list_rows = geo.list.height as usize;
@@ -647,9 +642,16 @@ pub(crate) fn render_picker_preview_pane(
         return;
     }
 
-    let Some(cache) = p.preview.as_ref() else {
-        // No selection → empty pane (paragraph would write spaces, but the
-        // background wipe in render_picker already cleared us).
+    // Nothing highlighted (empty match list) → empty pane, even if the MRU
+    // still holds a preview from a prior selection.
+    if p.matches.get(p.selected).is_none() {
+        return;
+    }
+    // Draw the most-recently-used preview. On a hit it's the current row's
+    // preview (promoted to the front); mid-debounce it's the previous row's,
+    // kept visible until the rebuild lands.
+    let Some(cache) = p.previews.first() else {
+        // Not built yet → empty pane (the background wipe already cleared us).
         return;
     };
 

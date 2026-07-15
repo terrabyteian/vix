@@ -45,11 +45,13 @@ pub(crate) struct Picker {
     /// cleared whenever the `items` vector is replaced (Tab toggle, grep
     /// refresh). Only Files/Grep pickers populate this.
     pub(crate) marked: std::collections::HashSet<usize>,
-    /// Cached file preview for the currently-highlighted Files/Grep row.
-    /// Holds the file's line-split source plus syntax spans so we don't
-    /// re-read or re-parse on every render. Replaced when the highlighted
-    /// row points at a different path.
-    pub(crate) preview: Option<PreviewCache>,
+    /// Small MRU cache of built previews (front = most-recently used, cap
+    /// `PREVIEW_LRU_CAP`). Keyed by `PreviewCache::key` — path for Files/Grep,
+    /// (buffer index, version) for Buffers. Selecting a row whose target is
+    /// already cached promotes it to the front instantly; a miss builds and
+    /// pushes to the front, evicting the tail. The renderer draws
+    /// `previews.first()`.
+    pub(crate) previews: Vec<PreviewCache>,
     /// `selected` value the last time `refresh_preview` ran. Used to detect
     /// scroll movement so the preview rebuild can be debounced — see
     /// `preview_changed_at`.
@@ -74,10 +76,23 @@ pub(crate) struct Picker {
     pub(crate) scorer: Scorer,
 }
 
-/// Cached file preview data. Built lazily for the currently-selected
-/// Files/Grep row and reused across renders until the selection moves to
-/// a different path.
+/// Identity of a cached preview, used to look it up in the MRU. Files/Grep
+/// key on the target path (so grep hits in the same file share one entry —
+/// the anchor line is applied at render time); Buffers key on the buffer
+/// index plus its version, so an edited buffer misses and rebuilds.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum PreviewKey {
+    Path(PathBuf),
+    Buffer { idx: usize, version: u64 },
+}
+
+/// Cached file/buffer preview data. Built lazily for a selected row and kept
+/// in the picker's preview MRU keyed by `key`.
 pub(crate) struct PreviewCache {
+    /// MRU lookup key.
+    pub(crate) key: PreviewKey,
+    /// Display path (pane header / file-name). For buffers this is the
+    /// buffer's path or a synthetic `[No Name]`.
     pub(crate) path: PathBuf,
     /// File contents split by newline. Each entry omits the trailing `\n`.
     pub(crate) lines: Vec<String>,
@@ -381,7 +396,7 @@ impl Picker {
             scroll: 0,
             last_list_rows: 0,
             marked: std::collections::HashSet::new(),
-            preview: None,
+            previews: Vec::new(),
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
             query_dirty_at: None,
@@ -537,6 +552,11 @@ pub(crate) const PREVIEW_MAX_BYTES: usize = 256 * 1024;
 /// render thread; the run loop's 100 ms event poll guarantees we'll be
 /// re-entered shortly after the user pauses.
 pub(crate) const PREVIEW_DEBOUNCE_MS: u64 = 50;
+
+/// Max number of built previews kept in the picker's MRU cache. Small: the
+/// user only ever revisits a handful of nearby rows, and each entry holds a
+/// whole file's line-split source + syntax spans.
+pub(crate) const PREVIEW_LRU_CAP: usize = 8;
 
 /// Window after a query change before we run the deferred rescore (Files)
 /// or regrep (Grep). Tuned so fast typing on large corpora doesn't pay the

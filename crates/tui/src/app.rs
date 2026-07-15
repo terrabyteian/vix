@@ -28,6 +28,10 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
             ed.drain_lsp_events();
             ed.flush_picker_query_if_due();
             ed.pump_grep_results();
+            // Keep the picker preview MRU current *before* drawing so preview
+            // I/O stays off the render path (cheap no-op unless a fullscreen
+            // preview picker is open).
+            crate::picker::preview::refresh_preview(&mut ed);
             term.draw(|f| render(f, &mut ed))?;
             // Poll for input with a short timeout so LSP events get a chance
             // to flow in between keystrokes without blocking.

@@ -933,7 +933,9 @@ impl Editor {
         let items = self.buffer_picker_items();
         if let Some(p) = self.picker.as_mut() {
             p.items = items;
-            p.preview = None;
+            // Drop cached previews: a reload replaces a buffer (version resets
+            // to 0), which could otherwise collide with a stale MRU entry.
+            p.previews.clear();
             p.rescore();
         }
     }
