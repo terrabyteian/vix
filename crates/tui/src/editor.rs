@@ -9,7 +9,7 @@ use vix_core::{
     RepeatAction, SearchDirection, Selection, TextObject, TextObjectKind, Transaction,
 };
 
-use vix_lsp::lsp_types::Diagnostic;
+use vix_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use vix_lsp::{LspClient, RequestId};
 use vix_syntax::{HlSpan, Language, SyntaxState};
 
@@ -53,6 +53,30 @@ pub(crate) struct PendingInsert {
 pub(crate) struct Register {
     pub(crate) text: String,
     pub(crate) linewise: bool,
+}
+
+/// Caches `render_content`'s search-highlight viewport scan so an unchanged
+/// frame (same query, buffer contents, and viewport) doesn't recompile the
+/// regex and rescan the visible lines every draw. Any field mismatch means
+/// "recompute" — including `buffer_id`, which guards against a stale hit
+/// when the active buffer is swapped (buffer `version()` counters restart
+/// at 0 per-buffer, so version+viewport alone could coincidentally match
+/// across two different buffers).
+pub(crate) struct SearchHlCache {
+    pub(crate) query: String,
+    pub(crate) buffer_id: u64,
+    pub(crate) buffer_version: u64,
+    pub(crate) view_top: usize,
+    pub(crate) rows: usize,
+    /// Char-offset (start, end) match ranges, as returned by
+    /// `find_all_in_lines`.
+    pub(crate) ranges: Vec<(usize, usize)>,
+    /// Compiled regex, kept alongside the ranges so a future `n`/`N` repeat
+    /// could reuse it without recompiling. Not consulted for the cache-key
+    /// comparison itself, and not read yet — `n`/`N` still recompile via
+    /// `do_search`. Reserved for that follow-up.
+    #[allow(dead_code)]
+    pub(crate) re: regex::Regex,
 }
 
 pub struct Editor {
@@ -100,6 +124,16 @@ pub struct Editor {
     pub(crate) lsp_docs: HashMap<PathBuf, LspDocState>,
     /// Diagnostics per buffer path.
     pub(crate) diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    /// Bumped every time `diagnostics` is mutated. Part of `diag_line_cache`'s
+    /// key, so a stale per-line severity map is never reused after new
+    /// diagnostics arrive.
+    pub(crate) diagnostics_gen: u64,
+    /// Cached per-line diagnostic severity map for the active buffer, keyed
+    /// by `(diagnostics_gen, path)`. Rebuilt only when diagnostics changed or
+    /// the active buffer's path differs from the cached one.
+    pub(crate) diag_line_cache: Option<(u64, PathBuf, HashMap<usize, DiagnosticSeverity>)>,
+    /// Cached search-highlight viewport scan. See [`SearchHlCache`].
+    pub(crate) search_hl_cache: Option<SearchHlCache>,
     /// In-flight LSP request bookkeeping — maps server cmd + id → intent.
     /// Intent carries the buffer path for correlation after response arrives.
     pub(crate) pending_requests: HashMap<(String, RequestId), PendingRequest>,
@@ -200,6 +234,9 @@ impl Editor {
             lsp_clients: HashMap::new(),
             lsp_docs: HashMap::new(),
             diagnostics: HashMap::new(),
+            diagnostics_gen: 0,
+            diag_line_cache: None,
+            search_hl_cache: None,
             pending_requests: HashMap::new(),
             lsp_failed: std::collections::HashSet::new(),
             lsp_restart_log: HashMap::new(),

@@ -14,3 +14,4 @@ ratatui.workspace = true
 crossterm.workspace = true
 regex.workspace = true
 anyhow.workspace = true
+ropey.workspace = true

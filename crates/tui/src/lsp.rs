@@ -147,6 +147,7 @@ impl Editor {
                     } else {
                         self.diagnostics.insert(path, diagnostics);
                     }
+                    self.diagnostics_gen = self.diagnostics_gen.wrapping_add(1);
                 }
             }
             ServerEvent::Response { id, result, error } => {

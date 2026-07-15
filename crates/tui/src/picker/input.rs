@@ -770,6 +770,7 @@ impl Editor {
                 }
             }
             self.diagnostics.remove(&p);
+            self.diagnostics_gen = self.diagnostics_gen.wrapping_add(1);
         }
     }
 
@@ -826,6 +827,7 @@ impl Editor {
             }
         }
         self.diagnostics.remove(&path);
+        self.diagnostics_gen = self.diagnostics_gen.wrapping_add(1);
         self.msg = format!("\"{}\" reloaded", path.display());
     }
 

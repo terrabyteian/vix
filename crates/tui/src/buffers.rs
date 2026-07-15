@@ -72,6 +72,7 @@ impl Editor {
             }
         }
         self.diagnostics.remove(&path);
+        self.diagnostics_gen = self.diagnostics_gen.wrapping_add(1);
         self.ensure_lsp_open();
         self.msg = format!("\"{}\" reloaded", path.display());
     }
