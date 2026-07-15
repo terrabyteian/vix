@@ -5,12 +5,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use vix_picker::match_indices;
-
 use crate::picker::preview::refresh_preview;
 use crate::picker::{
-    fit_picker_row, substring_match_smart, wrap_picker_detail, Picker, PickerKind, PickerLayout,
-    PickerMode, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER, PICKER_DIM,
+    fit_picker_row, substring_match_smart, wrap_picker_detail, Picker, PickerItem, PickerKind,
+    PickerLayout, PickerMode, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER,
+    PICKER_DIM,
 };
 use crate::render::content::scope_style;
 use crate::util::{char_index_in_byte_range, count_chars, pad_or_trunc, take_end};
@@ -219,7 +218,11 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
 
     refresh_preview(ed);
 
-    let Some(p) = ed.picker.as_ref() else {
+    // `&mut` (not `&ref`): the match-highlight pass below needs `&mut
+    // p.scorer` alongside a borrow of the active item storage, which only
+    // works if `p` itself is mutable (see the `active_items` binding before
+    // the list loop).
+    let Some(p) = ed.picker.as_mut() else {
         ed.last_picker_rect = None;
         ed.last_picker_list_rows = 0;
         return;
@@ -393,13 +396,23 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     let row_chrome = 4usize;
     let content_w = list_w.saturating_sub(row_chrome + 1);
 
+    // Resolved once (kind is fixed for the whole render): a *direct* field
+    // match rather than `p.active_items()`, so the borrow only ever covers
+    // one of `file_items`/`grep_items`/`items` — leaving `p.scorer` free to
+    // borrow mutably inside the loop below for the match-highlight pass.
+    let active_items: &[PickerItem] = match p.kind {
+        PickerKind::Files => &p.file_items,
+        PickerKind::Grep => &p.grep_items,
+        _ => &p.items,
+    };
+
     for row in 0..body_h {
         let match_idx = scroll + row;
         let Some(&(item_idx, _)) = p.matches.get(match_idx) else {
             list_lines.push(Line::raw(""));
             continue;
         };
-        let item = &p.active_items()[item_idx];
+        let item = &active_items[item_idx];
         let is_sel = match_idx == selected;
         let is_marked = p.marked.contains(&item_idx);
         let row_style = if is_sel {
@@ -437,7 +450,8 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
                     None => std::collections::HashSet::new(),
                 }
             } else {
-                match_indices(&item.haystack, &p.query)
+                p.scorer
+                    .match_indices(&item.haystack, &p.query)
                     .into_iter()
                     .map(|i| i as usize)
                     .collect()
@@ -770,7 +784,6 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::PickerItem;
     use crate::render::render;
     use ratatui::backend::TestBackend;
     use vix_core::Buffer;

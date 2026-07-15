@@ -4,7 +4,7 @@ use ratatui::style::Color;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use vix_picker::{grep, rescore_indices, scan_files, GrepItem, Utf32String};
+use vix_picker::{grep, scan_files, GrepItem, Scorer, Utf32String};
 use vix_syntax::HlSpan;
 
 use crate::util::{count_chars, take_end, take_start, truncate_end};
@@ -65,6 +65,12 @@ pub(crate) struct Picker {
     /// `PICKER_REFRESH_DEBOUNCE_MS` so fast typing on large corpora
     /// doesn't trigger per-keystroke work.
     pub(crate) query_dirty_at: Option<Instant>,
+    /// Persistent nucleo scorer for the Symbols/Buffers/CodeActions/Jumps
+    /// fuzzy match (`rescore`'s fallback branch) and the fullscreen list's
+    /// match-highlight pass. Held for the picker's lifetime so neither pays
+    /// for a fresh `Matcher` (or, on a repeated query, a fresh `Pattern`
+    /// parse) on every keystroke or render.
+    pub(crate) scorer: Scorer,
 }
 
 /// Cached file preview data. Built lazily for the currently-selected
@@ -384,6 +390,7 @@ impl Picker {
             preview_last_seen_selected: None,
             preview_changed_at: Instant::now(),
             query_dirty_at: None,
+            scorer: Scorer::new(),
         };
         match p.kind {
             PickerKind::Files => p.file_items = items,
@@ -469,7 +476,7 @@ impl Picker {
             self.scroll = 0;
             return;
         }
-        rescore_indices(
+        self.scorer.rescore_indices(
             self.items
                 .iter()
                 .enumerate()
