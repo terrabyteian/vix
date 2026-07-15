@@ -35,8 +35,8 @@ pub(crate) struct Picker {
     /// Vertical scroll offset within the match list.
     pub(crate) scroll: usize,
     /// Number of list rows the picker was last rendered with. Updated by
-    /// both renderers (overlay + fullscreen) on every render; used to size
-    /// PageUp/PageDown jumps to whatever's actually on screen. Defaults to
+    /// `render_picker` on every render; used to size PageUp/PageDown jumps
+    /// to whatever's actually on screen. Defaults to
     /// 0 before the first render — callers should treat 0 as "unknown" and
     /// fall back to a fixed page size.
     pub(crate) last_list_rows: usize,
@@ -441,6 +441,48 @@ impl Picker {
         }
     }
 
+    /// Score and rank the Files match list against `self.query`.
+    ///
+    /// Matching is space-separated AND: the query splits on whitespace and
+    /// every token must `substring_match_smart` the display path (empty /
+    /// all-whitespace query → everything matches). Ranking prefers a hit in
+    /// the *basename* (the segment after the last `/`), then an earlier
+    /// first-token offset, then a shorter path — so `mod` ranks `src/mod.rs`
+    /// above `some/long/path/module_helpers.rs`. Results are sorted (stable)
+    /// and capped at 1000.
+    fn rescore_files(&mut self) {
+        self.matches.clear();
+        let tokens: Vec<&str> = self.query.split_whitespace().collect();
+        // One scratch vec for the whole rescore (not per item); reused to
+        // sort by score before we write the capped result into `matches`.
+        let mut scored: Vec<(usize, i64)> = Vec::new();
+        for (i, it) in self.file_items.iter().enumerate() {
+            let disp = it.display.as_str();
+            if tokens.is_empty() {
+                // No query → keep scan order, shorter paths first.
+                scored.push((i, -(disp.chars().count() as i64)));
+                continue;
+            }
+            // Every token must match somewhere in the path.
+            if tokens
+                .iter()
+                .any(|t| substring_match_smart(disp, t).is_none())
+            {
+                continue;
+            }
+            let offset = substring_match_smart(disp, tokens[0]).unwrap_or(0);
+            let base_start = disp.rfind('/').map(|p| p + 1).unwrap_or(0);
+            let basename_hit = substring_match_smart(&disp[base_start..], tokens[0]).is_some();
+            let len = disp.chars().count() as i64;
+            let score = if basename_hit { 1_000_000 } else { 0 } - (offset as i64) * 1000 - len;
+            scored.push((i, score));
+        }
+        // Stable sort by descending score keeps ties in scan order.
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.truncate(1000);
+        self.matches.extend(scored.into_iter().map(|(i, _)| (i, 0)));
+    }
+
     /// Re-score items against `self.query`. Caps visible matches at 1000 to
     /// keep the render loop snappy on large repos. Iterates the active
     /// item storage by reference and writes directly into `self.matches`,
@@ -470,16 +512,7 @@ impl Picker {
             return;
         }
         if matches!(self.kind, PickerKind::Files) {
-            self.matches.clear();
-            let q = &self.query;
-            for (i, it) in self.file_items.iter().enumerate() {
-                if substring_match_smart(&it.display, q).is_some() {
-                    self.matches.push((i, 0));
-                    if self.matches.len() >= 1000 {
-                        break;
-                    }
-                }
-            }
+            self.rescore_files();
             if self.selected >= self.matches.len() {
                 self.selected = self.matches.len().saturating_sub(1);
             }
@@ -608,5 +641,68 @@ mod tests {
             rows[1].ends_with("..."),
             "missing truncation marker: {rows:?}"
         );
+    }
+
+    /// Build a Files picker over the given display paths.
+    fn files_picker(paths: &[&str]) -> Picker {
+        let items = paths
+            .iter()
+            .map(|d| PickerItem {
+                display: d.to_string(),
+                value: PickerValue::File((*d).into()),
+                haystack: Utf32String::from(*d),
+            })
+            .collect();
+        Picker::new(PickerKind::Files, items)
+    }
+
+    /// Match display strings in rank order.
+    fn ranked(p: &Picker) -> Vec<String> {
+        p.matches
+            .iter()
+            .map(|&(i, _)| p.file_items[i].display.clone())
+            .collect()
+    }
+
+    #[test]
+    fn files_and_tokens_require_every_token() {
+        let p = files_picker(&["src/mod.rs", "foo/bar.rs", "src/main.rs"]).with_query("src rs");
+        let got = ranked(&p);
+        assert_eq!(got.len(), 2, "only rows matching both tokens: {got:?}");
+        assert!(got.contains(&"src/mod.rs".to_string()));
+        assert!(got.contains(&"src/main.rs".to_string()));
+        assert!(!got.contains(&"foo/bar.rs".to_string()));
+
+        // Tokens are order-independent and must all be present.
+        let p = files_picker(&["src/mod.rs", "src/main.rs"]).with_query("rs mod");
+        assert_eq!(ranked(&p), vec!["src/mod.rs".to_string()]);
+    }
+
+    #[test]
+    fn files_empty_query_matches_all_shortest_first() {
+        let p = files_picker(&["aaa/longer.rs", "a.rs"]).with_query("");
+        assert_eq!(
+            ranked(&p),
+            vec!["a.rs".to_string(), "aaa/longer.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn files_basename_hit_outranks_directory_hit() {
+        // "foo" matches the directory of the first and the basename of the
+        // second; the basename hit wins despite its later offset.
+        let p = files_picker(&["foo/zzz.rs", "aaa/foo.rs"]).with_query("foo");
+        assert_eq!(
+            ranked(&p),
+            vec!["aaa/foo.rs".to_string(), "foo/zzz.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn files_shorter_basename_hit_ranks_first() {
+        // The task's canonical example: `mod` ranks the short basename hit
+        // above the long one.
+        let p = files_picker(&["some/long/path/module_helpers.rs", "src/mod.rs"]).with_query("mod");
+        assert_eq!(ranked(&p)[0], "src/mod.rs".to_string());
     }
 }
