@@ -39,7 +39,7 @@ use vix_syntax::{HlSpan, Language, Symbol, SyntaxState, HIGHLIGHT_NAMES};
 /// What action triggered the current Insert session — determines how `.`
 /// will replay it on Esc.
 #[derive(Debug, Clone)]
-enum InsertOrigin {
+pub(crate) enum InsertOrigin {
     /// `i/a/I/A/o/O` — bare insert mode entry.
     Plain,
     /// `c<motion>` — replay re-evaluates the motion at the cursor.
@@ -55,7 +55,7 @@ enum InsertOrigin {
 
 /// Accumulates text typed during an Insert-mode session, plus how that session
 /// was entered. On Esc we commit this as one undo unit and one `.` repeat.
-struct PendingInsert {
+pub(crate) struct PendingInsert {
     pos: InsertPos,
     tx: Transaction,
     typed: String,
@@ -66,7 +66,7 @@ struct PendingInsert {
 /// Contents of the unnamed register (`"`), plus whether the last yank/delete
 /// was linewise — determines how `p`/`P` paste.
 #[derive(Debug, Clone, Default)]
-struct Register {
+pub(crate) struct Register {
     text: String,
     linewise: bool,
 }
@@ -74,7 +74,7 @@ struct Register {
 /// Snapshot of everything per-buffer: used to park inactive buffers while
 /// another is active. Switching buffers swaps one of these with the fields
 /// living directly on `Editor`.
-struct BufferSave {
+pub(crate) struct BufferSave {
     buffer: Buffer,
     sel: Selection,
     history: History,
@@ -93,13 +93,13 @@ pub struct Editor {
     pub buffer: Buffer,
     pub sel: Selection,
     pub mode: Mode,
-    keys: NormalKeyState,
-    history: History,
-    pending_insert: Option<PendingInsert>,
-    last_change: Option<RepeatAction>,
+    pub(crate) keys: NormalKeyState,
+    pub(crate) history: History,
+    pub(crate) pending_insert: Option<PendingInsert>,
+    pub(crate) last_change: Option<RepeatAction>,
     /// Non-active buffers. Switching swaps the active set with one of these.
-    other_buffers: Vec<BufferSave>,
-    register: Register,
+    pub(crate) other_buffers: Vec<BufferSave>,
+    pub(crate) register: Register,
     /// Top line of the viewport (for vertical scrolling).
     pub view_top: usize,
     /// Command-line input buffer (active in Command and Search modes).
@@ -107,103 +107,103 @@ pub struct Editor {
     /// ':' for ex, '/' for forward search, '?' for backward.
     pub cmdline_prompt: char,
     /// Last search query (compiled). None when no search has been run.
-    last_search: Option<(String, SearchDirection)>,
+    pub(crate) last_search: Option<(String, SearchDirection)>,
     /// Whether to render match highlights (cleared by :noh).
-    hl_search: bool,
+    pub(crate) hl_search: bool,
     /// Last char-find for `;`/`,` repeat.
-    last_find: Option<(char, FindDirection, FindKind)>,
+    pub(crate) last_find: Option<(char, FindDirection, FindKind)>,
     /// Short status message shown at the right of the statusline.
     pub msg: String,
     pub quit: bool,
     /// Syntax highlighter, set if we recognized the file's language.
-    syntax: Option<SyntaxState>,
+    pub(crate) syntax: Option<SyntaxState>,
     /// Cached highlight spans. Refreshed only when `syntax_version` lags
     /// behind `buffer.version()` — avoids reparsing on pure navigation.
-    syntax_cache: Vec<HlSpan>,
+    pub(crate) syntax_cache: Vec<HlSpan>,
     /// Buffer version the cache was computed against. `None` forces a rebuild
     /// on first use.
-    syntax_version: Option<u64>,
+    pub(crate) syntax_version: Option<u64>,
     /// Active picker overlay (file finder / grep). Intercepts input while set.
-    picker: Option<Picker>,
+    pub(crate) picker: Option<Picker>,
     /// Registered LSP clients keyed by `cmd`. We spawn lazily — one client per
     /// language per editor lifetime — and route per-buffer requests based on
     /// the file's extension.
-    lsp_clients: HashMap<String, LspClient>,
+    pub(crate) lsp_clients: HashMap<String, LspClient>,
     /// Per-buffer LSP document state: URI, monotonic version, latest
     /// buffer-version we sent to the server (to decide when to `didChange`).
-    lsp_docs: HashMap<PathBuf, LspDocState>,
+    pub(crate) lsp_docs: HashMap<PathBuf, LspDocState>,
     /// Diagnostics per buffer path.
-    diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    pub(crate) diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     /// In-flight LSP request bookkeeping — maps server cmd + id → intent.
     /// Intent carries the buffer path for correlation after response arrives.
-    pending_requests: HashMap<(String, RequestId), PendingRequest>,
+    pub(crate) pending_requests: HashMap<(String, RequestId), PendingRequest>,
     /// Server cmds we've already tried to spawn and failed on. Prevents
     /// re-spawning a missing binary on every K/gd.
-    lsp_failed: std::collections::HashSet<String>,
+    pub(crate) lsp_failed: std::collections::HashSet<String>,
     /// Per-server timestamps of recent crashes — keyed by server cmd. Used to
     /// rate-limit auto-restart (max 3 restarts per 60s before giving up).
-    lsp_restart_log: HashMap<String, Vec<Instant>>,
+    pub(crate) lsp_restart_log: HashMap<String, Vec<Instant>>,
     /// Bottom-area hover popup, set after a hover response arrives. Cleared
     /// by any subsequent keypress in Normal mode.
-    hover_popup: Option<String>,
+    pub(crate) hover_popup: Option<String>,
     /// Active completion popup in Insert mode, if any.
-    completion_popup: Option<CompletionPopup>,
+    pub(crate) completion_popup: Option<CompletionPopup>,
     /// Pending code actions awaiting user selection. Cleared when the picker
     /// closes.
-    pending_code_actions: Vec<vix_lsp::lsp_types::CodeActionOrCommand>,
+    pub(crate) pending_code_actions: Vec<vix_lsp::lsp_types::CodeActionOrCommand>,
     /// Transient flash overlay after a yank — (range, expires_at).
-    yank_flash: Option<(std::ops::Range<usize>, Instant)>,
+    pub(crate) yank_flash: Option<(std::ops::Range<usize>, Instant)>,
     /// Jump-list ring for `Ctrl-O` / `Ctrl-I`. Entries are keyed by path + line
     /// + col so they survive buffer-index reshuffles and edits.
-    jumps: JumpList,
+    pub(crate) jumps: JumpList,
     /// In Visual mode, the pending text-object kind from the last `i` / `a`.
     /// Cleared once the object char arrives or Esc is pressed.
-    visual_object_kind: Option<TextObjectKind>,
+    pub(crate) visual_object_kind: Option<TextObjectKind>,
     /// Stable id of the currently-active buffer. Paired with `BufferSave::bid`
     /// to render a position counter that tracks the active buffer through
     /// `<Tab>` / `:bn` rotations.
-    active_bid: u64,
+    pub(crate) active_bid: u64,
     /// Monotonic source for new buffer ids.
-    next_bid: u64,
+    pub(crate) next_bid: u64,
     /// Last rendered content rect. Used to translate mouse coords to buffer
     /// positions. None until the first frame is drawn.
-    last_content_rect: Option<Rect>,
+    pub(crate) last_content_rect: Option<Rect>,
     /// Width of the gutter (line numbers + diag glyph + space) at the last
     /// render. Click x − content_rect.x − this = column into the line.
-    last_gutter_cols: u16,
+    pub(crate) last_gutter_cols: u16,
     /// Last rendered picker overlay rect, and the scroll offset into the
     /// match list at that frame. Used to translate mouse events on the picker
     /// back into list-item indices. `None` when no picker is up.
-    last_picker_rect: Option<Rect>,
-    last_picker_scroll: usize,
-    last_picker_list_rows: usize,
+    pub(crate) last_picker_rect: Option<Rect>,
+    pub(crate) last_picker_scroll: usize,
+    pub(crate) last_picker_list_rows: usize,
     /// Set true after `<Space>` is pressed in Normal mode. The next key
     /// resolves the leader sequence. Cleared on Esc / mode changes / Ctrl-C.
-    pending_leader: bool,
+    pub(crate) pending_leader: bool,
     /// One-shot flag used at launch: when the user opens vix without a file
     /// (or with a directory), we boot with an empty placeholder buffer and
     /// pop the file picker. The first buffer they pick should *replace*
     /// that placeholder rather than park it. Consumed on the first swap.
-    discard_active_on_swap: bool,
+    pub(crate) discard_active_on_swap: bool,
     /// One `SyntaxState` per language, reused across picker preview rebuilds
     /// so we don't re-compile tree-sitter highlight queries on every j/k.
     /// The active buffer keeps its own `syntax` field; this cache exists
     /// purely for the picker's preview pane and any other ad-hoc highlights.
-    preview_syntax: HashMap<Language, SyntaxState>,
+    pub(crate) preview_syntax: HashMap<Language, SyntaxState>,
     /// Latest grep generation. Bumped every time we issue a new background
     /// grep request; in-flight worker threads compare against this and
     /// bail (`WalkState::Quit`) when a newer generation appears, so a fresh
     /// keystroke supersedes the previous walk without waiting.
-    grep_gen: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) grep_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Receiver for the most recently spawned async grep worker. `None`
     /// when no grep is in flight. Pumped each tick from the run loop so
     /// results land on `picker.items` without blocking the UI thread.
-    grep_pending: Option<std::sync::mpsc::Receiver<Vec<PickerItem>>>,
+    pub(crate) grep_pending: Option<std::sync::mpsc::Receiver<Vec<PickerItem>>>,
 }
 
 /// What we asked for — lets us interpret the response when it arrives.
 #[derive(Clone, Debug)]
-enum PendingRequest {
+pub(crate) enum PendingRequest {
     Hover,
     Definition,
     /// Completion request. `prefix_start` is the char offset where the
@@ -216,7 +216,7 @@ enum PendingRequest {
 
 /// A pending completion popup in Insert mode.
 #[derive(Clone, Debug, Default)]
-struct CompletionPopup {
+pub(crate) struct CompletionPopup {
     /// Full list from the server.
     items: Vec<vix_lsp::lsp_types::CompletionItem>,
     /// Indices into `items` that match the current prefix (case-insensitive).
@@ -231,7 +231,7 @@ struct CompletionPopup {
 /// from the buffer's mutation counter so we only emit `didChange` on real
 /// text edits.
 #[derive(Clone)]
-struct LspDocState {
+pub(crate) struct LspDocState {
     uri: Uri,
     /// The LSP-visible document version. Starts at 1 on `didOpen`, bumped
     /// on every `didChange`.
@@ -245,7 +245,7 @@ struct LspDocState {
 
 /// Overlay state for the file / grep pickers. The overlay owns input and
 /// rendering while it's alive; dismissal returns control to Normal mode.
-struct Picker {
+pub(crate) struct Picker {
     kind: PickerKind,
     mode: PickerMode,
     query: String,
@@ -296,7 +296,7 @@ struct Picker {
 /// Cached file preview data. Built lazily for the currently-selected
 /// Files/Grep row and reused across renders until the selection moves to
 /// a different path.
-struct PreviewCache {
+pub(crate) struct PreviewCache {
     path: PathBuf,
     /// File contents split by newline. Each entry omits the trailing `\n`.
     lines: Vec<String>,
@@ -312,13 +312,13 @@ struct PreviewCache {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PickerMode {
+pub(crate) enum PickerMode {
     Input,
     Browse,
 }
 
 #[derive(Clone, Debug)]
-enum PickerKind {
+pub(crate) enum PickerKind {
     Files,
     Grep,
     Symbols,
@@ -329,7 +329,7 @@ enum PickerKind {
 
 /// Picker kinds that take over the full screen (with side preview pane)
 /// rather than rendering as a centered overlay.
-fn is_fullscreen_picker_kind(kind: &PickerKind) -> bool {
+pub(crate) fn is_fullscreen_picker_kind(kind: &PickerKind) -> bool {
     matches!(
         kind,
         PickerKind::Files | PickerKind::Grep | PickerKind::Buffers
@@ -337,7 +337,7 @@ fn is_fullscreen_picker_kind(kind: &PickerKind) -> bool {
 }
 
 #[derive(Clone)]
-struct PickerItem {
+pub(crate) struct PickerItem {
     display: String,
     value: PickerValue,
     haystack: Utf32String,
@@ -346,7 +346,7 @@ struct PickerItem {
 /// Selection payload. `File` is the selected path; `GrepHit` carries the
 /// file + line number so we can jump after load.
 #[derive(Clone, Debug)]
-enum PickerValue {
+pub(crate) enum PickerValue {
     File(std::path::PathBuf),
     GrepHit {
         path: std::path::PathBuf,
@@ -364,7 +364,7 @@ enum PickerValue {
 
 /// Scan `cwd` for files (respecting `.gitignore`) and wrap them as picker
 /// items. Used by the unified Files/Grep picker.
-fn scan_files_as_picker_items(cwd: &std::path::Path) -> Vec<PickerItem> {
+pub(crate) fn scan_files_as_picker_items(cwd: &std::path::Path) -> Vec<PickerItem> {
     scan_files(cwd)
         .into_iter()
         .map(|fi| PickerItem {
@@ -382,7 +382,7 @@ fn scan_files_as_picker_items(cwd: &std::path::Path) -> Vec<PickerItem> {
 /// The list shows `path:line` only — the matched line text is rendered in
 /// the right-side preview pane anchored at the hit, so duplicating it in
 /// the row would be visual noise.
-fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
+pub(crate) fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
     let hits: Vec<GrepItem> = grep(cwd, query).unwrap_or_default();
     hits.into_iter()
         .map(|g| grep_hit_to_picker_item(cwd, g))
@@ -391,7 +391,7 @@ fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
 
 /// Build a `PickerItem` for a single grep hit. Used by both the sync path
 /// (Tab toggle, initial open, Enter flush) and the async worker.
-fn grep_hit_to_picker_item(cwd: &std::path::Path, g: GrepItem) -> PickerItem {
+pub(crate) fn grep_hit_to_picker_item(cwd: &std::path::Path, g: GrepItem) -> PickerItem {
     let rel = g.path.strip_prefix(cwd).unwrap_or(&g.path);
     let display = format!("{}:{}", rel.display(), g.line);
     let haystack = Utf32String::from(display.as_str());
@@ -405,20 +405,20 @@ fn grep_hit_to_picker_item(cwd: &std::path::Path, g: GrepItem) -> PickerItem {
     }
 }
 
-fn count_chars(s: &str) -> usize {
+pub(crate) fn count_chars(s: &str) -> usize {
     s.chars().count()
 }
 
-fn take_start(s: &str, n: usize) -> String {
+pub(crate) fn take_start(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn take_end(s: &str, n: usize) -> String {
+pub(crate) fn take_end(s: &str, n: usize) -> String {
     let len = count_chars(s);
     s.chars().skip(len.saturating_sub(n)).collect()
 }
 
-fn truncate_end(s: &str, width: usize) -> String {
+pub(crate) fn truncate_end(s: &str, width: usize) -> String {
     let len = count_chars(s);
     if len <= width {
         return s.to_string();
@@ -429,7 +429,7 @@ fn truncate_end(s: &str, width: usize) -> String {
     format!("{}...", take_start(s, width - 3))
 }
 
-fn fit_path_display(path: &str, width: usize) -> String {
+pub(crate) fn fit_path_display(path: &str, width: usize) -> String {
     if count_chars(path) <= width {
         return path.to_string();
     }
@@ -458,7 +458,7 @@ fn fit_path_display(path: &str, width: usize) -> String {
 /// Fit a `path:line` grep row into `width` columns. The line marker is
 /// load-bearing, so we keep it intact and let the path fitter shave from
 /// the front of the path as needed.
-fn fit_grep_display(display: &str, line: u64, width: usize) -> String {
+pub(crate) fn fit_grep_display(display: &str, line: u64, width: usize) -> String {
     if count_chars(display) <= width {
         return display.to_string();
     }
@@ -476,7 +476,7 @@ fn fit_grep_display(display: &str, line: u64, width: usize) -> String {
     format!("{path_text}{marker}")
 }
 
-fn fit_picker_row(item: &PickerItem, width: usize) -> String {
+pub(crate) fn fit_picker_row(item: &PickerItem, width: usize) -> String {
     match &item.value {
         PickerValue::File(_) => fit_path_display(&item.display, width),
         PickerValue::GrepHit { line, .. } => fit_grep_display(&item.display, *line, width),
@@ -484,7 +484,7 @@ fn fit_picker_row(item: &PickerItem, width: usize) -> String {
     }
 }
 
-fn wrap_picker_detail(text: &str, width: usize, rows: usize) -> Vec<String> {
+pub(crate) fn wrap_picker_detail(text: &str, width: usize, rows: usize) -> Vec<String> {
     if rows == 0 || width == 0 {
         return Vec::new();
     }
@@ -509,7 +509,7 @@ fn wrap_picker_detail(text: &str, width: usize, rows: usize) -> Vec<String> {
 }
 
 /// Render label for the buffer picker: "[1] path   [+]".
-fn label_for_buffer(buf: &Buffer, idx: usize, active: bool) -> String {
+pub(crate) fn label_for_buffer(buf: &Buffer, idx: usize, active: bool) -> String {
     let tag = if active { "%" } else { " " };
     let name = buf
         .path()
@@ -599,7 +599,7 @@ impl Picker {
 /// allocating per haystack on every keystroke, which defeats the purpose.
 /// Editor targets (paths, identifiers) are predominantly ASCII so this is
 /// the right trade.
-fn substring_match_smart(haystack: &str, query: &str) -> Option<usize> {
+pub(crate) fn substring_match_smart(haystack: &str, query: &str) -> Option<usize> {
     if query.is_empty() {
         return Some(0);
     }
@@ -689,7 +689,7 @@ impl Editor {
     /// Returns `None` if construction fails (bad query, etc.). Reused across
     /// preview rebuilds so the expensive query compile happens once per
     /// language per editor session.
-    fn cached_syntax(&mut self, lang: Language) -> Option<&mut SyntaxState> {
+    pub(crate) fn cached_syntax(&mut self, lang: Language) -> Option<&mut SyntaxState> {
         if let std::collections::hash_map::Entry::Vacant(e) = self.preview_syntax.entry(lang) {
             if let Ok(s) = SyntaxState::new(lang) {
                 e.insert(s);
@@ -702,7 +702,7 @@ impl Editor {
     /// `PICKER_REFRESH_DEBOUNCE_MS`, fire the pending refresh. Files
     /// rescore on the main thread (cheap); Grep dispatches to a worker
     /// thread so the disk walk doesn't stall typing.
-    fn flush_picker_query_if_due(&mut self) {
+    pub(crate) fn flush_picker_query_if_due(&mut self) {
         let due = match self.picker.as_ref().and_then(|p| p.query_dirty_at) {
             Some(t) => {
                 Instant::now().duration_since(t)
@@ -734,7 +734,7 @@ impl Editor {
     /// a synchronous walk so the matches list reflects the current query
     /// by the time the caller reads it; any in-flight async worker is
     /// cancelled via the generation atomic.
-    fn flush_picker_query_now(&mut self) {
+    pub(crate) fn flush_picker_query_now(&mut self) {
         let dirty = self
             .picker
             .as_ref()
@@ -771,7 +771,7 @@ impl Editor {
     /// observes the change and quits its walk early. The worker sends
     /// results back over an mpsc channel; `pump_grep_results` drains it
     /// from the main loop.
-    fn start_grep_async(&mut self) {
+    pub(crate) fn start_grep_async(&mut self) {
         let query = match self.picker.as_ref() {
             Some(p) if matches!(p.kind, PickerKind::Grep) => p.query.clone(),
             _ => return,
@@ -808,7 +808,7 @@ impl Editor {
     /// Applying happens only when the picker is still on Grep; otherwise we
     /// silently drop the result so a stale walk can't repopulate a closed
     /// or kind-toggled picker.
-    fn pump_grep_results(&mut self) {
+    pub(crate) fn pump_grep_results(&mut self) {
         let Some(rx) = self.grep_pending.as_ref() else {
             return;
         };
@@ -899,7 +899,7 @@ impl Editor {
 
     /// Ensure an LSP server is running for the active buffer's language, and
     /// that the buffer is open on it. Idempotent per (server, path).
-    fn ensure_lsp_open(&mut self) {
+    pub(crate) fn ensure_lsp_open(&mut self) {
         let Some(path) = self.buffer.path() else {
             return;
         };
@@ -952,7 +952,7 @@ impl Editor {
     /// If the active buffer's LSP doc version lags the buffer's mutation
     /// counter, send a full `didChange` and bump. Full-text sync is
     /// heavier than incremental but dead-simple; incremental can come later.
-    fn sync_lsp_changes(&mut self) {
+    pub(crate) fn sync_lsp_changes(&mut self) {
         let Some(path) = self.buffer.path() else {
             return;
         };
@@ -976,7 +976,7 @@ impl Editor {
     }
 
     /// Drain any pending events from all running LSP clients.
-    fn drain_lsp_events(&mut self) {
+    pub(crate) fn drain_lsp_events(&mut self) {
         // Collect first (separate borrows) then dispatch.
         let mut batch: Vec<(String, ServerEvent)> = Vec::new();
         for (cmd, client) in &self.lsp_clients {
@@ -989,7 +989,7 @@ impl Editor {
         }
     }
 
-    fn handle_lsp_event(&mut self, cmd: String, ev: ServerEvent) {
+    pub(crate) fn handle_lsp_event(&mut self, cmd: String, ev: ServerEvent) {
         match ev {
             ServerEvent::Diagnostics { uri, diagnostics } => {
                 if let Some(path) = uri_to_path(&uri) {
@@ -1035,7 +1035,7 @@ impl Editor {
         }
     }
 
-    fn handle_lsp_response(
+    pub(crate) fn handle_lsp_response(
         &mut self,
         intent: PendingRequest,
         result: Option<vix_lsp::Value>,
@@ -1098,7 +1098,7 @@ impl Editor {
         }
     }
 
-    fn jump_to_definition(&mut self, resp: GotoDefinitionResponse) {
+    pub(crate) fn jump_to_definition(&mut self, resp: GotoDefinitionResponse) {
         let loc: Option<Location> = match resp {
             GotoDefinitionResponse::Scalar(l) => Some(l),
             GotoDefinitionResponse::Array(mut xs) => xs.drain(..).next(),
@@ -1138,7 +1138,7 @@ impl Editor {
 
     /// Send a hover request at the current cursor. No-op if the buffer isn't
     /// bound to an LSP server.
-    fn request_hover(&mut self) {
+    pub(crate) fn request_hover(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
         let Some(path) = self.buffer.path() else {
@@ -1158,7 +1158,7 @@ impl Editor {
     }
 
     /// Send a goto-definition request at the current cursor.
-    fn request_definition(&mut self) {
+    pub(crate) fn request_definition(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
         let Some(path) = self.buffer.path() else {
@@ -1179,7 +1179,7 @@ impl Editor {
 
     /// Send a completion request from the current cursor. Records the word
     /// prefix start so we know what range to replace when the user accepts.
-    fn request_completion(&mut self) {
+    pub(crate) fn request_completion(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
         let Some(path) = self.buffer.path() else {
@@ -1203,7 +1203,7 @@ impl Editor {
 
     /// Walk back from `at` over identifier chars (alphanumeric or `_`) to find
     /// the start of the word under the cursor.
-    fn word_prefix_start(&self, at: usize) -> usize {
+    pub(crate) fn word_prefix_start(&self, at: usize) -> usize {
         let rope = self.buffer.rope();
         let mut i = at;
         while i > 0 {
@@ -1219,7 +1219,7 @@ impl Editor {
 
     /// Rebuild `visible` based on the current prefix (chars between
     /// `prefix_start` and the cursor), case-insensitive prefix match.
-    fn refilter_completions(&mut self) {
+    pub(crate) fn refilter_completions(&mut self) {
         let Some(popup) = self.completion_popup.as_mut() else {
             return;
         };
@@ -1249,7 +1249,7 @@ impl Editor {
 
     /// Apply the currently-selected completion item: replace the prefix range
     /// with the item's text.
-    fn accept_completion(&mut self) {
+    pub(crate) fn accept_completion(&mut self) {
         let Some(popup) = self.completion_popup.take() else {
             return;
         };
@@ -1275,7 +1275,7 @@ impl Editor {
     }
 
     /// Select the next / previous completion item. Wraps.
-    fn move_completion_selection(&mut self, delta: isize) {
+    pub(crate) fn move_completion_selection(&mut self, delta: isize) {
         let Some(popup) = self.completion_popup.as_mut() else {
             return;
         };
@@ -1290,7 +1290,7 @@ impl Editor {
 
     /// Request code actions at the current cursor + present a picker. On
     /// accept the chosen action is applied (edit and/or command).
-    fn run_code_action(&mut self) {
+    pub(crate) fn run_code_action(&mut self) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
         let Some(path) = self.buffer.path() else {
@@ -1416,7 +1416,7 @@ impl Editor {
     /// Apply a selected code action: first its WorkspaceEdit (if any), then
     /// its Command (best-effort — we log unknown commands rather than round-
     /// tripping `workspace/executeCommand`).
-    fn apply_code_action(&mut self, idx: usize) {
+    pub(crate) fn apply_code_action(&mut self, idx: usize) {
         let Some(action) = self.pending_code_actions.get(idx).cloned() else {
             return;
         };
@@ -1440,7 +1440,7 @@ impl Editor {
     /// commands just bounce back a WorkspaceEdit via `workspace/applyEdit`,
     /// which we don't currently handle — but the edit part of most actions
     /// is already returned inline in the CodeAction and applied above.
-    fn run_lsp_command(&mut self, cmd: vix_lsp::lsp_types::Command) {
+    pub(crate) fn run_lsp_command(&mut self, cmd: vix_lsp::lsp_types::Command) {
         let Some(path) = self.buffer.path() else {
             return;
         };
@@ -1457,7 +1457,7 @@ impl Editor {
     /// WorkspaceEdit, and apply it across all affected files. Files already
     /// open (active or parked) are edited in-place; files only on disk are
     /// loaded, edited, and written back.
-    fn run_rename(&mut self, new_name: &str) {
+    pub(crate) fn run_rename(&mut self, new_name: &str) {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
         let Some(path) = self.buffer.path() else {
@@ -1511,7 +1511,7 @@ impl Editor {
     /// Apply a WorkspaceEdit across active, parked, and on-disk files.
     /// Servers may send either the legacy `changes` map or the newer
     /// `documentChanges` list — we flatten both to `(Uri, Vec<TextEdit>)`.
-    fn apply_workspace_edit(&mut self, edit: vix_lsp::lsp_types::WorkspaceEdit) {
+    pub(crate) fn apply_workspace_edit(&mut self, edit: vix_lsp::lsp_types::WorkspaceEdit) {
         use vix_lsp::lsp_types::{DocumentChangeOperation, DocumentChanges, OneOf};
 
         let mut per_file: Vec<(vix_lsp::lsp_types::Uri, Vec<vix_lsp::lsp_types::TextEdit>)> =
@@ -1583,7 +1583,7 @@ impl Editor {
     /// Apply `edits` to the buffer at `path`. If it's the active buffer, edit
     /// in place. If parked, edit the parked copy. If not loaded, read from
     /// disk, apply, and write back.
-    fn apply_edits_to_any_buffer(
+    pub(crate) fn apply_edits_to_any_buffer(
         &mut self,
         path: &std::path::Path,
         edits: &[vix_lsp::lsp_types::TextEdit],
@@ -1630,7 +1630,7 @@ impl Editor {
 
     /// Request `textDocument/formatting`, apply returned edits to the active
     /// buffer. Blocks the UI for up to ~1.5s. No-op if no LSP is attached.
-    fn format_buffer(&mut self) -> bool {
+    pub(crate) fn format_buffer(&mut self) -> bool {
         self.ensure_lsp_open();
         self.sync_lsp_changes();
         let Some(path) = self.buffer.path() else {
@@ -1671,7 +1671,7 @@ impl Editor {
     }
 
     /// Format (if LSP is attached) and write to disk.
-    fn format_and_save(&mut self) {
+    pub(crate) fn format_and_save(&mut self) {
         self.format_buffer();
         match self.buffer.save() {
             Ok(()) => {
@@ -1720,7 +1720,7 @@ impl Editor {
     /// Unified Files↔Grep picker. `<Tab>` toggles submode, query carries
     /// over. Files results are scanned once on open and cached so toggling
     /// is free.
-    fn open_picker_unified(&mut self, initial: PickerKind, initial_query: &str) {
+    pub(crate) fn open_picker_unified(&mut self, initial: PickerKind, initial_query: &str) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let cached_files = scan_files_as_picker_items(&cwd);
         let items = match initial {
@@ -1757,7 +1757,7 @@ impl Editor {
     /// Toggle the active picker between Files and Grep submodes. The query
     /// is preserved; the items list is regenerated from the cache (Files)
     /// or by re-running grep (Grep, if query is at least 2 chars).
-    fn toggle_picker_mode(&mut self) {
+    pub(crate) fn toggle_picker_mode(&mut self) {
         let (new_kind, query, cached) = {
             let Some(p) = self.picker.as_mut() else {
                 return;
@@ -1802,7 +1802,7 @@ impl Editor {
 
     /// Re-grep on each query change in Grep submode. Requires ≥2 chars;
     /// shorter queries clear the items list.
-    fn refresh_grep_items(&mut self) {
+    pub(crate) fn refresh_grep_items(&mut self) {
         let query = match self.picker.as_ref() {
             Some(p) if matches!(p.kind, PickerKind::Grep) => p.query.clone(),
             _ => return,
@@ -1822,7 +1822,7 @@ impl Editor {
     }
 
     /// Open the tree-sitter symbol picker for the current buffer.
-    fn open_symbols_picker(&mut self) {
+    pub(crate) fn open_symbols_picker(&mut self) {
         let Some(s) = self.syntax.as_ref() else {
             self.msg = "no language bound".into();
             return;
@@ -1875,13 +1875,13 @@ impl Editor {
 
     /// Open the grep picker, optionally pre-filled with `pattern`. Pattern
     /// becomes the initial query; the live grep machinery handles results.
-    fn open_grep_picker(&mut self, pattern: &str) {
+    pub(crate) fn open_grep_picker(&mut self, pattern: &str) {
         self.open_picker_unified(PickerKind::Grep, pattern);
     }
 
     /// Handle a key event while the picker overlay is active. Returns true if
     /// the event was consumed; false means the picker closed itself.
-    fn handle_picker_key(&mut self, k: KeyEvent) -> bool {
+    pub(crate) fn handle_picker_key(&mut self, k: KeyEvent) -> bool {
         // Enter commits a pick, which reads `p.matches` — flush any pending
         // query refresh first so the user lands on a result for the query
         // they just finished typing, not the one on screen mid-debounce.
@@ -2119,7 +2119,7 @@ impl Editor {
     /// moves the selection (so the visible window follows automatically);
     /// left-click on a row activates that entry. Clicks outside the overlay
     /// or on the header row are ignored.
-    fn handle_picker_mouse(&mut self, me: MouseEvent) {
+    pub(crate) fn handle_picker_mouse(&mut self, me: MouseEvent) {
         // Left-click activates a row and reads `p.matches` to resolve it.
         // Same rationale as Enter: flush any deferred refresh so the click
         // lands on a result for the query the user is actually looking at.
@@ -2193,7 +2193,7 @@ impl Editor {
     }
 
     /// Act on a picker selection: open a file or jump to a grep hit.
-    fn pick_result(&mut self, value: PickerValue) {
+    pub(crate) fn pick_result(&mut self, value: PickerValue) {
         match value {
             PickerValue::File(path) => self.open_path(&path),
             PickerValue::GrepHit { path, line } => {
@@ -2229,7 +2229,7 @@ impl Editor {
     /// Open a help topic in a scratch buffer. `topic` may be empty to show
     /// the index page. Subsequent `:help <same>` calls switch back to the
     /// existing buffer instead of duplicating it (path-keyed dedup).
-    fn open_help_doc(&mut self, topic: &str) {
+    pub(crate) fn open_help_doc(&mut self, topic: &str) {
         let topic = topic.trim();
         let (slug, body) = if topic.is_empty() {
             ("index".to_string(), help::index())
@@ -2259,7 +2259,7 @@ impl Editor {
     /// are unsaved changes unless `force` is true. Cursor is preserved by
     /// char-offset (clamped to the new length); history and pending state
     /// are reset since the buffer is now a fresh read from disk.
-    fn reload_buffer(&mut self, force: bool) {
+    pub(crate) fn reload_buffer(&mut self, force: bool) {
         let Some(path) = self.buffer.path().map(|p| p.to_path_buf()) else {
             self.msg = "E32: No file name".into();
             return;
@@ -2305,7 +2305,7 @@ impl Editor {
         self.msg = format!("\"{}\" reloaded", path.display());
     }
 
-    fn open_path(&mut self, path: &std::path::Path) {
+    pub(crate) fn open_path(&mut self, path: &std::path::Path) {
         // Record departure on any switch / load — but not when the target is
         // already the active buffer.
         let same_as_active = self.buffer.path().map(|p| p == path).unwrap_or(false);
@@ -2334,7 +2334,7 @@ impl Editor {
 
     /// Refresh `syntax_cache` if the buffer has mutated since the last parse.
     /// Cheap fast path when the user is just navigating (no edits).
-    fn refresh_syntax_cache(&mut self) {
+    pub(crate) fn refresh_syntax_cache(&mut self) {
         let version = self.buffer.version();
         if self.syntax_version == Some(version) {
             return;
@@ -2351,7 +2351,7 @@ impl Editor {
     /// Invalidate the syntax cache. Call this after swapping the buffer so
     /// the version-compare heuristic doesn't stick on a stale parse (the new
     /// buffer starts its counter at 0).
-    fn invalidate_syntax_cache(&mut self) {
+    pub(crate) fn invalidate_syntax_cache(&mut self) {
         self.syntax_version = None;
         self.syntax_cache.clear();
     }
@@ -2359,7 +2359,7 @@ impl Editor {
     /// Snapshot the currently-active buffer for parking. Leaves placeholder
     /// defaults behind (caller is expected to immediately install a new
     /// active buffer on top).
-    fn save_active(&mut self) -> BufferSave {
+    pub(crate) fn save_active(&mut self) -> BufferSave {
         BufferSave {
             buffer: std::mem::replace(&mut self.buffer, Buffer::empty()),
             sel: std::mem::replace(&mut self.sel, Selection::at(0)),
@@ -2376,7 +2376,7 @@ impl Editor {
 
     /// Install a saved buffer as the active one. Caller is responsible for
     /// having already saved any existing active buffer they want to preserve.
-    fn install_active(&mut self, save: BufferSave) {
+    pub(crate) fn install_active(&mut self, save: BufferSave) {
         self.buffer = save.buffer;
         self.sel = save.sel;
         self.history = save.history;
@@ -2392,7 +2392,7 @@ impl Editor {
     /// Allocate a fresh buffer id and assign it to the (newly-installed)
     /// active buffer. Call after `add_or_switch_buffer` puts a brand-new
     /// buffer into the active slot.
-    fn assign_new_active_bid(&mut self) {
+    pub(crate) fn assign_new_active_bid(&mut self) {
         self.active_bid = self.next_bid;
         self.next_bid = self.next_bid.wrapping_add(1).max(1);
     }
@@ -2401,7 +2401,7 @@ impl Editor {
     /// currently-active buffer in `other_buffers` so the user can return to
     /// it. If a buffer with the same path is already open, switch to it
     /// rather than loading twice.
-    fn add_or_switch_buffer(&mut self, buffer: Buffer) {
+    pub(crate) fn add_or_switch_buffer(&mut self, buffer: Buffer) {
         if let Some(new_path) = buffer.path() {
             if let Some(idx) = self.buffer_index_by_path(new_path) {
                 self.switch_to_buffer(idx);
@@ -2438,7 +2438,7 @@ impl Editor {
     }
 
     /// Find a buffer by path. Index 0 = active; 1..N = `other_buffers[i-1]`.
-    fn buffer_index_by_path(&self, path: &std::path::Path) -> Option<usize> {
+    pub(crate) fn buffer_index_by_path(&self, path: &std::path::Path) -> Option<usize> {
         if self.buffer.path() == Some(path) {
             return Some(0);
         }
@@ -2450,7 +2450,7 @@ impl Editor {
 
     /// Switch the active buffer to index `idx` (0 = already active, else park
     /// current and promote `other_buffers[idx-1]`).
-    fn switch_to_buffer(&mut self, idx: usize) {
+    pub(crate) fn switch_to_buffer(&mut self, idx: usize) {
         if idx == 0 || idx >= self.buffer_count() {
             return;
         }
@@ -2479,7 +2479,7 @@ impl Editor {
     /// immediately don't pay for tree-sitter highlight construction or
     /// `didOpen` round trips. `initial_line` (1-based) seeds the cursor for
     /// grep-hit batch opens; pass `None` to leave it at offset 0.
-    fn load_into_park(&mut self, path: &std::path::Path, initial_line: Option<u64>) {
+    pub(crate) fn load_into_park(&mut self, path: &std::path::Path, initial_line: Option<u64>) {
         if self.buffer_index_by_path(path).is_some() {
             return;
         }
@@ -2515,7 +2515,7 @@ impl Editor {
     }
 
     /// `:bn` — cycle to the next buffer (wraps). No-op with a single buffer.
-    fn next_buffer(&mut self) {
+    pub(crate) fn next_buffer(&mut self) {
         if self.other_buffers.is_empty() {
             self.msg = "E86: Only one buffer".into();
             return;
@@ -2526,7 +2526,7 @@ impl Editor {
     }
 
     /// `:bp` — cycle to the previous buffer. Symmetric to `:bn`.
-    fn prev_buffer(&mut self) {
+    pub(crate) fn prev_buffer(&mut self) {
         if self.other_buffers.is_empty() {
             self.msg = "E86: Only one buffer".into();
             return;
@@ -2538,7 +2538,7 @@ impl Editor {
 
     /// `:bd` — close the active buffer. Refuses if dirty (use `:bd!`). If
     /// there are no other buffers left, quits the editor.
-    fn close_buffer(&mut self, force: bool) {
+    pub(crate) fn close_buffer(&mut self, force: bool) {
         if !force && self.buffer.dirty() {
             self.msg = "E89: No write since last change (use :bd!)".into();
             return;
@@ -2552,7 +2552,7 @@ impl Editor {
 
     /// Save the buffer at `idx` (0 = active, 1.. = parked). Active buffer
     /// runs the LSP-format pass; parked buffers just write the rope to disk.
-    fn save_buffer_at_index(&mut self, idx: usize) {
+    pub(crate) fn save_buffer_at_index(&mut self, idx: usize) {
         if idx == 0 {
             self.format_and_save();
             return;
@@ -2580,7 +2580,7 @@ impl Editor {
 
     /// Close the buffer at `idx`. For a parked buffer, refuses if dirty
     /// unless `force`. For the active buffer, delegates to `close_buffer`.
-    fn close_buffer_at_index(&mut self, idx: usize, force: bool) {
+    pub(crate) fn close_buffer_at_index(&mut self, idx: usize, force: bool) {
         if idx == 0 {
             self.close_buffer(force);
             return;
@@ -2607,7 +2607,7 @@ impl Editor {
     }
 
     /// Reload the buffer at `idx` from disk. Refuses if dirty unless `force`.
-    fn reload_buffer_at_index(&mut self, idx: usize, force: bool) {
+    pub(crate) fn reload_buffer_at_index(&mut self, idx: usize, force: bool) {
         if idx == 0 {
             self.reload_buffer(force);
             return;
@@ -2663,12 +2663,12 @@ impl Editor {
     }
 
     /// True if any buffer (active or parked) has unsaved edits.
-    fn any_buffer_dirty(&self) -> bool {
+    pub(crate) fn any_buffer_dirty(&self) -> bool {
         self.buffer.dirty() || self.other_buffers.iter().any(|b| b.buffer.dirty())
     }
 
     /// Capture the current cursor position as a jump-list entry.
-    fn current_jump_entry(&self) -> JumpEntry {
+    pub(crate) fn current_jump_entry(&self) -> JumpEntry {
         let (line, col) = self.buffer.char_to_line_col(self.sel.head);
         JumpEntry {
             path: self.buffer.path().map(|p| p.to_path_buf()),
@@ -2680,14 +2680,14 @@ impl Editor {
     /// Push the *current* cursor position onto the jump list. Call this
     /// immediately before a "big jump" action — buffer switch, gg/G, search,
     /// goto-definition, etc.
-    fn push_jump(&mut self) {
+    pub(crate) fn push_jump(&mut self) {
         self.jumps.push(self.current_jump_entry());
     }
 
     /// Move the active buffer + cursor to the entry. If the target lives in a
     /// different buffer (or an on-disk file not currently open), we switch or
     /// load it. Returns false if the buffer couldn't be located or loaded.
-    fn goto_jump_entry(&mut self, entry: JumpEntry) -> bool {
+    pub(crate) fn goto_jump_entry(&mut self, entry: JumpEntry) -> bool {
         let same_buffer = match (&entry.path, self.buffer.path()) {
             (Some(p), Some(cur)) => p.as_path() == cur,
             (None, None) => true,
@@ -2725,7 +2725,7 @@ impl Editor {
     }
 
     /// `Ctrl-O` — step back through the jump list.
-    fn jump_back(&mut self) {
+    pub(crate) fn jump_back(&mut self) {
         let current = self.current_jump_entry();
         match self.jumps.back(current) {
             Some(e) => {
@@ -2736,7 +2736,7 @@ impl Editor {
     }
 
     /// `Ctrl-I` / Tab — step forward.
-    fn jump_forward(&mut self) {
+    pub(crate) fn jump_forward(&mut self) {
         match self.jumps.forward() {
             Some(e) => {
                 if !self.goto_jump_entry(e) { /* msg set in callee */ }
@@ -2747,7 +2747,7 @@ impl Editor {
 
     /// `:b <spec>` — switch to buffer matching `spec`. Numeric = 1-based
     /// index; non-numeric = substring match over buffer paths.
-    fn switch_buffer_by_spec(&mut self, spec: &str) {
+    pub(crate) fn switch_buffer_by_spec(&mut self, spec: &str) {
         if let Ok(n) = spec.parse::<usize>() {
             if n == 0 || n > self.buffer_count() {
                 self.msg = format!("E86: buffer {n} not found");
@@ -2778,7 +2778,7 @@ impl Editor {
 
     /// `:jumps` — open a picker listing jump-list entries. Selection jumps to
     /// that entry. Informational column shows `>` next to the current position.
-    fn open_jumps_picker(&mut self) {
+    pub(crate) fn open_jumps_picker(&mut self) {
         if self.jumps.is_empty() {
             self.msg = "jump list is empty".into();
             return;
@@ -2831,7 +2831,7 @@ impl Editor {
     /// the internal `pos` so subsequent Ctrl-O/I walk from there. We walk the
     /// jump list by calling `back`/`forward` until pos matches — cheap enough
     /// for the 100-entry cap.
-    fn apply_jump_pick(&mut self, idx: usize) {
+    pub(crate) fn apply_jump_pick(&mut self, idx: usize) {
         let cur = self.jumps.pos();
         if idx == cur {
             return;
@@ -2857,7 +2857,7 @@ impl Editor {
     }
 
     /// Open the buffer picker: lists all live buffers for fuzzy selection.
-    fn open_buffers_picker(&mut self) {
+    pub(crate) fn open_buffers_picker(&mut self) {
         let items = self.buffer_picker_items();
         let mut p = Picker {
             kind: PickerKind::Buffers,
@@ -2882,7 +2882,7 @@ impl Editor {
     /// Build the item list for the buffer picker from the current set of
     /// active + parked buffers. Used both on initial open and after a
     /// management action (save/reload/close) so labels reflect new state.
-    fn buffer_picker_items(&self) -> Vec<PickerItem> {
+    pub(crate) fn buffer_picker_items(&self) -> Vec<PickerItem> {
         let mut items: Vec<PickerItem> = Vec::with_capacity(self.buffer_count());
         let active_label = label_for_buffer(&self.buffer, 0, true);
         items.push(PickerItem {
@@ -2904,7 +2904,7 @@ impl Editor {
     /// Rebuild the buffer picker's items in place. No-op if the picker isn't
     /// the Buffers kind. Drops the cached preview so the next render rebuilds
     /// it against any reloaded content.
-    fn refresh_buffers_picker_items(&mut self) {
+    pub(crate) fn refresh_buffers_picker_items(&mut self) {
         if !matches!(
             self.picker.as_ref().map(|p| &p.kind),
             Some(PickerKind::Buffers)
@@ -2922,7 +2922,7 @@ impl Editor {
     /// Returns the line index of the match on success so the caller can
     /// adjust the viewport (e.g. pin the first match to the top of the
     /// pane on a fresh `/` search).
-    fn do_search(&mut self, query: &str, dir: SearchDirection) -> Option<usize> {
+    pub(crate) fn do_search(&mut self, query: &str, dir: SearchDirection) -> Option<usize> {
         if query.is_empty() {
             return None;
         }
@@ -2958,7 +2958,7 @@ impl Editor {
         }
     }
 
-    fn word_search_under(&mut self, dir: SearchDirection) {
+    pub(crate) fn word_search_under(&mut self, dir: SearchDirection) {
         let rope = self.buffer.rope();
         let len = self.buffer.len_chars();
         if len == 0 {
@@ -2995,7 +2995,7 @@ impl Editor {
         self.do_search(&pattern, dir);
     }
 
-    fn search_repeat(&mut self, dir: SearchDirection) {
+    pub(crate) fn search_repeat(&mut self, dir: SearchDirection) {
         let Some((query, last_dir)) = self.last_search.clone() else {
             self.msg = "No previous search".into();
             return;
@@ -3010,13 +3010,13 @@ impl Editor {
         self.do_search(&query, effective);
     }
 
-    fn cursor_line(&self) -> usize {
+    pub(crate) fn cursor_line(&self) -> usize {
         self.buffer.char_to_line_col(self.sel.head).0
     }
 
     /// Char-range covered by the current Visual/VisualLine selection, ready
     /// to be consumed by an operator.
-    fn visual_range(&self) -> std::ops::Range<usize> {
+    pub(crate) fn visual_range(&self) -> std::ops::Range<usize> {
         let r = self.sel.range();
         match self.mode {
             Mode::Visual => {
@@ -3040,7 +3040,7 @@ impl Editor {
         }
     }
 
-    fn ensure_cursor_visible(&mut self, viewport_rows: usize) {
+    pub(crate) fn ensure_cursor_visible(&mut self, viewport_rows: usize) {
         let line = self.cursor_line();
         if line < self.view_top {
             self.view_top = line;
@@ -3052,14 +3052,14 @@ impl Editor {
     /// Lines to jump on PageUp / PageDown — vim's `<C-f>`/`<C-b>` convention
     /// (viewport height − 2, leaving two rows of context across the jump).
     /// Falls back to 10 if no frame has rendered yet.
-    fn page_step(&self) -> usize {
+    pub(crate) fn page_step(&self) -> usize {
         match self.last_content_rect {
             Some(r) => (r.height as usize).saturating_sub(2).max(1),
             None => 10,
         }
     }
 
-    fn run_ex(&mut self, cmd: &str) {
+    pub(crate) fn run_ex(&mut self, cmd: &str) {
         let cmd = cmd.trim();
         match cmd {
             "w" => self.format_and_save(),
@@ -3163,7 +3163,7 @@ impl Editor {
 
     /// Parse and execute `:%s/pat/rep/flags`, `:s/pat/rep/flags`, etc.
     /// v1 supports `%` (whole file) and no-range (current line). Flags: g, i.
-    fn run_substitute(&mut self, cmd: &str) {
+    pub(crate) fn run_substitute(&mut self, cmd: &str) {
         // Strip the range prefix + the `s`.
         let rest = if let Some(r) = cmd.strip_prefix("%s") {
             r
@@ -3279,7 +3279,7 @@ impl Editor {
     }
 
     /// Dispatch a resolved Action. Mutates editor state.
-    fn dispatch(&mut self, action: Action) {
+    pub(crate) fn dispatch(&mut self, action: Action) {
         match action {
             Action::Move(m, n) => {
                 if let Motion::FindChar(c, dir, kind) = m {
@@ -3568,7 +3568,7 @@ impl Editor {
     }
 
     /// Position cursor for the given insert style and begin recording.
-    fn enter_insert(&mut self, pos: InsertPos) {
+    pub(crate) fn enter_insert(&mut self, pos: InsertPos) {
         let sel_before = self.sel;
         let (line, col) = self.buffer.char_to_line_col(self.sel.head);
         let mut tx = Transaction::new();
@@ -3624,13 +3624,13 @@ impl Editor {
     }
 
     /// Returns true if the operator entered Insert mode (c/cc).
-    fn apply_operator(&mut self, op: PendingOp, range: std::ops::Range<usize>) -> bool {
+    pub(crate) fn apply_operator(&mut self, op: PendingOp, range: std::ops::Range<usize>) -> bool {
         self.apply_operator_with_kind(op, range, false)
     }
 
     /// Linewise-aware operator application. `linewise` affects the register
     /// tag on yank/delete.
-    fn apply_operator_with_kind(
+    pub(crate) fn apply_operator_with_kind(
         &mut self,
         op: PendingOp,
         range: std::ops::Range<usize>,
@@ -3748,7 +3748,12 @@ impl Editor {
     }
 
     /// Replace `range` (currently holding `old`) with `new_text` as one transaction.
-    fn replace_range(&mut self, range: std::ops::Range<usize>, old: &str, new_text: &str) {
+    pub(crate) fn replace_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        old: &str,
+        new_text: &str,
+    ) {
         let sel_before = self.sel;
         self.buffer.remove_range(range.clone());
         self.buffer.insert_str(range.start, new_text);
@@ -3770,7 +3775,7 @@ impl Editor {
     }
 
     /// Indent or outdent the lines touched by `range`. 4 spaces per level.
-    fn indent_range(&mut self, range: std::ops::Range<usize>, right: bool) {
+    pub(crate) fn indent_range(&mut self, range: std::ops::Range<usize>, right: bool) {
         let (first_line, _) = self.buffer.char_to_line_col(range.start);
         let (mut last_line, _) = self.buffer.char_to_line_col(range.end.saturating_sub(1));
         if range.end == 0 {
@@ -3809,7 +3814,7 @@ impl Editor {
     /// state is determined by the non-blank lines: if every non-blank line
     /// already starts with the language's line-comment prefix, uncomment;
     /// otherwise comment by inserting at the minimum indent column.
-    fn toggle_comment_range(&mut self, range: std::ops::Range<usize>) {
+    pub(crate) fn toggle_comment_range(&mut self, range: std::ops::Range<usize>) {
         let Some(prefix) = self
             .syntax
             .as_ref()
@@ -3915,7 +3920,7 @@ impl Editor {
     }
 
     /// Paste the unnamed register after (`p`) or before (`P`) the cursor.
-    fn paste(&mut self, after: bool) {
+    pub(crate) fn paste(&mut self, after: bool) {
         if self.register.text.is_empty() {
             self.msg = "Register empty".into();
             return;
@@ -3975,7 +3980,7 @@ impl Editor {
     }
 
     /// Re-dispatch the last change at the current cursor.
-    fn repeat_last_change(&mut self) {
+    pub(crate) fn repeat_last_change(&mut self) {
         let Some(last) = self.last_change.clone() else {
             self.msg = "No previous change to repeat".into();
             return;
@@ -4096,7 +4101,7 @@ impl Editor {
     /// Compute the char range for `x` / `X`: `count` chars forward or backward
     /// from the cursor, clamped to the current line (so x on the last char of
     /// a line deletes that char, and X at col 0 is a no-op).
-    fn delete_chars_range(&self, forward: bool, count: usize) -> std::ops::Range<usize> {
+    pub(crate) fn delete_chars_range(&self, forward: bool, count: usize) -> std::ops::Range<usize> {
         let count = count.max(1);
         let head = self.sel.head;
         let (line, _) = self.buffer.char_to_line_col(head);
@@ -4111,7 +4116,7 @@ impl Editor {
 
     /// Insert a single character within the current Insert session. Records it
     /// into the pending transaction and the dot-repeat buffer.
-    fn insert_char_in_session(&mut self, c: char) {
+    pub(crate) fn insert_char_in_session(&mut self, c: char) {
         let at = self.sel.head;
         self.buffer.insert_char(at, c);
         self.sel.head += 1;
@@ -4127,7 +4132,7 @@ impl Editor {
     }
 
     /// Backspace in Insert mode. Records the deletion.
-    fn backspace_in_session(&mut self) {
+    pub(crate) fn backspace_in_session(&mut self) {
         if self.sel.head == 0 {
             return;
         }
@@ -4143,7 +4148,7 @@ impl Editor {
     }
 
     /// Commit the current Insert session to history and record it for `.`.
-    fn leave_insert(&mut self) {
+    pub(crate) fn leave_insert(&mut self) {
         if let Some(mut pi) = self.pending_insert.take() {
             pi.tx.sel_after = Some(self.sel);
             self.history.commit(pi.tx);
@@ -4675,7 +4680,7 @@ impl Editor {
 
     /// Translate absolute terminal (col, row) to a buffer char offset, or
     /// None if the click was outside the content area / past EOF.
-    fn click_to_char(&self, col: u16, row: u16) -> Option<usize> {
+    pub(crate) fn click_to_char(&self, col: u16, row: u16) -> Option<usize> {
         let rect = self.last_content_rect?;
         if col < rect.x || row < rect.y || col >= rect.x + rect.width || row >= rect.y + rect.height
         {
@@ -4697,7 +4702,7 @@ impl Editor {
 }
 
 /// "E:2 W:1 " if the active buffer has diagnostics, else empty.
-fn diag_summary(ed: &Editor) -> String {
+pub(crate) fn diag_summary(ed: &Editor) -> String {
     let Some(path) = ed.buffer.path() else {
         return String::new();
     };
@@ -4719,7 +4724,7 @@ fn diag_summary(ed: &Editor) -> String {
     }
 }
 
-fn sev_rank(s: DiagnosticSeverity) -> u8 {
+pub(crate) fn sev_rank(s: DiagnosticSeverity) -> u8 {
     match s {
         DiagnosticSeverity::ERROR => 4,
         DiagnosticSeverity::WARNING => 3,
@@ -4730,7 +4735,7 @@ fn sev_rank(s: DiagnosticSeverity) -> u8 {
 }
 
 /// Flatten a hover response to a plain string the TUI can render.
-fn hover_text(h: &Hover) -> String {
+pub(crate) fn hover_text(h: &Hover) -> String {
     let piece = |s: &str| s.to_string();
     match &h.contents {
         HoverContents::Scalar(s) => match s {
@@ -4757,7 +4762,7 @@ fn hover_text(h: &Hover) -> String {
 /// `tx` (for history / undo). Pass `&mut Transaction::new()` and discard if
 /// you don't want history tracking (e.g. when writing an on-disk file we're
 /// not keeping open).
-fn apply_text_edits_to_buffer_tx(
+pub(crate) fn apply_text_edits_to_buffer_tx(
     buf: &mut Buffer,
     edits: &[vix_lsp::lsp_types::TextEdit],
     tx: &mut Transaction,
@@ -4801,7 +4806,7 @@ fn apply_text_edits_to_buffer_tx(
 /// Write `text` to the terminal's system clipboard via the OSC 52 escape
 /// sequence. Works over SSH on any terminal that supports it (iTerm2,
 /// WezTerm, kitty, Alacritty, Ghostty, tmux with set-clipboard on, etc.).
-fn osc52_copy(text: &str) {
+pub(crate) fn osc52_copy(text: &str) {
     use std::io::Write;
     // Skip pathologically large yanks. Most terminals cap OSC 52 around
     // 8-100KB; blasting a huge sequence can jam the terminal.
@@ -4815,7 +4820,7 @@ fn osc52_copy(text: &str) {
 }
 
 /// Minimal RFC 4648 base64 encoder. Used for OSC 52 clipboard writes.
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
@@ -4847,7 +4852,7 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-fn regex_escape_like(s: &str) -> String {
+pub(crate) fn regex_escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if ".+*?()[]{}|^$\\/".contains(c) {
@@ -4858,7 +4863,7 @@ fn regex_escape_like(s: &str) -> String {
     out
 }
 
-fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
+pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let area = f.area();
 
     // Files / Grep / Buffers picker takes the whole screen — skip drawing
@@ -4923,7 +4928,7 @@ fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     }
 }
 
-fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
+pub(crate) fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let Some(text) = ed.hover_popup.as_deref() else {
         return;
     };
@@ -4983,7 +4988,7 @@ fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
 
 /// Draw the completion popup anchored to the cursor. Opens below the cursor
 /// if there's room, else above.
-fn render_completion_popup(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
+pub(crate) fn render_completion_popup(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     use vix_lsp::lsp_types::CompletionItemKind;
     let Some(popup) = ed.completion_popup.as_ref() else {
         return;
@@ -5069,7 +5074,7 @@ fn render_completion_popup(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
 
 /// Translate a tree-sitter highlight scope index into a ratatui style.
 /// Returns `None` for unstyled ("default foreground") scopes.
-fn scope_style(scope_idx: usize) -> Option<Style> {
+pub(crate) fn scope_style(scope_idx: usize) -> Option<Style> {
     let name = HIGHLIGHT_NAMES.get(scope_idx)?;
     let color = if name.starts_with("keyword") {
         Color::Magenta
@@ -5094,7 +5099,12 @@ fn scope_style(scope_idx: usize) -> Option<Style> {
     Some(Style::default().fg(color))
 }
 
-fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans: &[HlSpan]) {
+pub(crate) fn render_content(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    ed: &mut Editor,
+    hl_spans: &[HlSpan],
+) {
     let total_lines = ed.buffer.len_lines();
     let rows = area.height as usize;
     let gutter_width = total_lines.to_string().len().max(3) + 1;
@@ -5287,7 +5297,7 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor, hl_spans:
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
+pub(crate) fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let (line, col) = ed.buffer.char_to_line_col(ed.sel.head);
     let mode_style = match ed.mode {
         Mode::Normal => Style::default()
@@ -5346,7 +5356,7 @@ fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     f.render_widget(Paragraph::new(line_widget), area);
 }
 
-fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
+pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     let Some(p) = ed.picker.as_ref() else {
         ed.last_picker_rect = None;
         ed.last_picker_list_rows = 0;
@@ -5359,7 +5369,7 @@ fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     }
 }
 
-fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
+pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     let Some(p) = ed.picker.as_ref() else {
         ed.last_picker_rect = None;
         ed.last_picker_list_rows = 0;
@@ -5518,14 +5528,14 @@ fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
 
 // --- Fullscreen Files / Grep picker ----------------------------------------
 
-const PICKER_ACCENT: Color = Color::Cyan;
-const PICKER_ACCENT_HI: Color = Color::LightCyan;
-const PICKER_BORDER: Color = Color::DarkGray;
-const PICKER_DIM: Color = Color::Gray;
+pub(crate) const PICKER_ACCENT: Color = Color::Cyan;
+pub(crate) const PICKER_ACCENT_HI: Color = Color::LightCyan;
+pub(crate) const PICKER_BORDER: Color = Color::DarkGray;
+pub(crate) const PICKER_DIM: Color = Color::Gray;
 
 /// Cap the file size we'll attempt to read for previews. Keeps a single
 /// keystroke from triggering a multi-MB read on a stray binary.
-const PREVIEW_MAX_BYTES: usize = 256 * 1024;
+pub(crate) const PREVIEW_MAX_BYTES: usize = 256 * 1024;
 
 impl PreviewCache {
     fn placeholder(path: &Path, msg: &str) -> Self {
@@ -5544,7 +5554,7 @@ impl PreviewCache {
 ///
 /// Reads at most `PREVIEW_MAX_BYTES + 1` so we don't slurp a multi-MB file
 /// just to throw it away at the size check below.
-fn read_preview_source(path: &Path) -> Result<String, PreviewCache> {
+pub(crate) fn read_preview_source(path: &Path) -> Result<String, PreviewCache> {
     use std::io::Read;
     let file = std::fs::File::open(path)
         .map_err(|e| PreviewCache::placeholder(path, &format!("(cannot read: {e})")))?;
@@ -5568,7 +5578,11 @@ fn read_preview_source(path: &Path) -> Result<String, PreviewCache> {
 /// Build a `PreviewCache` from in-memory text plus precomputed syntax spans.
 /// `path` is used for display / cache key only — language routing happens
 /// in the caller, since they own the per-language `SyntaxState` cache.
-fn build_preview_from_text(path: &Path, source: &str, spans: Vec<HlSpan>) -> PreviewCache {
+pub(crate) fn build_preview_from_text(
+    path: &Path,
+    source: &str,
+    spans: Vec<HlSpan>,
+) -> PreviewCache {
     if source.len() > PREVIEW_MAX_BYTES {
         return PreviewCache::placeholder(path, "(buffer too large to preview)");
     }
@@ -5606,7 +5620,7 @@ fn build_preview_from_text(path: &Path, source: &str, spans: Vec<HlSpan>) -> Pre
 
 /// Compute syntax spans for a preview, routing through the per-language
 /// `SyntaxState` cache so the query compile is one-time per language.
-fn preview_spans(ed: &mut Editor, path: &Path, source: &str) -> Vec<HlSpan> {
+pub(crate) fn preview_spans(ed: &mut Editor, path: &Path, source: &str) -> Vec<HlSpan> {
     let Some(lang) = Language::from_path(path) else {
         return Vec::new();
     };
@@ -5620,19 +5634,19 @@ fn preview_spans(ed: &mut Editor, path: &Path, source: &str) -> Vec<HlSpan> {
 /// fast j/k/scroll from triggering a per-move file read + parse on the
 /// render thread; the run loop's 100 ms event poll guarantees we'll be
 /// re-entered shortly after the user pauses.
-const PREVIEW_DEBOUNCE_MS: u64 = 50;
+pub(crate) const PREVIEW_DEBOUNCE_MS: u64 = 50;
 
 /// Window after a query change before we run the deferred rescore (Files)
 /// or regrep (Grep). Tuned so fast typing on large corpora doesn't pay the
 /// per-keystroke cost: the user types, the prompt updates immediately, and
 /// the match list catches up shortly after they pause.
-const PICKER_REFRESH_DEBOUNCE_MS: u64 = 80;
+pub(crate) const PICKER_REFRESH_DEBOUNCE_MS: u64 = 80;
 
 /// If the picker is showing a fullscreen-kind selection whose target differs
 /// from the cached preview, rebuild the cache. Cheap when the selection
 /// hasn't moved; debounced when the user is actively scrolling so the
 /// previous preview keeps showing instead of a render-time stall.
-fn refresh_preview(ed: &mut Editor) {
+pub(crate) fn refresh_preview(ed: &mut Editor) {
     let kind = match ed.picker.as_ref().map(|p| p.kind.clone()) {
         Some(k) => k,
         None => return,
@@ -5742,7 +5756,7 @@ fn refresh_preview(ed: &mut Editor) {
 /// Always rebuilds from the live rope so dirty changes show through. Falls
 /// back to a synthetic display path for unnamed buffers so syntax routing
 /// and the preview header still have *something* to show.
-fn build_preview_for_buffer_idx(ed: &mut Editor, idx: usize) -> PreviewCache {
+pub(crate) fn build_preview_for_buffer_idx(ed: &mut Editor, idx: usize) -> PreviewCache {
     // Pull the buffer's path + text under an immutable borrow first; release
     // the borrow before reaching for the (mutable) syntax cache.
     let (path, text): (PathBuf, String) = {
@@ -5772,7 +5786,7 @@ fn build_preview_for_buffer_idx(ed: &mut Editor, idx: usize) -> PreviewCache {
 /// Picker-time helper: the line number to anchor the preview around for the
 /// currently-highlighted item. Files anchor at line 0; grep hits at the hit
 /// line.
-fn picker_preview_anchor_line(p: &Picker) -> usize {
+pub(crate) fn picker_preview_anchor_line(p: &Picker) -> usize {
     p.matches
         .get(p.selected)
         .and_then(|&(idx, _)| match &p.items[idx].value {
@@ -5786,7 +5800,7 @@ fn picker_preview_anchor_line(p: &Picker) -> usize {
 /// only source of redraw cadence here, but the run loop polls every 100ms,
 /// so colors change roughly twice per second when nothing else triggers a
 /// redraw.
-fn picker_pulse_accent() -> Color {
+pub(crate) fn picker_pulse_accent() -> Color {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -5800,7 +5814,7 @@ fn picker_pulse_accent() -> Color {
 
 /// Pad a string out to `width` columns (assuming 1 char = 1 col). Truncates
 /// with `…` when the string would overflow.
-fn pad_or_trunc(s: &str, width: usize) -> String {
+pub(crate) fn pad_or_trunc(s: &str, width: usize) -> String {
     let n = count_chars(s);
     if n == width {
         s.to_string()
@@ -5813,7 +5827,7 @@ fn pad_or_trunc(s: &str, width: usize) -> String {
     }
 }
 
-fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
+pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     // Tiny terminal — fall back to the overlay so we don't render garbage.
     if area.width < 50 || area.height < 12 {
         render_picker_overlay(f, area, ed);
@@ -6192,7 +6206,7 @@ fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
 
 /// Draw the preview pane for the highlighted Files/Grep row. Caller positions
 /// the rect; we own every cell inside it.
-fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: &Picker) {
+pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: &Picker) {
     let w = area.width as usize;
     let h = area.height as usize;
     if w < 8 || h < 3 {
@@ -6368,14 +6382,14 @@ fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: &Picker) {
 
 /// Map a byte offset within a UTF-8 string to its char index. Clamps to
 /// `s.chars().count()` if the byte is at or past the end.
-fn char_index_in_byte_range(s: &str, byte_offset: usize) -> usize {
+pub(crate) fn char_index_in_byte_range(s: &str, byte_offset: usize) -> usize {
     if byte_offset >= s.len() {
         return s.chars().count();
     }
     s[..byte_offset].chars().count()
 }
 
-fn render_cmdline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
+pub(crate) fn render_cmdline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let content = match ed.mode {
         Mode::Command => format!("{}{}", ed.cmdline_prompt, ed.cmdline),
         _ => ed.msg.clone(),
