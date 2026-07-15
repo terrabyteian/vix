@@ -10,7 +10,7 @@ use vix_syntax::{Language, Symbol, SyntaxState};
 
 use crate::picker::{
     grep_as_picker_items, grep_hit_to_picker_item, scan_files_as_picker_items, Picker, PickerItem,
-    PickerKind, PickerLayout, PickerValue, PICKER_REFRESH_DEBOUNCE_MS,
+    PickerKind, PickerValue, PICKER_REFRESH_DEBOUNCE_MS,
 };
 use crate::Editor;
 
@@ -656,18 +656,10 @@ impl Editor {
                     {
                         return;
                     }
-                    let row_in_rect = me.row - rect.y;
-                    // For overlay pickers, row 0 of `rect` is the header; for
-                    // the fullscreen picker, `rect` already starts at the
-                    // first list row. Distinguish via picker kind.
-                    let is_fullscreen = matches!(p.kind.spec().layout, PickerLayout::Full);
-                    let list_row = if is_fullscreen {
-                        row_in_rect as usize
-                    } else if row_in_rect == 0 {
-                        return;
-                    } else {
-                        (row_in_rect - 1) as usize
-                    };
+                    // `last_picker_rect` is the list rect for every kind now,
+                    // so a clicked row maps straight to a list row — no
+                    // per-layout header offset.
+                    let list_row = (me.row - rect.y) as usize;
                     if list_row >= self.last_picker_list_rows {
                         return;
                     }

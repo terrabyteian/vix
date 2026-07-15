@@ -370,8 +370,10 @@ impl Editor {
 
     #[doc(hidden)]
     pub fn set_picker_geometry_for_test(&mut self, rect: Rect, scroll: usize) {
+        // `rect` is the list area (no header inside it); every clickable row
+        // maps straight to a list row.
         self.last_picker_rect = Some(rect);
         self.last_picker_scroll = scroll;
-        self.last_picker_list_rows = rect.height.saturating_sub(1) as usize;
+        self.last_picker_list_rows = rect.height as usize;
     }
 }

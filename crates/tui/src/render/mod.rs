@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use std::time::Instant;
 
-use crate::picker::render::{render_picker, render_picker_fullscreen};
+use crate::picker::render::render_picker;
 use crate::picker::PickerLayout;
 use crate::Editor;
 
@@ -27,7 +27,7 @@ pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
         // LSP sync still useful — keeps server state consistent across the
         // (potentially long) picker session.
         ed.sync_lsp_changes();
-        render_picker_fullscreen(f, area, ed);
+        render_picker(f, area, ed);
         return;
     }
 
