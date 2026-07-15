@@ -62,6 +62,65 @@ pub fn scan_files(root: &Path) -> Vec<FileItem> {
     out
 }
 
+/// Streaming variant of [`scan_files`]: walks `root` and hands out batches
+/// of files as they're discovered instead of one big Vec at the end, so a
+/// UI can show results immediately on huge repos. Batches flush every
+/// `SCAN_BATCH` entries or `SCAN_FLUSH_MS` ms, whichever comes first.
+///
+/// `on_batch` returns `false` to stop the walk (e.g. the consumer hung up).
+/// The walk also stops when `current` moves past `target_gen` — the same
+/// shared-generation cancellation used by [`grep_cancellable`].
+pub fn scan_files_streaming(
+    root: &Path,
+    current: &Arc<AtomicU64>,
+    target_gen: u64,
+    mut on_batch: impl FnMut(Vec<FileItem>) -> bool,
+) {
+    const SCAN_BATCH: usize = 500;
+    const SCAN_FLUSH_MS: u64 = 25;
+    let mut batch: Vec<FileItem> = Vec::with_capacity(SCAN_BATCH);
+    let mut last_flush = std::time::Instant::now();
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build()
+        .flatten()
+    {
+        if current.load(Ordering::Relaxed) != target_gen {
+            return;
+        }
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path())
+            .to_path_buf();
+        let display = rel.to_string_lossy().into_owned();
+        let haystack = Utf32String::from(display);
+        batch.push(FileItem {
+            rel_path: rel,
+            haystack,
+        });
+        if batch.len() >= SCAN_BATCH
+            || (!batch.is_empty() && last_flush.elapsed().as_millis() as u64 >= SCAN_FLUSH_MS)
+        {
+            if !on_batch(std::mem::take(&mut batch)) {
+                return;
+            }
+            batch.reserve(SCAN_BATCH);
+            last_flush = std::time::Instant::now();
+        }
+    }
+    if !batch.is_empty() {
+        on_batch(batch);
+    }
+}
+
 /// Recursively grep `root` for `pattern`. Returns per-line matches.
 ///
 /// Uses `WalkParallel` and one `Searcher` per worker thread, the same
@@ -69,6 +128,116 @@ pub fn scan_files(root: &Path) -> Vec<FileItem> {
 /// channel; the calling thread drains it once the walk completes.
 pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
     grep_cancellable(root, pattern, &Arc::new(AtomicU64::new(0)), 0)
+}
+
+/// Streaming variant of [`grep_cancellable`]: hits are delivered to
+/// `on_batch` in chunks (every `GREP_BATCH` hits or `GREP_FLUSH_MS` ms)
+/// while the parallel walk is still running, instead of one Vec at the
+/// end. `on_batch` returns `false` to stop early; generation cancellation
+/// works exactly as in [`grep_cancellable`].
+pub fn grep_streaming(
+    root: &Path,
+    pattern: &str,
+    current: &Arc<AtomicU64>,
+    target_gen: u64,
+    mut on_batch: impl FnMut(Vec<GrepItem>) -> bool,
+) -> anyhow::Result<()> {
+    const GREP_BATCH: usize = 200;
+    const GREP_FLUSH_MS: u64 = 30;
+    let matcher = Arc::new(RegexMatcher::new(pattern)?);
+    let root: Arc<Path> = Arc::from(root.to_path_buf().into_boxed_path());
+    let (tx, rx) = mpsc::channel::<GrepItem>();
+
+    let walker = WalkBuilder::new(&*root)
+        .hidden(false)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build_parallel();
+
+    std::thread::scope(|scope| {
+        // The walk runs on a scoped thread; this thread drains per-hit
+        // messages into batches as they arrive. Dropping `rx` (on early
+        // stop) makes worker sends fail, which stops their per-file search.
+        let current_walk = Arc::clone(current);
+        let matcher = Arc::clone(&matcher);
+        let walk_root = Arc::clone(&root);
+        scope.spawn(move || {
+            walker.run(|| {
+                let tx = tx.clone();
+                let matcher = Arc::clone(&matcher);
+                let root = Arc::clone(&walk_root);
+                let current = Arc::clone(&current_walk);
+                let mut searcher = Searcher::new();
+                Box::new(move |result| {
+                    if current.load(Ordering::Relaxed) != target_gen {
+                        return WalkState::Quit;
+                    }
+                    let entry = match result {
+                        Ok(e) => e,
+                        Err(_) => return WalkState::Continue,
+                    };
+                    let Some(ft) = entry.file_type() else {
+                        return WalkState::Continue;
+                    };
+                    if !ft.is_file() {
+                        return WalkState::Continue;
+                    }
+                    let path = entry.path().to_path_buf();
+                    let rel = path.strip_prefix(&*root).unwrap_or(&path).to_path_buf();
+                    let _ = searcher.search_path(
+                        &*matcher,
+                        &path,
+                        UTF8(|line_no, text| {
+                            if current.load(Ordering::Relaxed) != target_gen {
+                                return Ok(false);
+                            }
+                            let text = text.trim_end_matches('\n').to_string();
+                            let display = format!("{}:{}: {}", rel.display(), line_no, text);
+                            if tx
+                                .send(GrepItem {
+                                    path: path.clone(),
+                                    line: line_no,
+                                    text,
+                                    haystack: Utf32String::from(display),
+                                })
+                                .is_err()
+                            {
+                                return Ok(false);
+                            }
+                            Ok(true)
+                        }),
+                    );
+                    WalkState::Continue
+                })
+            });
+            // Workers' sender clones drop as `run` returns; the original was
+            // moved into the closure factory and drops with it, so the drain
+            // loop below sees Disconnected once the walk is done.
+        });
+
+        let mut batch: Vec<GrepItem> = Vec::with_capacity(GREP_BATCH);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(GREP_FLUSH_MS)) {
+                Ok(item) => {
+                    batch.push(item);
+                    if batch.len() >= GREP_BATCH && !on_batch(std::mem::take(&mut batch)) {
+                        return;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !batch.is_empty() && !on_batch(std::mem::take(&mut batch)) {
+                        return;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if !batch.is_empty() {
+                        on_batch(batch);
+                    }
+                    return;
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Cancellable variant of [`grep`]. The walker checks `current` against
@@ -341,5 +510,77 @@ mod tests {
 
         assert_eq!(hits.len(), 1, "expected to skip .git; got {hits:?}");
         assert!(hits[0].path.ends_with("real.txt"));
+    }
+
+    #[test]
+    fn scan_files_streaming_delivers_same_set_as_scan_files() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-scan-stream-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        for i in 0..12 {
+            fs::write(dir.join(format!("f{i}.txt")), "x\n").unwrap();
+        }
+        fs::write(dir.join("sub/nested.txt"), "x\n").unwrap();
+
+        let full: Vec<_> = scan_files(&dir).into_iter().map(|f| f.rel_path).collect();
+        let gen = Arc::new(AtomicU64::new(7));
+        let mut streamed: Vec<std::path::PathBuf> = Vec::new();
+        scan_files_streaming(&dir, &gen, 7, |batch| {
+            streamed.extend(batch.into_iter().map(|f| f.rel_path));
+            true
+        });
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut a = full;
+        let mut b = streamed;
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn scan_files_streaming_stops_on_generation_bump() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-scan-cancel-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..5 {
+            fs::write(dir.join(format!("f{i}.txt")), "x\n").unwrap();
+        }
+        // Generation already moved past the target: nothing is delivered.
+        let gen = Arc::new(AtomicU64::new(2));
+        let mut called = false;
+        scan_files_streaming(&dir, &gen, 1, |_batch| {
+            called = true;
+            true
+        });
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!called, "cancelled scan must not deliver batches");
+    }
+
+    #[test]
+    fn grep_streaming_delivers_same_hits_as_grep() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-grep-stream-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), "alpha\nbeta NEEDLE here\ngamma\n").unwrap();
+        fs::write(dir.join("sub/c.txt"), "first NEEDLE\nsecond NEEDLE\n").unwrap();
+
+        let mut full: Vec<String> = grep(&dir, "NEEDLE")
+            .unwrap()
+            .into_iter()
+            .map(|h| h.text)
+            .collect();
+        let gen = Arc::new(AtomicU64::new(3));
+        let mut streamed: Vec<String> = Vec::new();
+        grep_streaming(&dir, "NEEDLE", &gen, 3, |batch| {
+            streamed.extend(batch.into_iter().map(|h| h.text));
+            true
+        })
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        full.sort();
+        streamed.sort();
+        assert_eq!(full, streamed);
     }
 }

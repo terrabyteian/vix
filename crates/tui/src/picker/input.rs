@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vix_core::{Buffer, History, JumpEntry, Selection};
-use vix_picker::{grep_cancellable, Utf32String};
+use vix_picker::{grep_streaming, scan_files_streaming, Utf32String};
 use vix_syntax::{Language, Symbol, SyntaxState};
 
 use crate::picker::{
-    grep_as_picker_items, grep_hit_to_picker_item, scan_files_as_picker_items, Picker, PickerItem,
+    file_item_to_picker_item, grep_hit_to_picker_item, PendingSource, Picker, PickerItem,
     PickerKind, PickerValue, PICKER_REFRESH_DEBOUNCE_MS,
 };
 use crate::Editor;
@@ -270,17 +270,17 @@ impl Editor {
             Some(PickerKind::Grep)
         );
         if is_grep {
-            self.start_grep_async();
+            self.start_grep_stream();
         } else if let Some(p) = self.picker.as_mut() {
-            p.rescore();
+            p.rescore_query_changed();
         }
     }
 
-    /// Force-run the deferred rescore / regrep right now. Used on
-    /// commit-style events (Enter, mouse click). Grep falls through to
-    /// a synchronous walk so the matches list reflects the current query
-    /// by the time the caller reads it; any in-flight async worker is
-    /// cancelled via the generation atomic.
+    /// Force-run the deferred rescore right now. Used on commit-style
+    /// events (Enter, mouse click). In-memory kinds rescore synchronously
+    /// (cheap) so the commit reads matches for the query as typed; Grep
+    /// follows fzf semantics instead — *Enter acts on what's on screen* —
+    /// so a dirty query is simply dropped rather than re-walked.
     pub(crate) fn flush_picker_query_now(&mut self) {
         let dirty = self
             .picker
@@ -295,86 +295,249 @@ impl Editor {
             self.picker.as_ref().map(|p| &p.kind),
             Some(PickerKind::Grep)
         );
-        if is_grep {
-            // Cancel any in-flight async worker by bumping the generation;
-            // its result (if it ever arrives) won't match `grep_pending`'s
-            // expected gen, and pump_grep_results discards it. Then run
-            // sync so Enter / click can read p.matches immediately.
-            if dirty || self.grep_pending.is_some() {
-                self.grep_pending = None;
-                self.grep_gen
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                self.refresh_grep_items();
-            }
-        } else if dirty {
+        if dirty && !is_grep {
             if let Some(p) = self.picker.as_mut() {
-                p.rescore();
+                p.rescore_query_changed();
             }
         }
     }
 
-    /// Spawn a worker thread that runs `grep_cancellable` for the picker's
-    /// current query. Bumps the generation atomic so any older worker
-    /// observes the change and quits its walk early. The worker sends
-    /// results back over an mpsc channel; `pump_grep_results` drains it
-    /// from the main loop.
-    pub(crate) fn start_grep_async(&mut self) {
+    /// Spawn the streaming file-scan worker for the unified picker. Batches
+    /// arrive via `pump_picker_sources`; the picker opens instantly and the
+    /// list fills in. The scan has its own cancel token (`files_gen`) so a
+    /// grep starting later can't kill it.
+    pub(crate) fn start_files_scan(&mut self) {
+        let Some(p) = self.picker.as_mut() else {
+            return;
+        };
+        p.file_items.clear();
+        p.file_items_complete = false;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let target_gen = self
+            .files_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        let gen_arc = Arc::clone(&self.files_gen);
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<PickerItem>>();
+        std::thread::spawn(move || {
+            scan_files_streaming(&cwd, &gen_arc, target_gen, |batch| {
+                tx.send(batch.into_iter().map(file_item_to_picker_item).collect())
+                    .is_ok()
+            });
+        });
+        self.files_source = Some(PendingSource {
+            rx,
+            gen: target_gen,
+        });
+    }
+
+    /// Spawn the streaming grep worker for the picker's current query.
+    /// Clears the previous query's hits immediately (they're stale), then
+    /// batches stream in via `pump_picker_sources`. Queries shorter than
+    /// `min_query_len` just clear — no walk.
+    pub(crate) fn start_grep_stream(&mut self) {
         let query = match self.picker.as_ref() {
             Some(p) if matches!(p.kind, PickerKind::Grep) => p.query.clone(),
             _ => return,
         };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        // Cancel any in-flight grep; stale batches also fail the receiver-side
+        // gen check in the pump.
         let target_gen = self
             .grep_gen
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
+        self.grep_source = None;
+        let run = query.len() >= PickerKind::Grep.spec().min_query_len;
+        if let Some(p) = self.picker.as_mut() {
+            p.grep_items.clear();
+            p.marked.clear();
+            p.grep_items_complete = !run;
+            p.last_grep_query = Some(query.clone());
+            p.rescore_query_changed();
+        }
+        if !run {
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let gen_arc = Arc::clone(&self.grep_gen);
         let (tx, rx) = std::sync::mpsc::channel::<Vec<PickerItem>>();
         std::thread::spawn(move || {
-            let items: Vec<PickerItem> = if query.len() >= PickerKind::Grep.spec().min_query_len {
-                grep_cancellable(&cwd, &query, &gen_arc, target_gen)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|g| grep_hit_to_picker_item(&cwd, g))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            // Don't bother delivering if a newer generation has been issued
-            // since — the receiver may already have been replaced.
-            if gen_arc.load(std::sync::atomic::Ordering::SeqCst) == target_gen {
-                let _ = tx.send(items);
-            }
+            // Regex errors (mid-typing patterns like `[`) collapse to an
+            // empty stream — same silence as the old sync path.
+            let _ = grep_streaming(&cwd, &query, &gen_arc, target_gen, |batch| {
+                tx.send(
+                    batch
+                        .into_iter()
+                        .map(|g| grep_hit_to_picker_item(&cwd, g))
+                        .collect(),
+                )
+                .is_ok()
+            });
         });
-        // Drop any prior receiver. Its worker (if still running) will see a
-        // newer gen on its next cancel-check and quit.
-        self.grep_pending = Some(rx);
+        self.grep_source = Some(PendingSource {
+            rx,
+            gen: target_gen,
+        });
     }
 
-    /// Drain pending grep results, if any. Called once per main-loop tick.
-    /// Applying happens only when the picker is still on Grep; otherwise we
-    /// silently drop the result so a stale walk can't repopulate a closed
-    /// or kind-toggled picker.
-    pub(crate) fn pump_grep_results(&mut self) {
-        let Some(rx) = self.grep_pending.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(items) => {
-                self.grep_pending = None;
-                if let Some(p) = self.picker.as_mut() {
-                    if matches!(p.kind, PickerKind::Grep) {
-                        p.grep_items = items;
-                        p.marked.clear();
-                        p.rescore();
-                    }
+    /// Drain any batches the streaming scan/grep workers have delivered.
+    /// Called once per main-loop tick. Batches append to the picker's
+    /// per-source storage without touching the selection; sender disconnect
+    /// marks the source complete.
+    pub(crate) fn pump_picker_sources(&mut self) {
+        loop {
+            let Some(src) = self.files_source.as_ref() else {
+                break;
+            };
+            match src.rx.try_recv() {
+                Ok(batch) => {
+                    let gen = src.gen;
+                    self.apply_files_batch(batch, gen);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.finish_files_source();
+                    break;
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Worker quit (cancelled, or its sender went out of scope
-                // without ever delivering). Nothing to do but clear.
-                self.grep_pending = None;
+        }
+        loop {
+            let Some(src) = self.grep_source.as_ref() else {
+                break;
+            };
+            match src.rx.try_recv() {
+                Ok(batch) => {
+                    let gen = src.gen;
+                    self.apply_grep_batch(batch, gen);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.finish_grep_source();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Append one scan batch to `file_items` (if it's still wanted) and
+    /// extend the match list in place when the Files tab is active.
+    fn apply_files_batch(&mut self, batch: Vec<PickerItem>, gen: u64) {
+        // Receiver-side generation check: a bump (close/reopen) after the
+        // worker's own check but before this pump must not apply.
+        if gen != self.files_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            self.files_source = None;
+            return;
+        }
+        let unified = matches!(
+            self.picker.as_ref().map(|p| &p.kind),
+            Some(PickerKind::Files | PickerKind::Grep)
+        );
+        if !unified {
+            // Picker closed or switched to an unrelated kind: cancel the walk.
+            self.files_source = None;
+            self.files_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        if let Some(p) = self.picker.as_mut() {
+            let from_idx = p.file_items.len();
+            p.file_items.extend(batch);
+            if matches!(p.kind, PickerKind::Files) {
+                p.append_matches(from_idx);
+            }
+        }
+    }
+
+    /// Append one grep batch to `grep_items` (if it's still wanted) and
+    /// extend the match list in place when the Grep tab is active.
+    fn apply_grep_batch(&mut self, batch: Vec<PickerItem>, gen: u64) {
+        if gen != self.grep_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            self.grep_source = None;
+            return;
+        }
+        let unified = matches!(
+            self.picker.as_ref().map(|p| &p.kind),
+            Some(PickerKind::Files | PickerKind::Grep)
+        );
+        if !unified {
+            self.grep_source = None;
+            self.grep_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        if let Some(p) = self.picker.as_mut() {
+            let from_idx = p.grep_items.len();
+            p.grep_items.extend(batch);
+            if matches!(p.kind, PickerKind::Grep) {
+                p.append_matches(from_idx);
+            }
+        }
+    }
+
+    /// The scan worker hung up: everything is delivered. Apply the one-time
+    /// ranked re-sort for a live query (streamed hits sat at the end in
+    /// arrival order), keeping the highlight on the same item.
+    fn finish_files_source(&mut self) {
+        self.files_source = None;
+        if let Some(p) = self.picker.as_mut() {
+            p.file_items_complete = true;
+            if matches!(p.kind, PickerKind::Files) && !p.query.trim().is_empty() {
+                p.rescore_files_preserving_selection();
+            }
+        }
+    }
+
+    fn finish_grep_source(&mut self) {
+        self.grep_source = None;
+        if let Some(p) = self.picker.as_mut() {
+            p.grep_items_complete = true;
+        }
+    }
+
+    /// Cancel both streaming workers and drop their channels. Called when
+    /// the picker closes so a stale walk can't outlive it.
+    pub(crate) fn cancel_picker_sources(&mut self) {
+        self.files_source = None;
+        self.grep_source = None;
+        self.files_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.grep_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Deterministic pump for tests: block on each in-flight source until
+    /// its worker finishes (or a 2 s safety timeout trips), applying batches
+    /// exactly like the main-loop pump.
+    #[doc(hidden)]
+    pub fn pump_picker_sources_blocking_for_test(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.files_source.is_some() || self.grep_source.is_some() {
+            if Instant::now() >= deadline {
+                return;
+            }
+            if let Some(src) = self.files_source.as_ref() {
+                match src.rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(batch) => {
+                        let gen = src.gen;
+                        self.apply_files_batch(batch, gen);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        self.finish_files_source();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+            if let Some(src) = self.grep_source.as_ref() {
+                match src.rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(batch) => {
+                        let gen = src.gen;
+                        self.apply_grep_batch(batch, gen);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        self.finish_grep_source();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
             }
         }
     }
@@ -392,13 +555,32 @@ impl Editor {
     pub fn picker_matches_count_for_test(&self) -> usize {
         self.picker.as_ref().map(|p| p.matches.len()).unwrap_or(0)
     }
-    /// Force-run the deferred query refresh right now. Typing only marks the
-    /// query dirty (debounced) so fast keystrokes on a large corpus don't
-    /// pay per-char rescore cost; tests that need to observe `matches` /
-    /// `selected` right after typing should call this first.
+    /// Force-run the deferred query refresh right now and drain any
+    /// streaming sources to completion. Typing only marks the query dirty
+    /// (debounced), and scan/grep results stream in from workers; tests
+    /// that need to observe `matches` / `selected` after typing or opening
+    /// call this to make the picker state deterministic.
     #[doc(hidden)]
     pub fn flush_picker_query_for_test(&mut self) {
-        self.flush_picker_query_now();
+        let dirty = self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.query_dirty_at.is_some());
+        if dirty {
+            if let Some(p) = self.picker.as_mut() {
+                p.query_dirty_at = None;
+            }
+            let is_grep = matches!(
+                self.picker.as_ref().map(|p| &p.kind),
+                Some(PickerKind::Grep)
+            );
+            if is_grep {
+                self.start_grep_stream();
+            } else if let Some(p) = self.picker.as_mut() {
+                p.rescore_query_changed();
+            }
+        }
+        self.pump_picker_sources_blocking_for_test();
     }
 
     /// Open the file finder picker rooted at the current working directory.
@@ -407,37 +589,32 @@ impl Editor {
     }
 
     /// Unified Files↔Grep picker. `<Tab>` toggles submode, query carries
-    /// over. Files results are scanned once on open and cached so toggling
-    /// is free.
+    /// over. Opening is instant: the file scan (and grep, when opening
+    /// straight into Grep with a long-enough query) streams in from worker
+    /// threads while the picker is already on screen.
     pub(crate) fn open_picker_unified(&mut self, initial: PickerKind, initial_query: &str) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let cached_files = scan_files_as_picker_items(&cwd);
-        let items = match initial {
-            PickerKind::Files => cached_files.clone(),
-            PickerKind::Grep => {
-                if initial_query.len() >= PickerKind::Grep.spec().min_query_len {
-                    grep_as_picker_items(&cwd, initial_query)
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => return,
-        };
-        let mut p = Picker::new(initial, items).with_query(initial_query);
-        // `file_items` doubles as the Files↔Grep toggle cache (see its doc
-        // comment), so it's always populated here regardless of `initial` —
-        // a picker opened straight into Grep still gets a free Files scan
-        // banked for the first `<Tab>`.
-        p.file_items = cached_files;
-        self.picker = Some(p);
+        if !matches!(initial, PickerKind::Files | PickerKind::Grep) {
+            return;
+        }
+        self.cancel_picker_sources();
+        let is_grep = matches!(initial, PickerKind::Grep);
+        self.picker = Some(Picker::new(initial, Vec::new()).with_query(initial_query));
+        // The file scan always starts — `file_items` doubles as the
+        // Files↔Grep toggle cache, so a picker opened straight into Grep
+        // still gets the scan banked for the first `<Tab>`.
+        self.start_files_scan();
+        if is_grep {
+            self.start_grep_stream();
+        }
     }
 
     /// Toggle the active picker between Files and Grep submodes. The query
-    /// is preserved. Files reuses `file_items` as-is (it persists across
-    /// toggles — no rescan, no clone); Grep re-runs the live grep (if the
-    /// query is at least `min_query_len` chars) to fill `grep_items`.
+    /// is preserved and the flip is instant: Files reuses `file_items`
+    /// as-is (still streaming in if the scan hasn't finished); Grep reuses
+    /// `grep_items` when they were produced for the same query, otherwise
+    /// kicks off a fresh streaming grep.
     pub(crate) fn toggle_picker_mode(&mut self) {
-        let (new_kind, query) = {
+        let (new_kind, query, grep_warm) = {
             let Some(p) = self.picker.as_mut() else {
                 return;
             };
@@ -446,51 +623,29 @@ impl Editor {
                 PickerKind::Grep => PickerKind::Files,
                 _ => return,
             };
-            (new_kind, p.query.clone())
+            let grep_warm = p.last_grep_query.as_deref() == Some(p.query.as_str());
+            (new_kind, p.query.clone(), grep_warm)
         };
-        if matches!(new_kind, PickerKind::Grep) {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-            let new_items = if query.len() >= PickerKind::Grep.spec().min_query_len {
-                grep_as_picker_items(&cwd, &query)
-            } else {
-                Vec::new()
-            };
+        {
             let Some(p) = self.picker.as_mut() else {
                 return;
             };
-            p.grep_items = new_items;
+            p.kind = new_kind.clone();
+            p.selected = 0;
+            p.scroll = 0;
+            // Item indices change when the active item storage is swapped, so
+            // any previously-marked entries now point at the wrong rows.
+            p.marked.clear();
         }
-        let Some(p) = self.picker.as_mut() else {
-            return;
-        };
-        p.kind = new_kind;
-        p.selected = 0;
-        p.scroll = 0;
-        // Item indices change when the active item storage is swapped, so
-        // any previously-marked entries now point at the wrong rows.
-        p.marked.clear();
-        p.rescore();
-    }
-
-    /// Re-grep on each query change in Grep submode. Requires ≥2 chars;
-    /// shorter queries clear the items list.
-    pub(crate) fn refresh_grep_items(&mut self) {
-        let query = match self.picker.as_ref() {
-            Some(p) if matches!(p.kind, PickerKind::Grep) => p.query.clone(),
-            _ => return,
-        };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let new_items = if query.len() >= PickerKind::Grep.spec().min_query_len {
-            grep_as_picker_items(&cwd, &query)
-        } else {
-            Vec::new()
-        };
-        let Some(p) = self.picker.as_mut() else {
-            return;
-        };
-        p.grep_items = new_items;
-        p.marked.clear();
-        p.rescore();
+        let needs_grep = matches!(new_kind, PickerKind::Grep)
+            && !grep_warm
+            && query.len() >= PickerKind::Grep.spec().min_query_len;
+        if needs_grep {
+            // Starts the walk and rescores (clearing stale hits) in one go.
+            self.start_grep_stream();
+        } else if let Some(p) = self.picker.as_mut() {
+            p.rescore_query_changed();
+        }
     }
 
     /// Open the tree-sitter symbol picker for the current buffer.
@@ -555,13 +710,16 @@ impl Editor {
             PickerAction::None => {}
             PickerAction::Close => {
                 self.picker = None;
+                self.cancel_picker_sources();
             }
             PickerAction::Select(v) => {
                 self.picker = None;
+                self.cancel_picker_sources();
                 self.pick_result(v);
             }
             PickerAction::SelectMany(values) => {
                 self.picker = None;
+                self.cancel_picker_sources();
                 // Park every selection except the last directly into
                 // `other_buffers` via `load_into_park` — that skips the
                 // tree-sitter highlight construction and LSP `didOpen`
@@ -605,6 +763,7 @@ impl Editor {
                     // Last buffer just closed → editor is exiting; tear down
                     // the picker so the final frame doesn't render over us.
                     self.picker = None;
+                    self.cancel_picker_sources();
                 } else {
                     self.refresh_buffers_picker_items();
                 }
@@ -682,6 +841,7 @@ impl Editor {
         };
         if let Some(v) = selected_value {
             self.picker = None;
+            self.cancel_picker_sources();
             self.pick_result(v);
         }
     }

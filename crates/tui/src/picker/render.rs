@@ -336,7 +336,20 @@ fn render_full_body(
     } else {
         cwd_str
     };
-    let counts = format!(" {} / {} ", p.matches.len(), p.active_items().len());
+    let scanning = match p.kind {
+        PickerKind::Files => !p.file_items_complete,
+        PickerKind::Grep => !p.grep_items_complete,
+        _ => false,
+    };
+    let counts = if scanning {
+        format!(
+            " {} / {} · scanning… ",
+            p.matches.len(),
+            p.active_items().len()
+        )
+    } else {
+        format!(" {} / {} ", p.matches.len(), p.active_items().len())
+    };
     let bread = format!(" {}  ", cwd_disp);
     let active_style = Style::default()
         .fg(theme.accent_hi)

@@ -30,7 +30,7 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
         while !ed.quit {
             ed.drain_lsp_events();
             ed.flush_picker_query_if_due();
-            ed.pump_grep_results();
+            ed.pump_picker_sources();
             // Keep the picker preview MRU current *before* drawing so preview
             // I/O stays off the render path (cheap no-op unless a fullscreen
             // preview picker is open).

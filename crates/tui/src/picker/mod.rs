@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use vix_picker::{grep, scan_files, GrepItem, Scorer, Utf32String};
+use vix_picker::{GrepItem, Scorer, Utf32String};
 use vix_syntax::HlSpan;
 
 use crate::util::{count_chars, take_end, take_start, truncate_end};
@@ -20,10 +20,22 @@ pub(crate) struct Picker {
     pub(crate) query: String,
     /// File-scan items. Only populated/consulted when `kind` is `Files`;
     /// doubles as the `<Tab>` Files↔Grep toggle cache so flipping back to
-    /// Files doesn't rescan the tree.
+    /// Files doesn't rescan the tree. Filled incrementally by the streaming
+    /// scan worker via `Editor::pump_picker_sources`.
     pub(crate) file_items: Vec<PickerItem>,
+    /// True once the streaming file scan has delivered its last batch (or
+    /// no scan is in flight). Drives the "scanning…" indicator and the
+    /// final ranked re-sort for a live query.
+    pub(crate) file_items_complete: bool,
     /// Live grep-hit items. Only populated/consulted when `kind` is `Grep`.
+    /// Filled incrementally by the streaming grep worker.
     pub(crate) grep_items: Vec<PickerItem>,
+    /// True once the streaming grep has delivered its last batch (or no
+    /// grep is in flight).
+    pub(crate) grep_items_complete: bool,
+    /// The query `grep_items` was produced for. Lets the `<Tab>` toggle
+    /// tell a warm grep cache from a stale one without re-running the walk.
+    pub(crate) last_grep_query: Option<String>,
     /// `(display, value, haystack)` tuples for every other picker kind
     /// (Symbols, Buffers, CodeActions, Jumps). Files/Grep use their own
     /// dedicated storage above instead — see `active_items`.
@@ -255,35 +267,27 @@ pub(crate) enum PickerValue {
     JumpIndex(usize),
 }
 
-/// Scan `cwd` for files (respecting `.gitignore`) and wrap them as picker
-/// items. Used by the unified Files/Grep picker.
-pub(crate) fn scan_files_as_picker_items(cwd: &std::path::Path) -> Vec<PickerItem> {
-    scan_files(cwd)
-        .into_iter()
-        .map(|fi| PickerItem {
-            display: fi.rel_path.to_string_lossy().into_owned(),
-            value: PickerValue::File(fi.rel_path),
-            haystack: fi.haystack,
-        })
-        .collect()
+/// A streaming result channel from a background scan/grep worker, plus the
+/// generation it was issued under. `Editor::pump_picker_sources` drains it
+/// each tick, verifying the generation against the live cancel token before
+/// applying anything (the belt to the worker-side suspenders).
+pub(crate) struct PendingSource {
+    pub(crate) rx: std::sync::mpsc::Receiver<Vec<PickerItem>>,
+    pub(crate) gen: u64,
 }
 
-/// Run a regex grep across `cwd` and wrap results as picker items. Errors
-/// (e.g. user typed an in-progress regex like `[`) collapse to an empty
-/// list — no UX-disrupting noise during live typing.
-///
-/// The list shows `path:line` only — the matched line text is rendered in
-/// the right-side preview pane anchored at the hit, so duplicating it in
-/// the row would be visual noise.
-pub(crate) fn grep_as_picker_items(cwd: &std::path::Path, query: &str) -> Vec<PickerItem> {
-    let hits: Vec<GrepItem> = grep(cwd, query).unwrap_or_default();
-    hits.into_iter()
-        .map(|g| grep_hit_to_picker_item(cwd, g))
-        .collect()
+/// Wrap one scanned file as a picker item. Used by the streaming scan
+/// worker (off the UI thread).
+pub(crate) fn file_item_to_picker_item(fi: vix_picker::FileItem) -> PickerItem {
+    PickerItem {
+        display: fi.rel_path.to_string_lossy().into_owned(),
+        value: PickerValue::File(fi.rel_path),
+        haystack: fi.haystack,
+    }
 }
 
-/// Build a `PickerItem` for a single grep hit. Used by both the sync path
-/// (Tab toggle, initial open, Enter flush) and the async worker.
+/// Build a `PickerItem` for a single grep hit. Used by the streaming grep
+/// worker (off the UI thread).
 pub(crate) fn grep_hit_to_picker_item(cwd: &std::path::Path, g: GrepItem) -> PickerItem {
     let rel = g.path.strip_prefix(cwd).unwrap_or(&g.path);
     let display = format!("{}:{}", rel.display(), g.line);
@@ -389,7 +393,10 @@ impl Picker {
             kind,
             query: String::new(),
             file_items: Vec::new(),
+            file_items_complete: true,
             grep_items: Vec::new(),
+            grep_items_complete: true,
+            last_grep_query: None,
             items: Vec::new(),
             matches: Vec::new(),
             selected: 0,
@@ -457,30 +464,77 @@ impl Picker {
         // sort by score before we write the capped result into `matches`.
         let mut scored: Vec<(usize, i64)> = Vec::new();
         for (i, it) in self.file_items.iter().enumerate() {
-            let disp = it.display.as_str();
-            if tokens.is_empty() {
-                // No query → keep scan order, shorter paths first.
-                scored.push((i, -(disp.chars().count() as i64)));
-                continue;
+            if let Some(score) = score_file_display(&it.display, &tokens) {
+                scored.push((i, score));
             }
-            // Every token must match somewhere in the path.
-            if tokens
-                .iter()
-                .any(|t| substring_match_smart(disp, t).is_none())
-            {
-                continue;
-            }
-            let offset = substring_match_smart(disp, tokens[0]).unwrap_or(0);
-            let base_start = disp.rfind('/').map(|p| p + 1).unwrap_or(0);
-            let basename_hit = substring_match_smart(&disp[base_start..], tokens[0]).is_some();
-            let len = disp.chars().count() as i64;
-            let score = if basename_hit { 1_000_000 } else { 0 } - (offset as i64) * 1000 - len;
-            scored.push((i, score));
         }
         // Stable sort by descending score keeps ties in scan order.
         scored.sort_by(|a, b| b.1.cmp(&a.1));
         scored.truncate(1000);
         self.matches.extend(scored.into_iter().map(|(i, _)| (i, 0)));
+    }
+
+    /// Full rescore for a *changed query*: recompute matches and snap the
+    /// selection back to the top (fzf behavior — a new query means the old
+    /// selection is meaningless).
+    pub(crate) fn rescore_query_changed(&mut self) {
+        self.rescore();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Incremental match update for a *streaming batch append*: items from
+    /// `from_idx` onward in the active storage are new; score just those and
+    /// push their hits onto `matches`. Never touches `selected`/`scroll`, so
+    /// results filling in under the user can't yank the highlight away.
+    ///
+    /// Files hits land at the end in arrival order (the ranked sort is
+    /// re-applied once when the scan completes — see
+    /// `rescore_files_preserving_selection`); Grep is identity-ordered
+    /// anyway. Fuzzy kinds never stream.
+    pub(crate) fn append_matches(&mut self, from_idx: usize) {
+        const CAP: usize = 1000;
+        match self.kind {
+            PickerKind::Grep => {
+                for i in from_idx..self.grep_items.len() {
+                    if self.matches.len() >= CAP {
+                        break;
+                    }
+                    self.matches.push((i, 0));
+                }
+            }
+            PickerKind::Files => {
+                let tokens: Vec<&str> = self.query.split_whitespace().collect();
+                for i in from_idx..self.file_items.len() {
+                    if self.matches.len() >= CAP {
+                        break;
+                    }
+                    if score_file_display(&self.file_items[i].display, &tokens).is_some() {
+                        self.matches.push((i, 0));
+                    }
+                }
+            }
+            _ => debug_assert!(false, "append_matches is only for streamed kinds"),
+        }
+    }
+
+    /// Ranked re-sort of the Files list after the scan completes, keeping
+    /// the highlight on the same *item* wherever it lands in the new order.
+    /// (During streaming, appended hits sit at the end unranked; this is
+    /// the one-time cleanup pass.)
+    pub(crate) fn rescore_files_preserving_selection(&mut self) {
+        let selected_item = self.matches.get(self.selected).map(|&(i, _)| i);
+        self.rescore_files();
+        if let Some(item_idx) = selected_item {
+            self.selected = self
+                .matches
+                .iter()
+                .position(|&(i, _)| i == item_idx)
+                .unwrap_or(0);
+        }
+        if self.selected >= self.matches.len() {
+            self.selected = self.matches.len().saturating_sub(1);
+        }
     }
 
     /// Re-score items against `self.query`. Caps visible matches at 1000 to
@@ -533,6 +587,29 @@ impl Picker {
         }
         self.scroll = 0;
     }
+}
+
+/// Score one Files row against the AND-token set. `None` = no match.
+/// Empty token set matches everything (scan order, shorter paths first).
+/// Shared by the full rescore and the streaming batch append so both
+/// agree on what matches.
+fn score_file_display(disp: &str, tokens: &[&str]) -> Option<i64> {
+    if tokens.is_empty() {
+        // No query → keep scan order, shorter paths first.
+        return Some(-(disp.chars().count() as i64));
+    }
+    // Every token must match somewhere in the path.
+    if tokens
+        .iter()
+        .any(|t| substring_match_smart(disp, t).is_none())
+    {
+        return None;
+    }
+    let offset = substring_match_smart(disp, tokens[0]).unwrap_or(0);
+    let base_start = disp.rfind('/').map(|p| p + 1).unwrap_or(0);
+    let basename_hit = substring_match_smart(&disp[base_start..], tokens[0]).is_some();
+    let len = disp.chars().count() as i64;
+    Some(if basename_hit { 1_000_000 } else { 0 } - (offset as i64) * 1000 - len)
 }
 
 /// Smart-case substring search. Returns the byte offset of the first match
@@ -704,5 +781,62 @@ mod tests {
         // above the long one.
         let p = files_picker(&["some/long/path/module_helpers.rs", "src/mod.rs"]).with_query("mod");
         assert_eq!(ranked(&p)[0], "src/mod.rs".to_string());
+    }
+
+    fn file_item(d: &str) -> PickerItem {
+        PickerItem {
+            display: d.to_string(),
+            value: PickerValue::File(d.into()),
+            haystack: Utf32String::from(d),
+        }
+    }
+
+    #[test]
+    fn append_matches_never_moves_the_selection() {
+        let mut p = files_picker(&["aaa.rs", "abb.rs", "abc.rs"]).with_query("a");
+        assert_eq!(p.matches.len(), 3);
+        p.selected = 2;
+        // A streamed batch arrives: two more matches, one non-match.
+        let from = p.file_items.len();
+        p.file_items.push(file_item("axe.rs"));
+        p.file_items.push(file_item("zzz.txt"));
+        p.file_items.push(file_item("arm.rs"));
+        p.append_matches(from);
+        assert_eq!(p.matches.len(), 5, "two of three new items match");
+        assert_eq!(
+            p.selected, 2,
+            "streaming append must not yank the selection"
+        );
+    }
+
+    #[test]
+    fn append_matches_respects_the_cap() {
+        let mut p = files_picker(&[]).with_query("");
+        for i in 0..1100 {
+            p.file_items.push(file_item(&format!("f{i}.rs")));
+        }
+        p.append_matches(0);
+        assert_eq!(p.matches.len(), 1000);
+    }
+
+    #[test]
+    fn completion_resort_keeps_highlight_on_the_same_item() {
+        // Simulate streamed arrival order: a weak match lands first, the
+        // basename hit later. The user parks the highlight on the weak match;
+        // the completion re-sort reorders but must follow that item.
+        let mut p = files_picker(&[]).with_query("mod");
+        let from = p.file_items.len();
+        p.file_items
+            .push(file_item("some/long/path/module_helpers.rs"));
+        p.file_items.push(file_item("src/mod.rs"));
+        p.append_matches(from);
+        assert_eq!(p.matches.len(), 2);
+        p.selected = 0; // highlight the weak match (arrival order)
+        let followed = p.file_items[p.matches[p.selected].0].display.clone();
+        p.rescore_files_preserving_selection();
+        // Ranked order now puts src/mod.rs first; the highlight follows the
+        // item it was on, not the row number.
+        assert_eq!(p.file_items[p.matches[0].0].display, "src/mod.rs");
+        assert_eq!(p.file_items[p.matches[p.selected].0].display, followed);
     }
 }

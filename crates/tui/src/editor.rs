@@ -17,7 +17,7 @@ use crate::buffers::BufferSave;
 use crate::completion::CompletionPopup;
 use crate::help;
 use crate::lsp::{LspDocState, PendingRequest};
-use crate::picker::{Picker, PickerItem};
+use crate::picker::{PendingSource, Picker};
 use crate::theme::Theme;
 
 /// What action triggered the current Insert session — determines how `.`
@@ -195,10 +195,18 @@ pub struct Editor {
     /// bail (`WalkState::Quit`) when a newer generation appears, so a fresh
     /// keystroke supersedes the previous walk without waiting.
     pub(crate) grep_gen: Arc<std::sync::atomic::AtomicU64>,
-    /// Receiver for the most recently spawned async grep worker. `None`
-    /// when no grep is in flight. Pumped each tick from the run loop so
-    /// results land on `picker.items` without blocking the UI thread.
-    pub(crate) grep_pending: Option<std::sync::mpsc::Receiver<Vec<PickerItem>>>,
+    /// Cancel token for the streaming file scan, independent of `grep_gen`
+    /// so starting a new grep can't kill an in-flight scan (the scan keeps
+    /// warming the Files list while the user greps).
+    pub(crate) files_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Streaming grep worker channel, if a grep is in flight. Pumped each
+    /// tick from the run loop so batches land on `picker.grep_items`
+    /// without blocking the UI thread.
+    pub(crate) grep_source: Option<PendingSource>,
+    /// Streaming file-scan worker channel, if a scan is in flight. Fills
+    /// `picker.file_items` batch by batch — the picker opens instantly and
+    /// the list grows under it.
+    pub(crate) files_source: Option<PendingSource>,
     /// Centralized color/style palette. See `crate::theme`.
     pub(crate) theme: Theme,
 }
@@ -257,7 +265,9 @@ impl Editor {
             next_bid: 1,
             preview_syntax: HashMap::new(),
             grep_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            grep_pending: None,
+            files_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            grep_source: None,
+            files_source: None,
             theme: Theme::default_dark(),
         }
     }

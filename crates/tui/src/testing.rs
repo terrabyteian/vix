@@ -120,11 +120,20 @@ impl Harness {
         self.editor.picker_kind_label()
     }
 
-    /// Force-run the picker's deferred query refresh right now. Typing only
-    /// marks the query dirty (debounced); call this after typing when the
-    /// test needs to observe fresh `matches`/selection.
+    /// Force-run the picker's deferred query refresh right now and drain
+    /// any in-flight streaming scan/grep to completion. Typing only marks
+    /// the query dirty (debounced) and results stream in from worker
+    /// threads; call this after opening a picker or typing when the test
+    /// needs to observe settled `matches`/selection.
     pub fn flush_picker(&mut self) {
         self.editor.flush_picker_query_for_test();
+    }
+
+    /// Drain in-flight streaming picker sources (file scan / grep) without
+    /// forcing a query refresh. Alias for the common "opened a picker, wait
+    /// for its items" case.
+    pub fn pump_picker(&mut self) {
+        self.editor.pump_picker_sources_blocking_for_test();
     }
 
     pub fn quit_requested(&self) -> bool {
