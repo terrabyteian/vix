@@ -10,7 +10,7 @@ use vix_syntax::{Language, Symbol, SyntaxState};
 
 use crate::picker::{
     grep_as_picker_items, grep_hit_to_picker_item, scan_files_as_picker_items, Picker, PickerItem,
-    PickerKind, PickerLayout, PickerMode, PickerValue, PICKER_REFRESH_DEBOUNCE_MS,
+    PickerKind, PickerLayout, PickerValue, PICKER_REFRESH_DEBOUNCE_MS,
 };
 use crate::Editor;
 
@@ -32,148 +32,205 @@ pub(crate) enum PickerAction {
     BufferReload(usize, bool),
 }
 
-/// Decide what a key event should do to the picker, mutating `p` in place
-/// (selection, query, marks, mode) and returning the follow-up action for
-/// the caller to apply once the `&mut Picker` borrow is released.
-pub(crate) fn picker_key_action(p: &mut Picker, k: KeyEvent) -> PickerAction {
-    // Any keypress consumes the pending-`g` state. The 'g' branch below
-    // re-arms it on demand.
-    let was_pending_g = std::mem::replace(&mut p.pending_g, false);
-    let is_unified = p.kind.spec().supports_marks;
-    match k.code {
-        KeyCode::Esc => {
-            if p.mode == PickerMode::Input {
-                p.mode = PickerMode::Browse;
-                PickerAction::None
-            } else {
-                PickerAction::Close
+/// Buffer-management op requested by a Ctrl/Alt chord, resolved to the
+/// highlighted row's buffer index by `buffer_op_action`.
+enum BufOp {
+    Save,
+    Close(bool),
+    Reload(bool),
+}
+
+/// Resolve a buffer-management chord against the highlighted row. Returns
+/// `PickerAction::None` if the row isn't a `BufferIndex` (shouldn't happen
+/// for the Buffers kind, but keeps this total).
+fn buffer_op_action(p: &Picker, op: BufOp) -> PickerAction {
+    let idx = p.matches.get(p.selected).and_then(|&(item_idx, _)| {
+        if let PickerValue::BufferIndex(idx) = p.active_items()[item_idx].value {
+            Some(idx)
+        } else {
+            None
+        }
+    });
+    match (op, idx) {
+        (BufOp::Save, Some(idx)) => PickerAction::BufferSave(idx),
+        (BufOp::Close(force), Some(idx)) => PickerAction::BufferClose(idx, force),
+        (BufOp::Reload(force), Some(idx)) => PickerAction::BufferReload(idx, force),
+        _ => PickerAction::None,
+    }
+}
+
+/// Enter: open the marked set (if any) or the highlighted row. Shared by
+/// `picker_key_action`'s `KeyCode::Enter` arm.
+fn enter_action(p: &Picker) -> PickerAction {
+    if !p.marked.is_empty() {
+        // Batch-open: collect marked items in match order so the
+        // last-marked-in-list ends up active. Items not currently visible
+        // (filtered out by the live query) are still picked up — we walk
+        // all items, not just the match list.
+        let mut values: Vec<PickerValue> = p
+            .matches
+            .iter()
+            .filter(|(item_idx, _)| p.marked.contains(item_idx))
+            .map(|(item_idx, _)| p.active_items()[*item_idx].value.clone())
+            .collect();
+        for &item_idx in &p.marked {
+            if !p.matches.iter().any(|(i, _)| *i == item_idx) {
+                values.push(p.active_items()[item_idx].value.clone());
             }
         }
+        if values.is_empty() {
+            PickerAction::Close
+        } else {
+            PickerAction::SelectMany(values)
+        }
+    } else if let Some(&(idx, _)) = p.matches.get(p.selected) {
+        PickerAction::Select(p.active_items()[idx].value.clone())
+    } else {
+        PickerAction::Close
+    }
+}
+
+/// PageUp/PageDown jump size: the list-row count from the picker's last
+/// render, or a fixed fallback if it hasn't rendered yet (0).
+fn picker_page_size(p: &Picker) -> usize {
+    if p.last_list_rows == 0 {
+        10
+    } else {
+        p.last_list_rows
+    }
+}
+
+/// Ctrl-W: trim trailing whitespace, then delete back to the previous
+/// whitespace boundary (or the start of the string).
+fn delete_trailing_word(query: &mut String) {
+    while query.ends_with(char::is_whitespace) {
+        query.pop();
+    }
+    while let Some(c) = query.chars().next_back() {
+        if c.is_whitespace() {
+            break;
+        }
+        query.pop();
+    }
+}
+
+/// Decide what a key event should do to the picker, mutating `p` in place
+/// (selection, query, marks) and returning the follow-up action for the
+/// caller to apply once the `&mut Picker` borrow is released.
+///
+/// The picker is always in typing mode (single-mode, fzf-style): any
+/// printable key with no Ctrl/Alt modifier appends to `query`. Navigation,
+/// marks, and picker-management actions all live on Ctrl/Alt chords or
+/// non-printable keys so they never collide with query characters.
+pub(crate) fn picker_key_action(p: &mut Picker, k: KeyEvent) -> PickerAction {
+    let supports_marks = p.kind.spec().supports_marks;
+    let buffer_actions = p.kind.spec().buffer_actions;
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+    match k.code {
+        KeyCode::Esc => return PickerAction::Close,
+        KeyCode::Char('c') if ctrl => return PickerAction::Close,
         KeyCode::Tab => {
-            if is_unified {
+            return if supports_marks {
                 PickerAction::Toggle
             } else {
                 PickerAction::None
-            }
+            };
         }
-        KeyCode::Enter => {
-            if p.mode == PickerMode::Input {
-                p.mode = PickerMode::Browse;
-                PickerAction::None
-            } else if !p.marked.is_empty() {
-                // Batch-open: collect marked items in match order so
-                // the last-marked-in-list ends up active. Items not
-                // currently visible (filtered out by the live query)
-                // are still picked up — we walk all items, not just
-                // the match list.
-                let mut values: Vec<PickerValue> = p
-                    .matches
-                    .iter()
-                    .filter(|(item_idx, _)| p.marked.contains(item_idx))
-                    .map(|(item_idx, _)| p.active_items()[*item_idx].value.clone())
-                    .collect();
-                // Pick up any marked items that the current query
-                // filters out, so a mark made earlier doesn't get
-                // silently dropped.
-                for &item_idx in &p.marked {
-                    if !p.matches.iter().any(|(i, _)| *i == item_idx) {
-                        values.push(p.active_items()[item_idx].value.clone());
-                    }
-                }
-                if values.is_empty() {
-                    PickerAction::Close
-                } else {
-                    PickerAction::SelectMany(values)
-                }
-            } else if let Some(&(idx, _)) = p.matches.get(p.selected) {
-                PickerAction::Select(p.active_items()[idx].value.clone())
-            } else {
-                PickerAction::Close
-            }
+        KeyCode::Enter => return enter_action(p),
+        KeyCode::Down => {
+            p.move_selection(1);
+            return PickerAction::None;
         }
         KeyCode::Up => {
             p.move_selection(-1);
-            PickerAction::None
+            return PickerAction::None;
         }
-        KeyCode::Down => {
-            p.move_selection(1);
-            PickerAction::None
+        KeyCode::Home => {
+            p.selected = 0;
+            return PickerAction::None;
+        }
+        KeyCode::End => {
+            p.selected = p.matches.len().saturating_sub(1);
+            return PickerAction::None;
+        }
+        KeyCode::PageDown => {
+            p.move_selection(picker_page_size(p) as isize);
+            return PickerAction::None;
+        }
+        KeyCode::PageUp => {
+            p.move_selection(-(picker_page_size(p) as isize));
+            return PickerAction::None;
         }
         KeyCode::Backspace => {
-            if p.mode == PickerMode::Browse {
-                PickerAction::None
-            } else if p.query.pop().is_some() {
+            return if p.query.pop().is_some() {
                 PickerAction::Refresh
             } else {
                 PickerAction::None
-            }
-        }
-        KeyCode::Char(c) if k.modifiers.contains(KeyModifiers::CONTROL) => {
-            match c {
-                'n' | 'j' => p.move_selection(1),
-                'p' | 'k' => p.move_selection(-1),
-                _ => {}
-            }
-            PickerAction::None
-        }
-        KeyCode::Char(c) if p.mode == PickerMode::Browse => {
-            let is_buffers = p.kind.spec().buffer_actions;
-            // Buffer-picker management actions resolve to a PickerAction so
-            // we can release the &mut borrow before mutating.
-            let buf_action_idx = if is_buffers && matches!(c, 's' | 'q' | 'Q' | 'r' | 'R') {
-                p.matches.get(p.selected).and_then(|&(item_idx, _)| {
-                    if let PickerValue::BufferIndex(idx) = p.active_items()[item_idx].value {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
             };
-            match c {
-                'j' => p.move_selection(1),
-                'k' => p.move_selection(-1),
-                '/' => p.mode = PickerMode::Input,
-                'g' => {
-                    if was_pending_g {
-                        p.selected = 0;
-                    } else {
-                        p.pending_g = true;
-                    }
-                }
-                'G' => {
-                    p.selected = p.matches.len().saturating_sub(1);
-                }
-                // Multi-select: only meaningful for Files/Grep, since
-                // those are the kinds that can be opened in batch.
-                ' ' if is_unified => {
-                    if let Some(&(item_idx, _)) = p.matches.get(p.selected) {
-                        if !p.marked.insert(item_idx) {
-                            p.marked.remove(&item_idx);
-                        }
-                    }
-                }
-                'c' if is_unified => {
-                    p.marked.clear();
-                }
-                _ => {}
-            }
-            match (c, buf_action_idx) {
-                ('s', Some(idx)) => PickerAction::BufferSave(idx),
-                ('q', Some(idx)) => PickerAction::BufferClose(idx, false),
-                ('Q', Some(idx)) => PickerAction::BufferClose(idx, true),
-                ('r', Some(idx)) => PickerAction::BufferReload(idx, false),
-                ('R', Some(idx)) => PickerAction::BufferReload(idx, true),
-                _ => PickerAction::None,
-            }
         }
-        KeyCode::Char(c) => {
+        // Ctrl-Space: crossterm delivers this as `Char(' ')` + CONTROL (the
+        // test DSL's `<Nul>` token produces the same event). Marks only
+        // apply to kinds that support batch-open.
+        KeyCode::Char(' ') if ctrl => {
+            if supports_marks {
+                if let Some(&(item_idx, _)) = p.matches.get(p.selected) {
+                    if !p.marked.insert(item_idx) {
+                        p.marked.remove(&item_idx);
+                    }
+                }
+                p.move_selection(1);
+            }
+            return PickerAction::None;
+        }
+        KeyCode::Char('c') if alt => {
+            if supports_marks {
+                p.marked.clear();
+            }
+            return PickerAction::None;
+        }
+        KeyCode::Char('u') if ctrl => {
+            p.query.clear();
+            return PickerAction::Refresh;
+        }
+        KeyCode::Char('w') if ctrl => {
+            delete_trailing_word(&mut p.query);
+            return PickerAction::Refresh;
+        }
+        KeyCode::Char('n') | KeyCode::Char('j') if ctrl => {
+            p.move_selection(1);
+            return PickerAction::None;
+        }
+        KeyCode::Char('p') | KeyCode::Char('k') if ctrl => {
+            p.move_selection(-1);
+            return PickerAction::None;
+        }
+        KeyCode::Char('s') if ctrl && buffer_actions => {
+            return buffer_op_action(p, BufOp::Save);
+        }
+        KeyCode::Char('q') if ctrl && buffer_actions => {
+            return buffer_op_action(p, BufOp::Close(false));
+        }
+        KeyCode::Char('q') if alt && buffer_actions => {
+            return buffer_op_action(p, BufOp::Close(true));
+        }
+        KeyCode::Char('r') if ctrl && buffer_actions => {
+            return buffer_op_action(p, BufOp::Reload(false));
+        }
+        KeyCode::Char('r') if alt && buffer_actions => {
+            return buffer_op_action(p, BufOp::Reload(true));
+        }
+        // Plain printable char (no Ctrl/Alt): types into the query. Shift
+        // alone (e.g. capital letters) is fine here — only Ctrl/Alt divert
+        // a char away from the query.
+        KeyCode::Char(c) if !ctrl && !alt => {
             p.query.push(c);
-            PickerAction::Refresh
+            return PickerAction::Refresh;
         }
-        _ => PickerAction::None,
+        _ => {}
     }
+    PickerAction::None
 }
 
 /// Render label for the buffer picker: "[1] path   [+]".
@@ -330,6 +387,18 @@ impl Editor {
     #[doc(hidden)]
     pub fn picker_marked_count_for_test(&self) -> usize {
         self.picker.as_ref().map(|p| p.marked.len()).unwrap_or(0)
+    }
+    #[doc(hidden)]
+    pub fn picker_matches_count_for_test(&self) -> usize {
+        self.picker.as_ref().map(|p| p.matches.len()).unwrap_or(0)
+    }
+    /// Force-run the deferred query refresh right now. Typing only marks the
+    /// query dirty (debounced) so fast keystrokes on a large corpus don't
+    /// pay per-char rescore cost; tests that need to observe `matches` /
+    /// `selected` right after typing should call this first.
+    #[doc(hidden)]
+    pub fn flush_picker_query_for_test(&mut self) {
+        self.flush_picker_query_now();
     }
 
     /// Open the file finder picker rooted at the current working directory.
@@ -894,8 +963,7 @@ mod tests {
                 haystack: Utf32String::from(display),
             })
             .collect();
-        let mut p = Picker::new(PickerKind::Files, items);
-        p.mode = PickerMode::Input;
+        let p = Picker::new(PickerKind::Files, items);
         ed.picker = Some(p);
         ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
         ed.last_picker_scroll = 0;

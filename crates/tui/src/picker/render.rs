@@ -8,12 +8,40 @@ use ratatui::widgets::Paragraph;
 use crate::picker::preview::refresh_preview;
 use crate::picker::{
     fit_picker_row, substring_match_smart, wrap_picker_detail, Picker, PickerItem, PickerKind,
-    PickerLayout, PickerMode, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER,
-    PICKER_DIM,
+    PickerLayout, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER, PICKER_DIM,
 };
 use crate::render::content::scope_style;
 use crate::util::{char_index_in_byte_range, count_chars, pad_or_trunc, take_end};
 use crate::Editor;
+
+/// One-line key hint for the picker footer/header, shared between the
+/// overlay and fullscreen renderers so the wording stays consistent. Gated
+/// by kind: the Files↔Grep toggle only applies to those two kinds; marks
+/// only to `supports_marks` kinds; buffer management only to `Buffers`.
+pub(crate) fn picker_hint_line(
+    kind: &PickerKind,
+    supports_marks: bool,
+    buffer_actions: bool,
+) -> String {
+    let toggle = match kind {
+        PickerKind::Files => Some("<Tab> grep"),
+        PickerKind::Grep => Some("<Tab> files"),
+        _ => None,
+    };
+    let mut s = String::from("\u{2191}\u{2193}/C-j/C-k nav \u{00b7} <CR> open");
+    if let Some(t) = toggle {
+        s.push_str(" \u{00b7} ");
+        s.push_str(t);
+    }
+    if supports_marks {
+        s.push_str(" \u{00b7} C-Spc mark \u{00b7} A-c clear");
+    }
+    if buffer_actions {
+        s.push_str(" \u{00b7} C-s save \u{00b7} C-q close \u{00b7} C-r reload");
+    }
+    s.push_str(" \u{00b7} <Esc> close");
+    s
+}
 
 pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     let Some(p) = ed.picker.as_ref() else {
@@ -50,31 +78,17 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
 
     let kind_label = p.kind.spec().label;
     let prompt = format!(" {} > {}", kind_label, p.query);
-    let toggle_hint = match p.kind {
-        PickerKind::Files => " <Tab>=grep ",
-        PickerKind::Grep => " <Tab>=files ",
-        _ => "",
-    };
     let is_unified = p.kind.spec().supports_marks;
-    let mode_hint = match p.mode {
-        PickerMode::Input => " <Enter>/<Esc>=nav ",
-        PickerMode::Browse => {
-            if is_unified {
-                " j/k /=search <Space>=mark c=clear <Enter>=open "
-            } else {
-                " j/k /=search <Enter>=open <Esc>=close "
-            }
-        }
-    };
+    let is_buffers = p.kind.spec().buffer_actions;
+    let nav_hint = format!(" {} ", picker_hint_line(&p.kind, is_unified, is_buffers));
     let mark_hint = if is_unified && !p.marked.is_empty() {
-        format!(" [{}m] ", p.marked.len())
+        format!("[{}m] ", p.marked.len())
     } else {
         String::new()
     };
     let count = format!(
-        "{}{}{}{}/{} ",
-        toggle_hint,
-        mode_hint,
+        "{}{}{}/{} ",
+        nav_hint,
         mark_hint,
         p.matches.len(),
         p.active_items().len()
@@ -109,6 +123,19 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
         p.selected + 1 - list_rows
     } else {
         0
+    };
+
+    // Grep with a too-short query has no items; show a dim hint at the top
+    // of the list instead of leaving it blank.
+    let grep_hint = if matches!(p.kind, PickerKind::Grep)
+        && p.query.chars().count() < p.kind.spec().min_query_len
+    {
+        Some(format!(
+            "type {}+ characters to search",
+            p.kind.spec().min_query_len
+        ))
+    } else {
+        None
     };
 
     let mut lines: Vec<Line> = Vec::with_capacity(h as usize);
@@ -148,7 +175,18 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
                     Span::styled(" ".repeat(pad), style),
                 ]));
             }
-            None => lines.push(Line::raw("")),
+            None => {
+                if row == 0 {
+                    if let Some(hint) = &grep_hint {
+                        lines.push(Line::from(Span::styled(
+                            format!(" {hint}"),
+                            Style::default().bg(Color::Black).fg(PICKER_DIM),
+                        )));
+                        continue;
+                    }
+                }
+                lines.push(Line::raw(""));
+            }
         }
     }
     if detail_rows > 0 {
@@ -176,6 +214,9 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
     ed.last_picker_rect = Some(overlay);
     ed.last_picker_scroll = scroll;
     ed.last_picker_list_rows = list_rows;
+    if let Some(pm) = ed.picker.as_mut() {
+        pm.last_list_rows = list_rows;
+    }
 }
 
 // --- Fullscreen Files / Grep picker ----------------------------------------
@@ -263,6 +304,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
 
     // --- Row 0: tabs + breadcrumb + counts -----------------------------------
     let is_buffers = p.kind.spec().buffer_actions;
+    let is_unified = p.kind.spec().supports_marks;
     let mode_files = matches!(p.kind, PickerKind::Files);
     let cwd_str = std::env::current_dir()
         .ok()
@@ -340,8 +382,8 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     let arrow_style = Style::default()
         .fg(picker_pulse_accent())
         .add_modifier(Modifier::BOLD);
-    // Caret only blinks while in Input mode; Browse mode shows none.
-    let caret = if matches!(p.mode, PickerMode::Input) {
+    // The picker is always in typing mode, so the caret always blinks.
+    let caret = {
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -351,8 +393,6 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
         } else {
             " "
         }
-    } else {
-        ""
     };
     let prompt_line = Line::from(vec![
         Span::raw(" "),
@@ -406,9 +446,31 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
         _ => &p.items,
     };
 
+    // Grep with a too-short query has no items; show a dim hint at the top
+    // of the list instead of leaving it blank.
+    let grep_hint = if matches!(p.kind, PickerKind::Grep)
+        && p.query.chars().count() < p.kind.spec().min_query_len
+    {
+        Some(format!(
+            "type {}+ characters to search",
+            p.kind.spec().min_query_len
+        ))
+    } else {
+        None
+    };
+
     for row in 0..body_h {
         let match_idx = scroll + row;
         let Some(&(item_idx, _)) = p.matches.get(match_idx) else {
+            if row == 0 {
+                if let Some(hint) = &grep_hint {
+                    list_lines.push(Line::from(Span::styled(
+                        format!("   {hint}"),
+                        Style::default().fg(PICKER_DIM),
+                    )));
+                    continue;
+                }
+            }
             list_lines.push(Line::raw(""));
             continue;
         };
@@ -534,46 +596,14 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     );
 
     // --- Footer hints --------------------------------------------------------
-    let mode_label = match p.mode {
-        PickerMode::Input => " input ",
-        PickerMode::Browse => " browse ",
-    };
-    let footer_body = if is_buffers {
-        match p.mode {
-            PickerMode::Input => "· <CR>/<Esc> nav".to_string(),
-            PickerMode::Browse => {
-                "· j/k nav · / search · <CR> switch · s save · q/Q close · r/R reload · <Esc> close"
-                    .to_string()
-            }
-        }
-    } else {
-        let toggle = match p.kind {
-            PickerKind::Files => "<Tab> grep",
-            _ => "<Tab> files",
-        };
-        let nav = match p.mode {
-            PickerMode::Input => "<CR>/<Esc> nav",
-            PickerMode::Browse => "j/k nav · / search · <Space> mark · <CR> open",
-        };
-        format!("· {toggle} · {nav} · <Esc> close")
-    };
+    let footer_body = format!(" {}", picker_hint_line(&p.kind, is_unified, is_buffers));
     let mark_status = if !p.marked.is_empty() {
         format!(" [{} marked] ", p.marked.len())
     } else {
         String::new()
     };
-    let footer_left = format!("{mode_label}{footer_body}");
-    let footer_pad = w
-        .saturating_sub(count_chars(&footer_left) + count_chars(&mark_status))
-        .max(0);
+    let footer_pad = w.saturating_sub(count_chars(&footer_body) + count_chars(&mark_status));
     let footer_line = Line::from(vec![
-        Span::styled(
-            mode_label.to_string(),
-            Style::default()
-                .bg(picker_pulse_accent())
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
         Span::styled(footer_body, Style::default().fg(PICKER_DIM)),
         Span::raw(" ".repeat(footer_pad)),
         Span::styled(
@@ -599,6 +629,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     ));
     ed.last_picker_scroll = scroll;
     ed.last_picker_list_rows = body_h;
+    p.last_list_rows = body_h;
 }
 
 /// Draw the preview pane for the highlighted Files/Grep row. Caller positions
@@ -804,8 +835,7 @@ mod tests {
                 haystack: Utf32String::from(*p),
             })
             .collect();
-        let mut picker = Picker::new(PickerKind::Files, items);
-        picker.mode = PickerMode::Input;
+        let picker = Picker::new(PickerKind::Files, items);
         ed.picker = Some(picker);
 
         let backend = TestBackend::new(100, 30);
@@ -833,8 +863,7 @@ mod tests {
                 haystack: Utf32String::from(*p),
             })
             .collect();
-        let mut picker = Picker::new(PickerKind::Files, items);
-        picker.mode = PickerMode::Input;
+        let picker = Picker::new(PickerKind::Files, items);
         ed.picker = Some(picker);
 
         let backend = TestBackend::new(40, 14);

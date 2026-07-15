@@ -73,19 +73,27 @@ Inside the editor, `:help` opens the in-binary help index; `:help <topic>` jumps
 | `:Symbols` | Tree-sitter outline of the current buffer |
 | `:jumps` | Jump list |
 
-Inside a picker:
+Inside a picker — it's single-mode, fzf-style: you're always typing, and
+everything else lives on a non-printable key or a Ctrl/Alt chord so it never
+collides with a query character.
 
 | Key | Action |
 |---|---|
-| Type | Filter in input mode |
-| `↑` / `↓` / mouse scroll | Move selection |
-| `<Enter>` | Switch from input mode to browse mode |
-| `j` / `k` | Move selection in browse mode |
-| `<Enter>` in browse mode | Open the selected entry |
+| Type | Filter the query (printable keys, no Ctrl/Alt) |
+| `<Backspace>` | Delete the last query character |
+| `<C-u>` | Clear the query |
+| `<C-w>` | Delete the trailing word from the query |
+| `↑` / `↓` / `<C-j>` / `<C-k>` / mouse scroll | Move selection |
+| `<PageUp>` / `<PageDown>` | Move selection by a page |
+| `<Home>` / `<End>` | Jump to the first / last match |
+| `<Enter>` | Open the selected entry (or every marked entry, if any) |
+| `<Tab>` | Toggle Files ⇆ Grep, preserving the query |
+| `<C-Space>` | Mark the current row for batch-open, then advance |
+| `<A-c>` | Clear all marks |
+| `<C-s>` / `<C-q>` / `<A-q>` / `<C-r>` / `<A-r>` | Buffers only: save / close / force-close / reload / force-reload |
 | First click on a row | Focus the row |
 | Second click on the focused row | Open it |
-| `<Esc>` in browse mode | Return to input mode |
-| `<Esc>` in input mode | First clears the query, then closes |
+| `<Esc>` / `<C-c>` | Close the picker immediately |
 
 ## Buffers
 

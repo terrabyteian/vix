@@ -1,7 +1,10 @@
 //! `<Space>` leader opens the unified Files/Grep picker. `<Tab>` toggles
-//! submode preserving the query. The picker opens in Browse (nav) mode;
-//! pressing `/` enters Input mode where typing filters results. `<Esc>` from
-//! Input goes back to Browse; a second `<Esc>` closes the picker.
+//! submode preserving the query. The picker is single-mode, fzf-style: it is
+//! always typing. Printable keys (no Ctrl/Alt) filter the query; navigation,
+//! marks, and picker-management all live on Ctrl/Alt chords or non-printable
+//! keys (arrows, Home/End, PageUp/PageDown) so they never collide with query
+//! characters. `<Enter>` opens the highlighted row (or every marked row, if
+//! any are marked); `<Esc>`/`<C-c>` closes immediately regardless of query.
 
 #![allow(non_snake_case)]
 
@@ -78,7 +81,7 @@ fn esc_clears_pending_leader() {
 fn tab_toggles_files_to_grep_preserving_query() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    h.keys("<Space>f/he");
+    h.keys("<Space>fhe");
     assert_eq!(h.picker_kind(), Some("files"));
     assert_eq!(h.picker_query(), Some("he"));
     h.keys("<Tab>");
@@ -90,38 +93,36 @@ fn tab_toggles_files_to_grep_preserving_query() {
 fn tab_toggles_grep_back_to_files_preserving_query() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    h.keys("<Space>g/hello<Tab>");
+    h.keys("<Space>ghello<Tab>");
     assert_eq!(h.picker_kind(), Some("files"));
     assert_eq!(h.picker_query(), Some("hello"));
 }
 
 #[test]
-fn esc_from_input_returns_to_browse_preserving_query() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
-    // Enter Input via `/`, type, then Esc — query is preserved, picker stays
-    // open in Browse mode. A second Esc closes.
-    h.keys("<Space>f/abc");
-    assert_eq!(h.picker_query(), Some("abc"));
-    h.keys("<Esc>");
-    assert!(h.picker_open());
-    assert_eq!(h.picker_query(), Some("abc"));
-    h.keys("<Esc>");
-    assert!(!h.picker_open());
-}
-
-#[test]
-fn esc_in_browse_closes_immediately() {
+fn esc_closes_immediately() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
-    assert_eq!(h.picker_query(), Some(""));
+    h.keys("abc");
+    assert_eq!(h.picker_query(), Some("abc"));
+    // A single Esc closes the picker outright, regardless of query — there
+    // is no intermediate "clear query first" step.
     h.keys("<Esc>");
     assert!(!h.picker_open());
 }
 
 #[test]
-fn enter_in_browse_opens_selected_row() {
+fn ctrl_c_closes_immediately() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>f");
+    assert!(h.picker_open());
+    h.keys("<C-c>");
+    assert!(!h.picker_open());
+}
+
+#[test]
+fn enter_opens_selected_row() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
@@ -131,35 +132,70 @@ fn enter_in_browse_opens_selected_row() {
 }
 
 #[test]
-fn jk_moves_selection_in_picker_browse_mode() {
+fn ctrl_jk_and_arrows_move_selection() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
     let before = h.editor.picker_selected_for_test();
-    h.keys("j");
+    h.keys("<C-j>");
     assert_eq!(h.editor.picker_selected_for_test(), before + 1);
-    h.keys("k");
+    h.keys("<C-k>");
+    assert_eq!(h.editor.picker_selected_for_test(), before);
+    h.keys("<Down>");
+    assert_eq!(h.editor.picker_selected_for_test(), before + 1);
+    h.keys("<Up>");
     assert_eq!(h.editor.picker_selected_for_test(), before);
 }
 
 #[test]
-fn jk_types_in_picker_input_mode_after_slash() {
+fn typing_filters_matches() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    // `/` enters Input; thereafter j and k are query characters.
-    h.keys("<Space>f/jk");
-    assert_eq!(h.picker_query(), Some("jk"));
+    h.keys("<Space>f");
+    let before = h.editor.picker_matches_count_for_test();
+    assert_eq!(before, 3, "alpha.txt, beta.txt, gamma.rs");
+    h.keys("gamma");
+    h.flush_picker();
+    assert_eq!(h.picker_query(), Some("gamma"));
+    assert_eq!(h.editor.picker_matches_count_for_test(), 1);
 }
 
 #[test]
-fn enter_from_input_returns_to_browse_preserving_query() {
+fn ctrl_u_clears_query() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    // Enter Input, type, press Enter — back to Browse with query intact.
-    // A second `/p` reopens Input and appends `p`.
-    h.keys("<Space>f/al<CR>/p");
-    assert!(h.picker_open());
-    assert_eq!(h.picker_query(), Some("alp"));
+    h.keys("<Space>fgamma");
+    assert_eq!(h.picker_query(), Some("gamma"));
+    h.keys("<C-u>");
+    assert_eq!(h.picker_query(), Some(""));
+    h.flush_picker();
+    assert_eq!(h.editor.picker_matches_count_for_test(), 3);
+}
+
+#[test]
+fn ctrl_w_deletes_trailing_word() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>f");
+    h.keys("foo bar");
+    assert_eq!(h.picker_query(), Some("foo bar"));
+    h.keys("<C-w>");
+    assert_eq!(h.picker_query(), Some("foo "));
+    h.keys("<C-w>");
+    assert_eq!(h.picker_query(), Some(""));
+}
+
+#[test]
+fn pagedown_moves_selection_forward_and_pageup_back() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>f");
+    assert_eq!(h.editor.picker_selected_for_test(), 0);
+    h.keys("<PageDown>");
+    let after = h.editor.picker_selected_for_test();
+    assert!(after > 0, "PageDown should move selection down");
+    h.keys("<PageUp>");
+    assert_eq!(h.editor.picker_selected_for_test(), 0);
 }
 
 #[test]
@@ -272,72 +308,70 @@ fn ex_grep_command_prefills_query() {
 }
 
 #[test]
-fn shift_g_jumps_to_last_match_in_browse_mode() {
+fn grep_short_query_shows_hint() {
+    // Grep requires 2+ chars before it populates items; below that, the
+    // match list is empty (the hint itself is render-only, so we just
+    // assert there's no crash and no matches).
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>g");
+    assert!(h.picker_open());
+    assert_eq!(h.picker_query(), Some(""));
+    assert_eq!(h.editor.picker_matches_count_for_test(), 0);
+    h.keys("h");
+    h.flush_picker();
+    assert_eq!(h.picker_query(), Some("h"));
+    assert_eq!(h.editor.picker_matches_count_for_test(), 0);
+}
+
+#[test]
+fn end_jumps_to_last_match() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
     assert_eq!(h.editor.picker_selected_for_test(), 0);
-    h.keys("G");
+    h.keys("<End>");
     let last = h.editor.picker_selected_for_test();
-    assert!(last > 0, "G should advance past the first row");
-    // Pressing G again is idempotent.
-    h.keys("G");
+    assert!(last > 0, "End should jump past the first row");
+    // Pressing End again is idempotent.
+    h.keys("<End>");
     assert_eq!(h.editor.picker_selected_for_test(), last);
 }
 
 #[test]
-fn gg_jumps_to_first_match_in_browse_mode() {
+fn home_jumps_to_first_match() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    h.keys("<Space>fG");
+    h.keys("<Space>f<End>");
     assert!(h.editor.picker_selected_for_test() > 0);
-    h.keys("gg");
+    h.keys("<Home>");
     assert_eq!(h.editor.picker_selected_for_test(), 0);
 }
 
 #[test]
-fn single_g_waits_for_second_g() {
+fn ctrl_space_marks_and_advances_alt_c_clears() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    h.keys("<Space>fjj");
-    let mid = h.editor.picker_selected_for_test();
-    assert!(mid > 0);
-    // One `g` alone should not move the selection.
-    h.keys("g");
-    assert_eq!(h.editor.picker_selected_for_test(), mid);
-    // A non-`g` key cancels the pending state.
-    h.keys("k");
-    assert_eq!(h.editor.picker_selected_for_test(), mid - 1);
-    // Now another single `g` again should still wait, not jump.
-    h.keys("g");
-    assert_eq!(h.editor.picker_selected_for_test(), mid - 1);
-}
-
-#[test]
-fn g_and_shift_g_type_into_input_mode_query() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
-    // `/` enters Input mode, so subsequent g/G become query characters.
-    h.keys("<Space>f/gG");
-    assert_eq!(h.picker_query(), Some("gG"));
-}
-
-#[test]
-fn space_marks_in_browse_mode_and_c_clears() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
-    // Picker opens in Browse mode; mark first row, move down, mark second row.
     h.keys("<Space>f");
     assert_eq!(h.editor.picker_marked_count_for_test(), 0);
-    h.keys("<Space>");
+    assert_eq!(h.editor.picker_selected_for_test(), 0);
+    // `<Nul>` (Ctrl-Space) marks the current row and auto-advances.
+    h.keys("<Nul>");
     assert_eq!(h.editor.picker_marked_count_for_test(), 1);
-    h.keys("j<Space>");
+    assert_eq!(
+        h.editor.picker_selected_for_test(),
+        1,
+        "mark should auto-advance selection"
+    );
+    h.keys("<Nul>");
     assert_eq!(h.editor.picker_marked_count_for_test(), 2);
-    // Re-pressing space on the same row toggles it off.
-    h.keys("<Space>");
+    assert_eq!(h.editor.picker_selected_for_test(), 2);
+    // Move back and re-mark the same row — toggles it off (still advances).
+    h.keys("<Up>");
+    h.keys("<Nul>");
     assert_eq!(h.editor.picker_marked_count_for_test(), 1);
-    // `c` clears all marks.
-    h.keys("c");
+    // `<A-c>` clears all marks.
+    h.keys("<A-c>");
     assert_eq!(h.editor.picker_marked_count_for_test(), 0);
 }
 
@@ -346,8 +380,9 @@ fn enter_with_marked_opens_all_marked_files() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
-    // Mark the first three rows.
-    h.keys("<Space>j<Space>j<Space>");
+    // Each `<Nul>` marks the current row and auto-advances, so three in a
+    // row marks rows 0, 1, 2.
+    h.keys("<Nul><Nul><Nul>");
     assert_eq!(h.editor.picker_marked_count_for_test(), 3);
     h.keys("<CR>");
     assert!(!h.picker_open(), "picker should close on batch open");
@@ -360,7 +395,7 @@ fn enter_with_marked_opens_all_marked_files() {
 fn tab_clears_marks_when_swapping_files_and_grep() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    h.keys("<Space>f<Space>j<Space>");
+    h.keys("<Space>f<Nul><Nul>");
     assert_eq!(h.editor.picker_marked_count_for_test(), 2);
     // Tab switches to grep; marks would point at the wrong items, so they
     // must be dropped.
@@ -369,12 +404,13 @@ fn tab_clears_marks_when_swapping_files_and_grep() {
 }
 
 #[test]
-fn space_in_input_mode_stays_a_query_character() {
+fn space_types_into_query() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
-    // After `/` we are in Input mode, so space appends to query rather than
-    // marking a row.
-    h.keys("<Space>f/a <Space>");
+    // Plain space has no modifier, so it's a printable char like any other:
+    // it appends to the query rather than marking a row.
+    h.keys("<Space>f");
+    h.keys("a  ");
     assert_eq!(h.picker_query(), Some("a  "));
     assert_eq!(h.editor.picker_marked_count_for_test(), 0);
 }

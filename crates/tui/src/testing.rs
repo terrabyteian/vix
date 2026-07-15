@@ -120,6 +120,13 @@ impl Harness {
         self.editor.picker_kind_label()
     }
 
+    /// Force-run the picker's deferred query refresh right now. Typing only
+    /// marks the query dirty (debounced); call this after typing when the
+    /// test needs to observe fresh `matches`/selection.
+    pub fn flush_picker(&mut self) {
+        self.editor.flush_picker_query_for_test();
+    }
+
     pub fn quit_requested(&self) -> bool {
         self.editor.quit
     }
@@ -253,6 +260,8 @@ fn decode_token(tok: &str) -> KeyEvent {
         "right" => return key(KeyCode::Right),
         "pageup" | "pgup" => return key(KeyCode::PageUp),
         "pagedown" | "pgdn" => return key(KeyCode::PageDown),
+        "home" => return key(KeyCode::Home),
+        "end" => return key(KeyCode::End),
         "lt" => return key(KeyCode::Char('<')),
         "gt" => return key(KeyCode::Char('>')),
         "nul" => return key_mod(KeyCode::Char(' '), KeyModifiers::CONTROL),
@@ -292,6 +301,8 @@ fn decode_token(tok: &str) -> KeyEvent {
         "right" => KeyCode::Right,
         "pageup" | "pgup" => KeyCode::PageUp,
         "pagedown" | "pgdn" => KeyCode::PageDown,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
         other => panic!("unknown key token: <{other}>"),
     };
     key_mod(code, mods)

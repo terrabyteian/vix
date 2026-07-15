@@ -18,7 +18,6 @@ pub(crate) mod render;
 /// rendering while it's alive; dismissal returns control to Normal mode.
 pub(crate) struct Picker {
     pub(crate) kind: PickerKind,
-    pub(crate) mode: PickerMode,
     pub(crate) query: String,
     /// File-scan items. Only populated/consulted when `kind` is `Files`;
     /// doubles as the `<Tab>` Files↔Grep toggle cache so flipping back to
@@ -36,10 +35,13 @@ pub(crate) struct Picker {
     pub(crate) selected: usize,
     /// Vertical scroll offset within the match list.
     pub(crate) scroll: usize,
-    /// Set after a single `g` in Browse mode; the next `g` jumps to top.
-    /// Cleared by any other key.
-    pub(crate) pending_g: bool,
-    /// Item indices marked by `<Space>` in Browse mode for batch opening.
+    /// Number of list rows the picker was last rendered with. Updated by
+    /// both renderers (overlay + fullscreen) on every render; used to size
+    /// PageUp/PageDown jumps to whatever's actually on screen. Defaults to
+    /// 0 before the first render — callers should treat 0 as "unknown" and
+    /// fall back to a fixed page size.
+    pub(crate) last_list_rows: usize,
+    /// Item indices marked by `<C-Space>` for batch opening.
     /// Item indices (not match indices) so marks survive query rescoring;
     /// cleared whenever the `items` vector is replaced (Tab toggle, grep
     /// refresh). Only Files/Grep pickers populate this.
@@ -89,12 +91,6 @@ pub(crate) struct PreviewCache {
     /// True if the file was too large or unreadable; `lines` then carries a
     /// short placeholder. We still cache so repeated renders don't retry I/O.
     pub(crate) placeholder: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PickerMode {
-    Input,
-    Browse,
 }
 
 #[derive(Clone, Debug)]
@@ -368,15 +364,15 @@ pub(crate) fn wrap_picker_detail(text: &str, width: usize, rows: usize) -> Vec<S
 }
 
 impl Picker {
-    /// Build a picker over `items` with every field at its default (Browse
-    /// mode, empty query, no marks/preview/scroll), then rescore so
-    /// `matches` reflects the (empty) query immediately. `items` is routed
-    /// to the kind-appropriate storage: `file_items` for Files, `grep_items`
-    /// for Grep, `items` for everything else — see `active_items`.
+    /// Build a picker over `items` with every field at its default (empty
+    /// query, no marks/preview/scroll), then rescore so `matches` reflects
+    /// the (empty) query immediately. `items` is routed to the
+    /// kind-appropriate storage: `file_items` for Files, `grep_items` for
+    /// Grep, `items` for everything else — see `active_items`. The picker
+    /// is always in typing mode: every printable key appends to `query`.
     pub(crate) fn new(kind: PickerKind, items: Vec<PickerItem>) -> Self {
         let mut p = Self {
             kind,
-            mode: PickerMode::Browse,
             query: String::new(),
             file_items: Vec::new(),
             grep_items: Vec::new(),
@@ -384,7 +380,7 @@ impl Picker {
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
-            pending_g: false,
+            last_list_rows: 0,
             marked: std::collections::HashSet::new(),
             preview: None,
             preview_last_seen_selected: None,
