@@ -1,8 +1,8 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use std::time::Instant;
 
-use crate::picker::is_fullscreen_picker_kind;
 use crate::picker::render::{render_picker, render_picker_fullscreen};
+use crate::picker::PickerLayout;
 use crate::Editor;
 
 pub(crate) mod content;
@@ -21,7 +21,7 @@ pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let fullscreen_picker = ed
         .picker
         .as_ref()
-        .map(|p| is_fullscreen_picker_kind(&p.kind))
+        .map(|p| matches!(p.kind.spec().layout, PickerLayout::Full))
         .unwrap_or(false);
     if fullscreen_picker {
         // LSP sync still useful — keeps server state consistent across the

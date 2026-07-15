@@ -9,9 +9,8 @@ use vix_picker::match_indices;
 
 use crate::picker::preview::refresh_preview;
 use crate::picker::{
-    fit_picker_row, is_fullscreen_picker_kind, substring_match_smart, wrap_picker_detail, Picker,
-    PickerKind, PickerMode, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER,
-    PICKER_DIM,
+    fit_picker_row, substring_match_smart, wrap_picker_detail, Picker, PickerKind, PickerLayout,
+    PickerMode, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER, PICKER_DIM,
 };
 use crate::render::content::scope_style;
 use crate::util::{char_index_in_byte_range, count_chars, pad_or_trunc, take_end};
@@ -23,7 +22,7 @@ pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
         ed.last_picker_list_rows = 0;
         return;
     };
-    if is_fullscreen_picker_kind(&p.kind) {
+    if matches!(p.kind.spec().layout, PickerLayout::Full) {
         render_picker_fullscreen(f, area, ed);
     } else {
         render_picker_overlay(f, area, ed);
@@ -50,21 +49,14 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
     let blank: Vec<Line> = (0..h).map(|_| Line::raw(" ".repeat(w as usize))).collect();
     f.render_widget(Paragraph::new(blank).style(bg), overlay);
 
-    let kind_label = match p.kind {
-        PickerKind::Files => "files",
-        PickerKind::Grep => "grep",
-        PickerKind::Symbols => "symbols",
-        PickerKind::Buffers => "buffers",
-        PickerKind::CodeActions => "code actions",
-        PickerKind::Jumps => "jumps",
-    };
+    let kind_label = p.kind.spec().label;
     let prompt = format!(" {} > {}", kind_label, p.query);
     let toggle_hint = match p.kind {
         PickerKind::Files => " <Tab>=grep ",
         PickerKind::Grep => " <Tab>=files ",
         _ => "",
     };
-    let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
+    let is_unified = p.kind.spec().supports_marks;
     let mode_hint = match p.mode {
         PickerMode::Input => " <Enter>/<Esc>=nav ",
         PickerMode::Browse => {
@@ -267,7 +259,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     f.render_widget(Paragraph::new(blank), area);
 
     // --- Row 0: tabs + breadcrumb + counts -----------------------------------
-    let is_buffers = matches!(p.kind, PickerKind::Buffers);
+    let is_buffers = p.kind.spec().buffer_actions;
     let mode_files = matches!(p.kind, PickerKind::Files);
     let cwd_str = std::env::current_dir()
         .ok()
@@ -777,7 +769,6 @@ mod tests {
     use crate::picker::PickerItem;
     use crate::render::render;
     use ratatui::backend::TestBackend;
-    use std::time::Instant;
     use vix_core::Buffer;
     use vix_picker::Utf32String;
 
@@ -796,23 +787,8 @@ mod tests {
                 haystack: Utf32String::from(*p),
             })
             .collect();
-        let mut picker = Picker {
-            kind: PickerKind::Files,
-            mode: PickerMode::Input,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        };
-        picker.rescore();
+        let mut picker = Picker::new(PickerKind::Files, items);
+        picker.mode = PickerMode::Input;
         ed.picker = Some(picker);
 
         let backend = TestBackend::new(100, 30);
@@ -840,23 +816,8 @@ mod tests {
                 haystack: Utf32String::from(*p),
             })
             .collect();
-        let mut picker = Picker {
-            kind: PickerKind::Files,
-            mode: PickerMode::Input,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        };
-        picker.rescore();
+        let mut picker = Picker::new(PickerKind::Files, items);
+        picker.mode = PickerMode::Input;
         ed.picker = Some(picker);
 
         let backend = TestBackend::new(40, 14);

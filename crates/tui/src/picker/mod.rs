@@ -98,13 +98,116 @@ pub(crate) enum PickerKind {
     Jumps,
 }
 
-/// Picker kinds that take over the full screen (with side preview pane)
-/// rather than rendering as a centered overlay.
-pub(crate) fn is_fullscreen_picker_kind(kind: &PickerKind) -> bool {
-    matches!(
-        kind,
-        PickerKind::Files | PickerKind::Grep | PickerKind::Buffers
-    )
+/// Whether a picker kind renders as a fullscreen split (list + preview) or
+/// a centered overlay.
+pub(crate) enum PickerLayout {
+    Full,
+    Compact,
+}
+
+/// How a picker kind's `query` narrows `items` into `matches`. See
+/// `Picker::rescore` for the actual per-kind logic; this just documents
+/// which strategy a kind uses.
+pub(crate) enum MatchMode {
+    /// Smart-case substring match (Files).
+    Substring,
+    /// Nucleo fuzzy match (Symbols, Buffers, CodeActions, Jumps).
+    Fuzzy,
+    /// No re-ranking; items are already in the desired order (Grep, whose
+    /// items are exact regex hits from an external walk).
+    Identity,
+}
+
+/// Per-`PickerKind` configuration: display label, layout, matching
+/// strategy, and which optional features (marks, preview, buffer actions)
+/// the kind supports. Centralizes the per-kind branching that used to be
+/// scattered across free functions and inline `match`es.
+pub(crate) struct KindSpec {
+    pub label: &'static str,
+    pub layout: PickerLayout,
+    /// Not yet consumed by `rescore` — it still switches on `PickerKind`
+    /// directly (see its doc comment). Kept here so the per-kind matching
+    /// strategy is documented in one place ahead of a later pass that
+    /// dispatches on it.
+    #[allow(dead_code)]
+    pub match_mode: MatchMode,
+    /// Whether `<Space>` multi-select / marks apply to this kind.
+    pub supports_marks: bool,
+    /// Whether the fullscreen split shows a preview pane for this kind.
+    pub has_preview: bool,
+    /// Whether `s`/`q`/`Q`/`r`/`R` buffer-management keys apply.
+    pub buffer_actions: bool,
+    /// Minimum query length before the picker's items are populated (Grep
+    /// requires 2+ chars to avoid a whole-repo regex walk on an empty or
+    /// 1-char pattern).
+    pub min_query_len: usize,
+}
+
+impl PickerKind {
+    pub(crate) fn spec(&self) -> &'static KindSpec {
+        const FILES: KindSpec = KindSpec {
+            label: "files",
+            layout: PickerLayout::Full,
+            match_mode: MatchMode::Substring,
+            supports_marks: true,
+            has_preview: true,
+            buffer_actions: false,
+            min_query_len: 0,
+        };
+        const GREP: KindSpec = KindSpec {
+            label: "grep",
+            layout: PickerLayout::Full,
+            match_mode: MatchMode::Identity,
+            supports_marks: true,
+            has_preview: true,
+            buffer_actions: false,
+            min_query_len: 2,
+        };
+        const BUFFERS: KindSpec = KindSpec {
+            label: "buffers",
+            layout: PickerLayout::Full,
+            match_mode: MatchMode::Fuzzy,
+            supports_marks: false,
+            has_preview: true,
+            buffer_actions: true,
+            min_query_len: 0,
+        };
+        const SYMBOLS: KindSpec = KindSpec {
+            label: "symbols",
+            layout: PickerLayout::Compact,
+            match_mode: MatchMode::Fuzzy,
+            supports_marks: false,
+            has_preview: false,
+            buffer_actions: false,
+            min_query_len: 0,
+        };
+        const CODE_ACTIONS: KindSpec = KindSpec {
+            label: "code actions",
+            layout: PickerLayout::Compact,
+            match_mode: MatchMode::Fuzzy,
+            supports_marks: false,
+            has_preview: false,
+            buffer_actions: false,
+            min_query_len: 0,
+        };
+        const JUMPS: KindSpec = KindSpec {
+            label: "jumps",
+            layout: PickerLayout::Compact,
+            match_mode: MatchMode::Fuzzy,
+            supports_marks: false,
+            has_preview: false,
+            buffer_actions: false,
+            min_query_len: 0,
+        };
+        match self {
+            PickerKind::Files => &FILES,
+            PickerKind::Grep => &GREP,
+            PickerKind::Buffers => &BUFFERS,
+            PickerKind::Symbols => &SYMBOLS,
+            PickerKind::CodeActions => &CODE_ACTIONS,
+            PickerKind::Jumps => &JUMPS,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -256,6 +359,39 @@ pub(crate) fn wrap_picker_detail(text: &str, width: usize, rows: usize) -> Vec<S
 }
 
 impl Picker {
+    /// Build a picker over `items` with every field at its default (Browse
+    /// mode, empty query, no marks/preview/scroll), then rescore so
+    /// `matches` reflects the (empty) query immediately.
+    pub(crate) fn new(kind: PickerKind, items: Vec<PickerItem>) -> Self {
+        let mut p = Self {
+            kind,
+            mode: PickerMode::Browse,
+            query: String::new(),
+            items,
+            matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            cached_files: None,
+            pending_g: false,
+            marked: std::collections::HashSet::new(),
+            preview: None,
+            preview_last_seen_selected: None,
+            preview_changed_at: Instant::now(),
+            query_dirty_at: None,
+        };
+        p.rescore();
+        p
+    }
+
+    /// Set the initial query and re-rescore. Builder-style for use at
+    /// picker-construction time (e.g. the grep picker opened with a
+    /// pre-filled pattern).
+    pub(crate) fn with_query(mut self, q: &str) -> Self {
+        self.query = q.to_string();
+        self.rescore();
+        self
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if delta < 0 {
             self.selected = self.selected.saturating_sub(delta.unsigned_abs());
@@ -395,14 +531,7 @@ impl Editor {
         self.picker.as_ref().map(|p| p.query.as_str())
     }
     pub fn picker_kind_label(&self) -> Option<&'static str> {
-        self.picker.as_ref().map(|p| match p.kind {
-            PickerKind::Files => "files",
-            PickerKind::Grep => "grep",
-            PickerKind::Symbols => "symbols",
-            PickerKind::Buffers => "buffers",
-            PickerKind::CodeActions => "code_actions",
-            PickerKind::Jumps => "jumps",
-        })
+        self.picker.as_ref().map(|p| p.kind.spec().label)
     }
 }
 

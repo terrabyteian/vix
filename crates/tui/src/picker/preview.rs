@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use vix_core::Buffer;
 use vix_syntax::{HlSpan, Language, SyntaxState};
 
-use crate::picker::{is_fullscreen_picker_kind, PickerKind, PickerValue, PreviewCache};
+use crate::picker::{PickerKind, PickerValue, PreviewCache};
 use crate::picker::{PREVIEW_DEBOUNCE_MS, PREVIEW_MAX_BYTES};
 use crate::Editor;
 
@@ -127,7 +127,7 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
         Some(k) => k,
         None => return,
     };
-    if !is_fullscreen_picker_kind(&kind) {
+    if !kind.spec().has_preview {
         if let Some(p) = ed.picker.as_mut() {
             p.preview = None;
         }

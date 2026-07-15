@@ -9,9 +9,8 @@ use vix_picker::{grep_cancellable, Utf32String};
 use vix_syntax::{Language, Symbol, SyntaxState};
 
 use crate::picker::{
-    grep_as_picker_items, grep_hit_to_picker_item, is_fullscreen_picker_kind,
-    scan_files_as_picker_items, Picker, PickerItem, PickerKind, PickerMode, PickerValue,
-    PICKER_REFRESH_DEBOUNCE_MS,
+    grep_as_picker_items, grep_hit_to_picker_item, scan_files_as_picker_items, Picker, PickerItem,
+    PickerKind, PickerLayout, PickerMode, PickerValue, PICKER_REFRESH_DEBOUNCE_MS,
 };
 use crate::Editor;
 
@@ -113,7 +112,7 @@ impl Editor {
         let gen_arc = Arc::clone(&self.grep_gen);
         let (tx, rx) = std::sync::mpsc::channel::<Vec<PickerItem>>();
         std::thread::spawn(move || {
-            let items: Vec<PickerItem> = if query.len() >= 2 {
+            let items: Vec<PickerItem> = if query.len() >= PickerKind::Grep.spec().min_query_len {
                 grep_cancellable(&cwd, &query, &gen_arc, target_gen)
                     .unwrap_or_default()
                     .into_iter()
@@ -185,7 +184,7 @@ impl Editor {
         let items = match initial {
             PickerKind::Files => cached_files.clone(),
             PickerKind::Grep => {
-                if initial_query.len() >= 2 {
+                if initial_query.len() >= PickerKind::Grep.spec().min_query_len {
                     grep_as_picker_items(&cwd, initial_query)
                 } else {
                     Vec::new()
@@ -193,23 +192,8 @@ impl Editor {
             }
             _ => return,
         };
-        let mut p = Picker {
-            kind: initial,
-            mode: PickerMode::Browse,
-            query: initial_query.to_string(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: Some(cached_files),
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        };
-        p.rescore();
+        let mut p = Picker::new(initial, items).with_query(initial_query);
+        p.cached_files = Some(cached_files);
         self.picker = Some(p);
     }
 
@@ -231,7 +215,7 @@ impl Editor {
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let new_items = match new_kind {
             PickerKind::Grep => {
-                if query.len() >= 2 {
+                if query.len() >= PickerKind::Grep.spec().min_query_len {
                     grep_as_picker_items(&cwd, &query)
                 } else {
                     Vec::new()
@@ -267,7 +251,7 @@ impl Editor {
             _ => return,
         };
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let new_items = if query.len() >= 2 {
+        let new_items = if query.len() >= PickerKind::Grep.spec().min_query_len {
             grep_as_picker_items(&cwd, &query)
         } else {
             Vec::new()
@@ -312,24 +296,7 @@ impl Editor {
                 }
             })
             .collect();
-        let mut p = Picker {
-            kind: PickerKind::Symbols,
-            mode: PickerMode::Browse,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        };
-        p.rescore();
-        self.picker = Some(p);
+        self.picker = Some(Picker::new(PickerKind::Symbols, items));
     }
 
     /// Open the grep picker, optionally pre-filled with `pattern`. Pattern
@@ -371,7 +338,7 @@ impl Editor {
             // Any keypress consumes the pending-`g` state. The 'g' branch
             // below re-arms it on demand.
             let was_pending_g = std::mem::replace(&mut p.pending_g, false);
-            let is_unified = matches!(p.kind, PickerKind::Files | PickerKind::Grep);
+            let is_unified = p.kind.spec().supports_marks;
             match k.code {
                 KeyCode::Esc => {
                     if p.mode == PickerMode::Input {
@@ -449,7 +416,7 @@ impl Editor {
                     Post::None
                 }
                 KeyCode::Char(c) if p.mode == PickerMode::Browse => {
-                    let is_buffers = matches!(p.kind, PickerKind::Buffers);
+                    let is_buffers = p.kind.spec().buffer_actions;
                     // Buffer-picker management actions resolve to a Post so
                     // we can release the &mut borrow before mutating.
                     let buf_action_idx = if is_buffers && matches!(c, 's' | 'q' | 'Q' | 'r' | 'R') {
@@ -617,7 +584,7 @@ impl Editor {
                     // For overlay pickers, row 0 of `rect` is the header; for
                     // the fullscreen picker, `rect` already starts at the
                     // first list row. Distinguish via picker kind.
-                    let is_fullscreen = is_fullscreen_picker_kind(&p.kind);
+                    let is_fullscreen = matches!(p.kind.spec().layout, PickerLayout::Full);
                     let list_row = if is_fullscreen {
                         row_in_rect as usize
                     } else if row_in_rect == 0 {
@@ -825,24 +792,7 @@ impl Editor {
                 haystack: Utf32String::from(label.as_str()),
             });
         }
-        let mut p = Picker {
-            kind: PickerKind::Jumps,
-            mode: PickerMode::Browse,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        };
-        p.rescore();
-        self.picker = Some(p);
+        self.picker = Some(Picker::new(PickerKind::Jumps, items));
     }
 
     /// Consume a `:jumps`-picker selection: jump to `entries[idx]` and update
@@ -877,24 +827,7 @@ impl Editor {
     /// Open the buffer picker: lists all live buffers for fuzzy selection.
     pub(crate) fn open_buffers_picker(&mut self) {
         let items = self.buffer_picker_items();
-        let mut p = Picker {
-            kind: PickerKind::Buffers,
-            mode: PickerMode::Browse,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        };
-        p.rescore();
-        self.picker = Some(p);
+        self.picker = Some(Picker::new(PickerKind::Buffers, items));
     }
 
     /// Build the item list for the buffer picker from the current set of
@@ -954,22 +887,9 @@ mod tests {
                 haystack: Utf32String::from(display),
             })
             .collect();
-        ed.picker = Some(Picker {
-            kind: PickerKind::Files,
-            mode: PickerMode::Input,
-            query: String::new(),
-            items,
-            matches: vec![(0, 0), (1, 0)],
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        });
+        let mut p = Picker::new(PickerKind::Files, items);
+        p.mode = PickerMode::Input;
+        ed.picker = Some(p);
         ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
         ed.last_picker_scroll = 0;
         ed.last_picker_list_rows = 1;

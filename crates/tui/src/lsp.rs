@@ -13,7 +13,7 @@ use vix_lsp::{parse_response, path_to_uri, server_for_path, uri_to_path, LspClie
 use vix_picker::Utf32String;
 
 use crate::completion::CompletionPopup;
-use crate::picker::{Picker, PickerItem, PickerKind, PickerMode, PickerValue};
+use crate::picker::{Picker, PickerItem, PickerKind, PickerValue};
 use crate::Editor;
 
 /// What we asked for — lets us interpret the response when it arrives.
@@ -455,24 +455,7 @@ impl Editor {
             });
         }
         self.pending_code_actions = actions;
-        let mut p = Picker {
-            kind: PickerKind::CodeActions,
-            mode: PickerMode::Browse,
-            query: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-            scroll: 0,
-            cached_files: None,
-            pending_g: false,
-            marked: std::collections::HashSet::new(),
-            preview: None,
-            preview_last_seen_selected: None,
-            preview_changed_at: Instant::now(),
-            query_dirty_at: None,
-        };
-        p.rescore();
-        self.picker = Some(p);
+        self.picker = Some(Picker::new(PickerKind::CodeActions, items));
     }
 
     /// Apply a selected code action: first its WorkspaceEdit (if any), then
