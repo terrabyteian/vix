@@ -13,8 +13,9 @@ use crate::picker::{
     PickerKind, PickerMode, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER,
     PICKER_DIM,
 };
+use crate::render::content::scope_style;
 use crate::util::{char_index_in_byte_range, count_chars, pad_or_trunc, take_end};
-use crate::{scope_style, Editor};
+use crate::Editor;
 
 pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor) {
     let Some(p) = ed.picker.as_ref() else {
@@ -774,7 +775,7 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
 mod tests {
     use super::*;
     use crate::picker::PickerItem;
-    use crate::render;
+    use crate::render::render;
     use ratatui::backend::TestBackend;
     use std::time::Instant;
     use vix_core::Buffer;
