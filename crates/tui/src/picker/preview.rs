@@ -156,7 +156,7 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
             let target_path: Option<PathBuf> = ed.picker.as_ref().and_then(|p| {
                 p.matches
                     .get(p.selected)
-                    .and_then(|&(idx, _)| match &p.items[idx].value {
+                    .and_then(|&(idx, _)| match &p.active_items()[idx].value {
                         PickerValue::File(path) => Some(path.clone()),
                         PickerValue::GrepHit { path, .. } => Some(path.clone()),
                         _ => None,
@@ -200,7 +200,7 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
                 .and_then(|p| p.matches.get(p.selected).map(|&(i, _)| i))
                 .and_then(|item_idx| {
                     let p = ed.picker.as_ref()?;
-                    if let PickerValue::BufferIndex(idx) = p.items[item_idx].value {
+                    if let PickerValue::BufferIndex(idx) = p.active_items()[item_idx].value {
                         Some(idx)
                     } else {
                         None

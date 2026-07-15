@@ -20,19 +20,22 @@ pub(crate) struct Picker {
     pub(crate) kind: PickerKind,
     pub(crate) mode: PickerMode,
     pub(crate) query: String,
-    /// `(display, value, haystack)` tuples. `value` is the selected payload
-    /// (path or grep hit) passed to `on_select`.
+    /// File-scan items. Only populated/consulted when `kind` is `Files`;
+    /// doubles as the `<Tab>` Files↔Grep toggle cache so flipping back to
+    /// Files doesn't rescan the tree.
+    pub(crate) file_items: Vec<PickerItem>,
+    /// Live grep-hit items. Only populated/consulted when `kind` is `Grep`.
+    pub(crate) grep_items: Vec<PickerItem>,
+    /// `(display, value, haystack)` tuples for every other picker kind
+    /// (Symbols, Buffers, CodeActions, Jumps). Files/Grep use their own
+    /// dedicated storage above instead — see `active_items`.
     pub(crate) items: Vec<PickerItem>,
-    /// Scored subset of `items` visible in the current list, plus the index
-    /// back into `items`.
+    /// Scored subset of `active_items()` visible in the current list, plus
+    /// the index back into it.
     pub(crate) matches: Vec<(usize, u32)>,
     pub(crate) selected: usize,
     /// Vertical scroll offset within the match list.
     pub(crate) scroll: usize,
-    /// Cached file-scan items so `<Tab>` Files↔Grep toggling doesn't
-    /// rescan the tree on every flip. Populated for the unified
-    /// Files/Grep picker; left `None` for other picker kinds.
-    pub(crate) cached_files: Option<Vec<PickerItem>>,
     /// Set after a single `g` in Browse mode; the next `g` jumps to top.
     /// Cleared by any other key.
     pub(crate) pending_g: bool,
@@ -361,17 +364,20 @@ pub(crate) fn wrap_picker_detail(text: &str, width: usize, rows: usize) -> Vec<S
 impl Picker {
     /// Build a picker over `items` with every field at its default (Browse
     /// mode, empty query, no marks/preview/scroll), then rescore so
-    /// `matches` reflects the (empty) query immediately.
+    /// `matches` reflects the (empty) query immediately. `items` is routed
+    /// to the kind-appropriate storage: `file_items` for Files, `grep_items`
+    /// for Grep, `items` for everything else — see `active_items`.
     pub(crate) fn new(kind: PickerKind, items: Vec<PickerItem>) -> Self {
         let mut p = Self {
             kind,
             mode: PickerMode::Browse,
             query: String::new(),
-            items,
+            file_items: Vec::new(),
+            grep_items: Vec::new(),
+            items: Vec::new(),
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
-            cached_files: None,
             pending_g: false,
             marked: std::collections::HashSet::new(),
             preview: None,
@@ -379,6 +385,11 @@ impl Picker {
             preview_changed_at: Instant::now(),
             query_dirty_at: None,
         };
+        match p.kind {
+            PickerKind::Files => p.file_items = items,
+            PickerKind::Grep => p.grep_items = items,
+            _ => p.items = items,
+        }
         p.rescore();
         p
     }
@@ -392,6 +403,18 @@ impl Picker {
         self
     }
 
+    /// The item list `matches` indexes into for the picker's current kind:
+    /// `file_items` for Files, `grep_items` for Grep, `items` for everything
+    /// else. Centralizes the per-kind storage split so renderers, mouse
+    /// handling, and pick-commit don't need to know about it.
+    pub(crate) fn active_items(&self) -> &[PickerItem] {
+        match self.kind {
+            PickerKind::Files => &self.file_items,
+            PickerKind::Grep => &self.grep_items,
+            _ => &self.items,
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if delta < 0 {
             self.selected = self.selected.saturating_sub(delta.unsigned_abs());
@@ -402,9 +425,10 @@ impl Picker {
     }
 
     /// Re-score items against `self.query`. Caps visible matches at 1000 to
-    /// keep the render loop snappy on large repos. Iterates `self.items` by
-    /// reference and writes directly into `self.matches`, so a keystroke
-    /// rescore on a 100k-file corpus doesn't allocate a clone per item.
+    /// keep the render loop snappy on large repos. Iterates the active
+    /// item storage by reference and writes directly into `self.matches`,
+    /// so a keystroke rescore on a 100k-file corpus doesn't allocate a
+    /// clone per item.
     ///
     /// Grep is a special case: every item is already an exact regex hit, so
     /// running nucleo over the result list would only re-rank — at real cost
@@ -419,7 +443,7 @@ impl Picker {
     pub(crate) fn rescore(&mut self) {
         if matches!(self.kind, PickerKind::Grep) {
             self.matches.clear();
-            for (i, _) in self.items.iter().enumerate().take(1000) {
+            for (i, _) in self.grep_items.iter().enumerate().take(1000) {
                 self.matches.push((i, 0));
             }
             if self.selected >= self.matches.len() {
@@ -431,7 +455,7 @@ impl Picker {
         if matches!(self.kind, PickerKind::Files) {
             self.matches.clear();
             let q = &self.query;
-            for (i, it) in self.items.iter().enumerate() {
+            for (i, it) in self.file_items.iter().enumerate() {
                 if substring_match_smart(&it.display, q).is_some() {
                     self.matches.push((i, 0));
                     if self.matches.len() >= 1000 {

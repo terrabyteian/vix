@@ -78,7 +78,7 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
         mode_hint,
         mark_hint,
         p.matches.len(),
-        p.items.len()
+        p.active_items().len()
     );
     let header_pad = (w as usize).saturating_sub(prompt.len() + count.len());
     let header = Line::from(vec![
@@ -96,7 +96,7 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
     let selected_item = p
         .matches
         .get(p.selected)
-        .map(|&(item_idx, _)| &p.items[item_idx]);
+        .map(|&(item_idx, _)| &p.active_items()[item_idx]);
     let detail_rows = if selected_item.is_some() && h >= 8 {
         2usize.min((h as usize).saturating_sub(2))
     } else {
@@ -118,7 +118,7 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
         let idx = scroll + row;
         match p.matches.get(idx) {
             Some(&(item_idx, _)) => {
-                let item = &p.items[item_idx];
+                let item = &p.active_items()[item_idx];
                 let is_sel = idx == p.selected;
                 let style = if is_sel {
                     Style::default()
@@ -187,7 +187,7 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
 pub(crate) fn picker_preview_anchor_line(p: &Picker) -> usize {
     p.matches
         .get(p.selected)
-        .and_then(|&(idx, _)| match &p.items[idx].value {
+        .and_then(|&(idx, _)| match &p.active_items()[idx].value {
             PickerValue::GrepHit { line, .. } => Some(line.saturating_sub(1) as usize),
             _ => None,
         })
@@ -271,7 +271,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     } else {
         cwd_str
     };
-    let counts = format!(" {} / {} ", p.matches.len(), p.items.len());
+    let counts = format!(" {} / {} ", p.matches.len(), p.active_items().len());
     let bread = format!(" {}  ", cwd_disp);
     let active_style = Style::default()
         .fg(picker_pulse_accent())
@@ -399,7 +399,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
             list_lines.push(Line::raw(""));
             continue;
         };
-        let item = &p.items[item_idx];
+        let item = &p.active_items()[item_idx];
         let is_sel = match_idx == selected;
         let is_marked = p.marked.contains(&item_idx);
         let row_style = if is_sel {
@@ -643,7 +643,9 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
     let anchor = picker_preview_anchor_line(p);
     let anchor = anchor.min(cache.lines.len().saturating_sub(1));
     let view_top = if matches!(
-        p.matches.get(p.selected).map(|&(i, _)| &p.items[i].value),
+        p.matches
+            .get(p.selected)
+            .map(|&(i, _)| &p.active_items()[i].value),
         Some(PickerValue::GrepHit { .. })
     ) {
         let third = body_h / 3;
@@ -674,7 +676,9 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
         let is_hit_line = !cache.placeholder
             && line_idx == anchor
             && matches!(
-                p.matches.get(p.selected).map(|&(i, _)| &p.items[i].value),
+                p.matches
+                    .get(p.selected)
+                    .map(|&(i, _)| &p.active_items()[i].value),
                 Some(PickerValue::GrepHit { .. })
             );
 
