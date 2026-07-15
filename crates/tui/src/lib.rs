@@ -16,18 +16,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vix_core::{
-    apply_motion, compile_search, find_all_in_lines, find_backward, find_forward,
-    handle_normal_char, text_object_range, Action, Buffer, Case, Change, FindDirection, FindKind,
-    History, InsertPos, JumpList, Mode, Motion, NormalKeyState, PendingOp, RepeatAction,
-    SearchDirection, Selection, TextObject, TextObjectKind, Transaction,
+    apply_motion, compile_search, find_all_in_lines, handle_normal_char, text_object_range, Action,
+    Buffer, Case, Change, FindDirection, FindKind, History, InsertPos, JumpList, Mode, Motion,
+    NormalKeyState, PendingOp, RepeatAction, SearchDirection, Selection, TextObject,
+    TextObjectKind, Transaction,
 };
 
 mod buffers;
 mod completion;
+mod ex;
 pub mod help;
 mod jumps;
 mod lsp;
 mod picker;
+mod search;
 pub mod testing;
 mod util;
 use vix_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
@@ -331,97 +333,6 @@ impl Editor {
         self.syntax_version = Some(version);
     }
 
-    /// Returns the line index of the match on success so the caller can
-    /// adjust the viewport (e.g. pin the first match to the top of the
-    /// pane on a fresh `/` search).
-    pub(crate) fn do_search(&mut self, query: &str, dir: SearchDirection) -> Option<usize> {
-        if query.is_empty() {
-            return None;
-        }
-        let re = match compile_search(query, Case::Smart) {
-            Ok(r) => r,
-            Err(e) => {
-                self.msg = format!("E: {e}");
-                return None;
-            }
-        };
-        // Vim starts search from cursor + 1 for forward, cursor for backward.
-        let start_from = match dir {
-            SearchDirection::Forward => (self.sel.head + 1).min(self.buffer.len_chars()),
-            SearchDirection::Backward => self.sel.head,
-        };
-        let hit = match dir {
-            SearchDirection::Forward => find_forward(&self.buffer, &re, start_from)
-                .or_else(|| find_forward(&self.buffer, &re, 0)), // wrap
-            SearchDirection::Backward => find_backward(&self.buffer, &re, start_from)
-                .or_else(|| find_backward(&self.buffer, &re, self.buffer.len_chars())),
-        };
-        match hit {
-            Some((s, _)) => {
-                self.sel = Selection::at(s).clamped(&self.buffer);
-                self.last_search = Some((query.to_string(), dir));
-                self.hl_search = true;
-                Some(self.cursor_line())
-            }
-            None => {
-                self.msg = format!("E486: Pattern not found: {query}");
-                None
-            }
-        }
-    }
-
-    pub(crate) fn word_search_under(&mut self, dir: SearchDirection) {
-        let rope = self.buffer.rope();
-        let len = self.buffer.len_chars();
-        if len == 0 {
-            return;
-        }
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        let mut start = self.sel.head.min(len.saturating_sub(1));
-        // If cursor is not on a word char, try to find one to the right on this line.
-        if !is_word(rope.char(start)) {
-            let (line, _) = self.buffer.char_to_line_col(start);
-            let line_end = self.buffer.line_to_char(line) + self.buffer.line_len_chars(line);
-            let mut i = start;
-            while i < line_end && !is_word(rope.char(i)) {
-                i += 1;
-            }
-            if i >= line_end {
-                self.msg = "E348: No string under cursor".into();
-                return;
-            }
-            start = i;
-        }
-        // Extend backward to start of word.
-        while start > 0 && is_word(rope.char(start - 1)) {
-            start -= 1;
-        }
-        let mut end = start;
-        while end < len && is_word(rope.char(end)) {
-            end += 1;
-        }
-        let word: String = rope.slice(start..end).to_string();
-        // Build a pattern with word boundaries, escaping regex metachars.
-        let escaped = regex_escape_like(&word);
-        let pattern = format!(r"\b{escaped}\b");
-        self.do_search(&pattern, dir);
-    }
-
-    pub(crate) fn search_repeat(&mut self, dir: SearchDirection) {
-        let Some((query, last_dir)) = self.last_search.clone() else {
-            self.msg = "No previous search".into();
-            return;
-        };
-        // `n` repeats in original direction; `N` reverses it.
-        let effective = match (last_dir, dir) {
-            (d, SearchDirection::Forward) => d,
-            (SearchDirection::Forward, SearchDirection::Backward) => SearchDirection::Backward,
-            (SearchDirection::Backward, SearchDirection::Backward) => SearchDirection::Forward,
-        };
-        self.hl_search = true;
-        self.do_search(&query, effective);
-    }
-
     pub(crate) fn cursor_line(&self) -> usize {
         self.buffer.char_to_line_col(self.sel.head).0
     }
@@ -469,225 +380,6 @@ impl Editor {
             Some(r) => (r.height as usize).saturating_sub(2).max(1),
             None => 10,
         }
-    }
-
-    pub(crate) fn run_ex(&mut self, cmd: &str) {
-        let cmd = cmd.trim();
-        match cmd {
-            "w" => self.format_and_save(),
-            "fmt" | "format" => {
-                self.format_buffer();
-            }
-            "action" | "actions" | "ca" => {
-                self.run_code_action();
-            }
-            "q" => {
-                if self.buffer.dirty() {
-                    self.msg = "E37: No write since last change (use :q!)".into();
-                } else {
-                    self.close_buffer(false);
-                }
-            }
-            "q!" => {
-                self.close_buffer(true);
-            }
-            "qa" | "qall" => {
-                if self.any_buffer_dirty() {
-                    self.msg = "E37: unsaved buffers exist (use :qa!)".into();
-                } else {
-                    self.quit = true;
-                }
-            }
-            "qa!" | "qall!" => {
-                self.quit = true;
-            }
-            "wq" | "x" => {
-                self.format_and_save();
-                if !self.buffer.dirty() {
-                    self.close_buffer(false);
-                }
-            }
-            "noh" | "nohl" | "nohlsearch" => {
-                self.hl_search = false;
-            }
-            "Files" => {
-                self.open_files_picker();
-            }
-            "Symbols" => {
-                self.open_symbols_picker();
-            }
-            "Buffers" | "ls" => {
-                self.open_buffers_picker();
-            }
-            "jumps" => {
-                self.open_jumps_picker();
-            }
-            "help" | "h" => {
-                self.open_help_doc("");
-            }
-            "bn" | "bnext" => {
-                self.next_buffer();
-            }
-            "bp" | "bprev" | "bprevious" => {
-                self.prev_buffer();
-            }
-            "bd" | "bdelete" => {
-                self.close_buffer(false);
-            }
-            "bd!" | "bdelete!" => {
-                self.close_buffer(true);
-            }
-            "e" | "edit" => {
-                self.reload_buffer(false);
-            }
-            "e!" | "edit!" => {
-                self.reload_buffer(true);
-            }
-            "" => {}
-            _ => {
-                if let Some(rest) = cmd.strip_prefix("Grep") {
-                    self.open_grep_picker(rest.trim());
-                } else if let Some(rest) =
-                    cmd.strip_prefix("help ").or_else(|| cmd.strip_prefix("h "))
-                {
-                    self.open_help_doc(rest.trim());
-                } else if let Some(rest) =
-                    cmd.strip_prefix("e ").or_else(|| cmd.strip_prefix("e! "))
-                {
-                    let path = std::path::PathBuf::from(rest.trim());
-                    self.open_path(&path);
-                } else if let Some(rest) = cmd.strip_prefix("b ") {
-                    self.switch_buffer_by_spec(rest.trim());
-                } else if let Some(new_name) = cmd.strip_prefix("rename ").map(str::trim) {
-                    if new_name.is_empty() {
-                        self.msg = "usage: :rename <new-name>".into();
-                    } else {
-                        self.run_rename(new_name);
-                    }
-                } else if cmd.starts_with("%s") || cmd.starts_with(".s") || cmd.starts_with('s') {
-                    self.run_substitute(cmd);
-                } else {
-                    self.msg = format!("not implemented: :{cmd}");
-                }
-            }
-        }
-    }
-
-    /// Parse and execute `:%s/pat/rep/flags`, `:s/pat/rep/flags`, etc.
-    /// v1 supports `%` (whole file) and no-range (current line). Flags: g, i.
-    pub(crate) fn run_substitute(&mut self, cmd: &str) {
-        // Strip the range prefix + the `s`.
-        let rest = if let Some(r) = cmd.strip_prefix("%s") {
-            r
-        } else if let Some(r) = cmd.strip_prefix(".s") {
-            r
-        } else if let Some(r) = cmd.strip_prefix('s') {
-            r
-        } else {
-            self.msg = "internal: bad :s".into();
-            return;
-        };
-        let whole_file = cmd.starts_with("%s");
-
-        // First char after `s` is the delimiter.
-        let mut chars = rest.chars();
-        let Some(delim) = chars.next() else {
-            self.msg = "E471: usage :s/pat/rep/flags".into();
-            return;
-        };
-        let body: String = chars.collect();
-        let parts: Vec<&str> = body.splitn(3, delim).collect();
-        if parts.len() < 2 {
-            self.msg = "E471: usage :s/pat/rep/flags".into();
-            return;
-        }
-        let pattern = parts[0];
-        let replacement = parts[1];
-        let flags = parts.get(2).copied().unwrap_or("");
-        let global = flags.contains('g');
-        let case_insensitive = flags.contains('i');
-
-        let re = match regex::RegexBuilder::new(pattern)
-            .case_insensitive(case_insensitive)
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                self.msg = format!("E: {e}");
-                return;
-            }
-        };
-
-        // Determine the char-range to operate on.
-        let (range_start, range_end) = if whole_file {
-            (0, self.buffer.len_chars())
-        } else {
-            let line = self.cursor_line();
-            let s = self.buffer.line_to_char(line);
-            let e = s + self.buffer.line_len_chars(line);
-            (s, e)
-        };
-
-        // Collect matches line-by-line so we can replace inside each line with
-        // Vim-ish semantics (per-line `g` flag). Must walk lines forward but
-        // apply replacements in reverse across the whole buffer so offsets
-        // stay valid.
-        let (start_line, _) = self.buffer.char_to_line_col(range_start);
-        let end_line_exclusive = if range_end == 0 {
-            0
-        } else {
-            self.buffer.char_to_line_col(range_end.saturating_sub(1)).0 + 1
-        };
-
-        let mut replacements: Vec<(std::ops::Range<usize>, String, String)> = Vec::new();
-        for line in start_line..end_line_exclusive {
-            let line_text: String = self.buffer.rope().line(line).chars().collect();
-            let line_text = line_text.trim_end_matches('\n');
-            let line_start = self.buffer.line_to_char(line);
-            let mut offset = 0usize; // byte offset within line_text
-            for m in re.find_iter(line_text) {
-                let start_byte = m.start();
-                let end_byte = m.end();
-                let matched = &line_text[start_byte..end_byte];
-                let rep = re.replace(matched, replacement).to_string();
-                let start_char = line_start + line_text[..start_byte].chars().count();
-                let end_char = line_start + line_text[..end_byte].chars().count();
-                replacements.push((start_char..end_char, matched.to_string(), rep));
-                offset = end_byte;
-                if !global {
-                    break;
-                }
-            }
-            let _ = offset;
-        }
-
-        if replacements.is_empty() {
-            self.msg = format!("E486: Pattern not found: {pattern}");
-            return;
-        }
-
-        // Apply in reverse char-offset order so earlier offsets stay valid.
-        replacements.sort_by(|a, b| b.0.start.cmp(&a.0.start));
-        let sel_before = self.sel;
-        let mut tx = Transaction::new();
-        tx.sel_before = Some(sel_before);
-        let count = replacements.len();
-        for (range, old, new_text) in &replacements {
-            self.buffer.remove_range(range.clone());
-            self.buffer.insert_str(range.start, new_text);
-            tx.push(Change::Delete {
-                at: range.start,
-                removed: old.clone(),
-            });
-            tx.push(Change::Insert {
-                at: range.start,
-                text: new_text.clone(),
-            });
-        }
-        self.sel = self.sel.clamped(&self.buffer);
-        tx.sel_after = Some(self.sel);
-        self.history.commit(tx);
-        self.msg = format!("{count} substitutions");
     }
 
     /// Dispatch a resolved Action. Mutates editor state.
@@ -2111,17 +1803,6 @@ impl Editor {
         let col_clamped = in_text_col.min(line_len);
         Some(self.buffer.line_to_char(line_idx) + col_clamped)
     }
-}
-
-pub(crate) fn regex_escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if ".+*?()[]{}|^$\\/".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
