@@ -3,7 +3,7 @@
 //! compact overlay (Symbols/CodeActions/Jumps), plus the narrow-terminal
 //! degrade of a fullscreen kind down to the compact box.
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -339,7 +339,7 @@ fn render_full_body(
     let counts = format!(" {} / {} ", p.matches.len(), p.active_items().len());
     let bread = format!(" {}  ", cwd_disp);
     let active_style = Style::default()
-        .fg(picker_pulse_accent(theme))
+        .fg(theme.accent_hi)
         .add_modifier(Modifier::BOLD);
     let inactive_style = Style::default().fg(theme.dim);
     let tab_row = if is_buffers {
@@ -387,7 +387,7 @@ fn render_full_body(
 
     // --- Row 1: prompt -------------------------------------------------------
     let arrow_style = Style::default()
-        .fg(picker_pulse_accent(theme))
+        .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
     // Prompt = " ❯ <query>". The caret is the terminal's own cursor (set
     // below) so it blinks natively without any redraw cadence of our own.
@@ -506,7 +506,7 @@ fn render_full_body(
         spans.push(Span::styled(
             mark_glyph.to_string(),
             if is_marked && !is_sel {
-                Style::default().fg(picker_pulse_accent(theme))
+                Style::default().fg(theme.accent_hi)
             } else {
                 row_style
             },
@@ -619,22 +619,6 @@ pub(crate) fn picker_preview_anchor_line(p: &Picker) -> usize {
             _ => None,
         })
         .unwrap_or(0)
-}
-
-/// Subtle two-step accent pulse driven by wall-clock time. The picker is the
-/// only source of redraw cadence here, but the run loop polls every 100ms,
-/// so colors change roughly twice per second when nothing else triggers a
-/// redraw.
-pub(crate) fn picker_pulse_accent(theme: &Theme) -> Color {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    if (ms / 600) % 2 == 0 {
-        theme.accent
-    } else {
-        theme.accent_hi
-    }
 }
 
 /// Draw the preview pane for the highlighted Files/Grep row. Caller positions
@@ -755,7 +739,7 @@ pub(crate) fn render_picker_preview_pane(
         let num_style = if is_hit_line {
             Style::default()
                 .bg(theme.border)
-                .fg(picker_pulse_accent(theme))
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.border)

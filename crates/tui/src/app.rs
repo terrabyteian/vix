@@ -18,6 +18,9 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
     let mut term: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 
     let mut ed = Editor::new(buffer);
+    // Editor::new defaults to the env-independent ANSI table (tests depend on
+    // that); pick the real palette from the terminal environment here.
+    ed.theme = crate::theme::Theme::detect();
     ed.ensure_lsp_open();
     if open_files_picker {
         ed.discard_active_on_swap = true;
