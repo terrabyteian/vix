@@ -113,6 +113,17 @@ pub struct Editor {
     /// Buffer version the cache was computed against. `None` forces a rebuild
     /// on first use.
     pub(crate) syntax_version: Option<u64>,
+    /// Byte window `syntax_cache` covers. `None` = whole file (the full
+    /// highlight path). `Some(w)` = viewport-limited spans from the windowed
+    /// query path; a viewport still inside `w` is a cache hit, scrolling
+    /// past it re-queries (no reparse while the buffer version is
+    /// unchanged).
+    pub(crate) syntax_window: Option<std::ops::Range<usize>>,
+    /// Reused scratch for the rope → contiguous-source copy handed to
+    /// tree-sitter. Keyed by (buffer id, version) so buffer switches and
+    /// edits rebuild it; navigation reuses it byte-for-byte.
+    pub(crate) syntax_src: String,
+    pub(crate) syntax_src_key: Option<(u64, u64)>,
     /// Active picker overlay (file finder / grep). Intercepts input while set.
     pub(crate) picker: Option<Picker>,
     /// Registered LSP clients keyed by `cmd`. We spawn lazily — one client per
@@ -243,6 +254,9 @@ impl Editor {
             syntax,
             syntax_cache: Vec::new(),
             syntax_version: None,
+            syntax_window: None,
+            syntax_src: String::new(),
+            syntax_src_key: None,
             picker: None,
             lsp_clients: HashMap::new(),
             lsp_docs: HashMap::new(),
@@ -362,8 +376,18 @@ impl Editor {
     /// changes to the LSP server. `content_rows` is the editor pane height
     /// (terminal height minus statusline + cmdline).
     pub(crate) fn update(&mut self, content_rows: usize) {
-        self.ensure_cursor_visible(content_rows.max(1));
-        self.refresh_syntax_cache();
+        let rows = content_rows.max(1);
+        self.ensure_cursor_visible(rows);
+        // A fullscreen picker covers the editor pane entirely — skip the
+        // highlight refresh while it's up; the first frame after it closes
+        // pays it instead.
+        let covered = self
+            .picker
+            .as_ref()
+            .is_some_and(|p| matches!(p.kind.spec().layout, crate::picker::PickerLayout::Full));
+        if !covered {
+            self.refresh_syntax_cache_for_viewport(self.view_top, rows);
+        }
         self.sync_lsp_changes();
     }
 
@@ -413,11 +437,75 @@ impl Editor {
         !self.lsp_clients.is_empty() || self.files_source.is_some() || self.grep_source.is_some()
     }
 
-    /// Refresh `syntax_cache` if the buffer has mutated since the last parse.
-    /// Cheap fast path when the user is just navigating (no edits).
+    /// Refresh `syntax_cache` for the given viewport (first visible line +
+    /// row count). Uses the windowed query path when the language supports
+    /// it: the cache covers the viewport plus a one-screen margin on each
+    /// side, so line-by-line scrolling hits the cache, a bigger jump pays a
+    /// windowed *query* (no reparse while the buffer is unchanged), and
+    /// only an edit pays a parse — whose cost no longer includes running
+    /// the highlights query over the whole file.
+    pub(crate) fn refresh_syntax_cache_for_viewport(&mut self, first_line: usize, rows: usize) {
+        let version = self.buffer.version();
+        let total_lines = self.buffer.len_lines();
+        let needed = self.line_span_bytes(first_line, first_line + rows, total_lines);
+        if self.syntax_version == Some(version) {
+            match &self.syntax_window {
+                None => return, // whole-file cache is always valid
+                Some(w) if w.start <= needed.start && needed.end <= w.end => return,
+                _ => {}
+            }
+        }
+        if self.syntax.is_none() {
+            self.syntax_cache = Vec::new();
+            self.syntax_window = None;
+            self.syntax_version = Some(version);
+            return;
+        }
+
+        // Rebuild the contiguous source copy only when the buffer actually
+        // changed (or a different buffer became active).
+        let src_key = (self.active_bid, version);
+        if self.syntax_src_key != Some(src_key) {
+            self.syntax_src.clear();
+            for chunk in self.buffer.rope().chunks() {
+                self.syntax_src.push_str(chunk);
+            }
+            self.syntax_src_key = Some(src_key);
+        }
+
+        // The retained parse tree inside SyntaxState is stale iff the cache
+        // version lags — SyntaxState swaps with its buffer, so version
+        // tracking here speaks for the tree too.
+        let source_changed = self.syntax_version != Some(version);
+        let margined = self.line_span_bytes(
+            first_line.saturating_sub(rows),
+            first_line + 2 * rows,
+            total_lines,
+        );
+        let syn = self.syntax.as_mut().expect("checked above");
+        match syn.highlight_range(self.syntax_src.as_bytes(), margined.clone(), source_changed) {
+            Some(spans) => {
+                self.syntax_cache = spans;
+                self.syntax_window = Some(margined);
+            }
+            None => {
+                // Locals-dependent language (or parse failure): full path.
+                self.syntax_cache = syn
+                    .highlight(self.syntax_src.as_bytes())
+                    .unwrap_or_default();
+                self.syntax_window = None;
+            }
+        }
+        self.syntax_version = Some(version);
+    }
+
+    /// Refresh `syntax_cache` for the whole file (no windowing). The
+    /// semantic baseline the viewport variant is tested against; only test
+    /// code calls it (the editor always goes through the viewport path).
+    #[cfg(test)]
     pub(crate) fn refresh_syntax_cache(&mut self) {
         let version = self.buffer.version();
-        if self.syntax_version == Some(version) {
+        if self.syntax_version == Some(version) && self.syntax_window.is_none() {
             return;
         }
         self.syntax_cache = if let Some(s) = self.syntax.as_mut() {
@@ -426,7 +514,28 @@ impl Editor {
         } else {
             Vec::new()
         };
+        self.syntax_window = None;
         self.syntax_version = Some(version);
+    }
+
+    /// Byte range spanned by lines `[start_line, end_line)`, both clamped
+    /// to the buffer. `end_line >= total` extends to the end of the buffer
+    /// (a viewport can run past EOF).
+    fn line_span_bytes(
+        &self,
+        start_line: usize,
+        end_line: usize,
+        total_lines: usize,
+    ) -> std::ops::Range<usize> {
+        let rope = self.buffer.rope();
+        let start_line = start_line.min(total_lines.saturating_sub(1));
+        let start = rope.char_to_byte(self.buffer.line_to_char(start_line));
+        let end = if end_line >= total_lines {
+            rope.len_bytes()
+        } else {
+            rope.char_to_byte(self.buffer.line_to_char(end_line))
+        };
+        start..end.max(start)
     }
 
     pub(crate) fn cursor_line(&self) -> usize {
@@ -553,5 +662,67 @@ mod tests {
         );
         h.pump_picker();
         assert!(!h.editor.has_live_channels());
+    }
+
+    /// Per-byte scope resolution over a byte window, from a flat span list.
+    fn scopes_in(spans: &[vix_syntax::HlSpan], win: std::ops::Range<usize>) -> Vec<Option<usize>> {
+        let mut v = vec![None; win.end - win.start];
+        for s in spans {
+            let a = s.range.start.max(win.start);
+            let b = s.range.end.min(win.end);
+            for i in a..b {
+                v[i - win.start] = Some(s.scope);
+            }
+        }
+        v
+    }
+
+    fn rust_fixture_harness() -> Harness {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/sample.rs"
+        ))
+        .unwrap();
+        Harness::with_text_and_path(&src, "sample.rs")
+    }
+
+    #[test]
+    fn viewport_syntax_cache_matches_full_highlight() {
+        let mut h = rust_fixture_harness();
+        // Baseline: whole-file highlight.
+        h.editor.refresh_syntax_cache();
+        let full = h.editor.syntax_cache.clone();
+        assert!(h.editor.syntax_window.is_none());
+
+        // Viewport path over several windows, including past-EOF clamps.
+        let total = h.editor.buffer.len_lines();
+        for (first, rows) in [(0usize, 10usize), (5, 8), (total.saturating_sub(3), 10)] {
+            h.editor.invalidate_syntax_cache();
+            h.editor.refresh_syntax_cache_for_viewport(first, rows);
+            let win = h.editor.syntax_window.clone().expect("windowed path");
+            assert_eq!(
+                scopes_in(&h.editor.syntax_cache, win.clone()),
+                scopes_in(&full, win),
+                "viewport ({first},{rows}) diverged from full highlight"
+            );
+        }
+    }
+
+    #[test]
+    fn viewport_syntax_cache_hits_and_invalidates() {
+        let mut h = rust_fixture_harness();
+        h.editor.refresh_syntax_cache_for_viewport(0, 10);
+        let win = h.editor.syntax_window.clone().unwrap();
+        // Same viewport again: pure cache hit, window unchanged.
+        h.editor.refresh_syntax_cache_for_viewport(2, 8);
+        assert_eq!(h.editor.syntax_window.clone().unwrap(), win);
+        // An edit invalidates: the version bump forces a re-highlight.
+        h.keys("ix<Esc>");
+        h.editor.refresh_syntax_cache_for_viewport(0, 10);
+        assert_eq!(
+            h.editor.syntax_version,
+            Some(h.editor.buffer.version()),
+            "edit must re-key the cache"
+        );
     }
 }

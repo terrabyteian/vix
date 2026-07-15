@@ -7,7 +7,7 @@
 use std::ops::Range;
 use std::path::Path;
 
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 /// The set of scope names we recognize. Order must match `HIGHLIGHT_NAMES`
@@ -128,12 +128,134 @@ pub struct Symbol {
     pub start_byte: usize,
 }
 
-/// Stateful highlighter. One per buffer. Currently re-parses from source on
-/// each `highlight` call — incremental reparse is a later optimization.
+/// The tree-sitter grammar for a language. Shared by the full highlighter,
+/// the windowed editor path, and the symbol picker.
+fn grammar_for(lang: Language) -> tree_sitter::Language {
+    match lang {
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Markdown => tree_sitter_md::LANGUAGE.into(),
+        Language::Json => tree_sitter_json::LANGUAGE.into(),
+        Language::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+        Language::Html => tree_sitter_html::LANGUAGE.into(),
+        Language::Css => tree_sitter_css::LANGUAGE.into(),
+        Language::Bash => tree_sitter_bash::LANGUAGE.into(),
+        Language::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+    }
+}
+
+/// The raw highlights query source for a language — the same string the
+/// full-path `HighlightConfiguration` is built from.
+fn highlights_src(lang: Language) -> &'static str {
+    match lang {
+        Language::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY,
+        Language::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
+        Language::JavaScript => tree_sitter_javascript::HIGHLIGHT_QUERY,
+        Language::TypeScript | Language::Tsx => tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        Language::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
+        Language::Markdown => tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+        Language::Json => tree_sitter_json::HIGHLIGHTS_QUERY,
+        Language::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+        Language::Html => tree_sitter_html::HIGHLIGHTS_QUERY,
+        Language::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
+        Language::Bash => tree_sitter_bash::HIGHLIGHT_QUERY,
+        Language::Hcl => HCL_HIGHLIGHTS,
+    }
+}
+
+/// Whether the windowed editor path is enabled for a language. The windowed
+/// path skips tree-sitter-highlight's locals machinery (definition/reference
+/// tracking); for languages whose bundled queries have no locals that's
+/// exactly equivalent (verified per-byte against the full path over
+/// `fixtures/` — see the `windowed_*` tests). JS/TS/TSX ship LOCALS_QUERYs,
+/// so a local reference could highlight differently — they stay on the full
+/// path until locals are replicated.
+fn windowed_supported(lang: Language) -> bool {
+    !matches!(
+        lang,
+        Language::JavaScript | Language::TypeScript | Language::Tsx
+    )
+}
+
+/// Raw-query highlighter for the editor's viewport: a retained parser and
+/// tree plus the compiled highlights query. `QueryCursor::set_byte_range`
+/// limits query execution to the visible window, so highlight cost stops
+/// scaling with file size (the parse is still whole-file — incremental
+/// `InputEdit` reparse is a later step).
+///
+/// Injections are irrelevant here: the full path passes a `|_| None`
+/// injection callback, so injected layers were never highlighted anyway.
+struct WindowedHighlighter {
+    parser: Parser,
+    tree: Option<Tree>,
+    query: Query,
+    /// Query capture index → `HIGHLIGHT_NAMES` index, using the same
+    /// best-match rule as `HighlightConfiguration::configure`.
+    capture_scopes: Vec<Option<usize>>,
+}
+
+impl WindowedHighlighter {
+    fn new(lang: Language) -> Option<Self> {
+        if !windowed_supported(lang) {
+            return None;
+        }
+        let grammar = grammar_for(lang);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).ok()?;
+        let query = Query::new(&grammar, highlights_src(lang)).ok()?;
+        let capture_scopes = query
+            .capture_names()
+            .iter()
+            .map(|name| best_scope_for(name))
+            .collect();
+        Some(Self {
+            parser,
+            tree: None,
+            query,
+            capture_scopes,
+        })
+    }
+}
+
+/// Map a query capture name to the best `HIGHLIGHT_NAMES` entry — the exact
+/// rule `HighlightConfiguration::configure` uses: every dot-part of the
+/// recognized name must appear among the capture name's parts; the
+/// recognized name with the most parts wins, first-listed on ties.
+fn best_scope_for(capture_name: &str) -> Option<usize> {
+    let capture_parts: Vec<&str> = capture_name.split('.').collect();
+    let mut best: Option<usize> = None;
+    let mut best_len = 0;
+    for (i, recognized) in HIGHLIGHT_NAMES.iter().enumerate() {
+        let mut len = 0;
+        let mut matches = true;
+        for part in recognized.split('.') {
+            len += 1;
+            if !capture_parts.contains(&part) {
+                matches = false;
+                break;
+            }
+        }
+        if matches && len > best_len {
+            best = Some(i);
+            best_len = len;
+        }
+    }
+    best
+}
+
+/// Stateful highlighter. One per buffer. The full path (`highlight`)
+/// re-parses from source on each call; the windowed path
+/// (`highlight_range`) retains its parse tree across calls when the source
+/// hasn't changed, and only executes the query over the requested window.
 pub struct SyntaxState {
     lang: Language,
     cfg: HighlightConfiguration,
     hl: Highlighter,
+    windowed: Option<WindowedHighlighter>,
 }
 
 impl SyntaxState {
@@ -236,6 +358,7 @@ impl SyntaxState {
             lang,
             cfg,
             hl: Highlighter::new(),
+            windowed: WindowedHighlighter::new(lang),
         })
     }
 
@@ -302,6 +425,107 @@ impl SyntaxState {
             }
         }
         Ok(out)
+    }
+
+    /// Viewport-limited highlight for the editor's hot path. Returns spans
+    /// whose per-byte scopes inside `range` are identical to what
+    /// [`Self::highlight`] would produce for the whole file (spans may
+    /// extend past the window; callers window per-line anyway). Returns
+    /// `None` when this language must use the full path (locals-dependent
+    /// grammars) or parsing fails — the caller falls back to `highlight`.
+    ///
+    /// `source_changed` = false lets the retained tree be reused, skipping
+    /// the parse entirely (pure scrolling costs one windowed query run).
+    pub fn highlight_range(
+        &mut self,
+        source: &[u8],
+        range: Range<usize>,
+        source_changed: bool,
+    ) -> Option<Vec<HlSpan>> {
+        let w = self.windowed.as_mut()?;
+        if source_changed || w.tree.is_none() {
+            // Full fresh parse: without byte-level edit deltas, reusing the
+            // old tree via `parse(_, Some(old))` would be unsound. The win
+            // here is the windowed *query*; incremental parse is a later
+            // step once edit plumbing exists.
+            w.tree = w.parser.parse(source, None);
+        }
+        let tree = w.tree.as_ref()?;
+
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(range);
+        let mut captures = cursor.captures(&w.query, tree.root_node(), source);
+
+        // Resolve captures node by node, mirroring tree-sitter-highlight:
+        // consecutive captures on the same node override each other (the
+        // last pattern wins, even if it maps to no recognized scope).
+        let mut nodes: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let mut last_node_id: Option<usize> = None;
+        while let Some((m, idx)) = captures.next() {
+            let cap = m.captures[*idx];
+            let scope = w.capture_scopes[cap.index as usize];
+            if last_node_id == Some(cap.node.id()) {
+                if let Some(last) = nodes.last_mut() {
+                    last.2 = scope;
+                }
+            } else {
+                nodes.push((cap.node.start_byte(), cap.node.end_byte(), scope));
+                last_node_id = Some(cap.node.id());
+            }
+        }
+
+        // Flatten nested scoped nodes into non-overlapping innermost-wins
+        // spans — the same output shape `highlight`'s event loop produces.
+        // Nodes whose final capture maps to no recognized scope emit
+        // nothing, but still (correctly) suppressed any earlier capture on
+        // the same node above. `pos` tracks the emit cursor; a segment is
+        // attributed to the top of the open-highlight stack, exactly like
+        // the event stream's Source-under-innermost-Start behavior.
+        let mut spans: Vec<HlSpan> = Vec::new();
+        let mut stack: Vec<(usize, usize)> = Vec::new(); // (end, scope)
+        let mut pos = 0usize;
+        for (start, end, scope) in nodes {
+            let Some(scope) = scope else { continue };
+            // Close highlights that end at or before this node's start,
+            // emitting each one's trailing segment.
+            while let Some(&(top_end, top_scope)) = stack.last() {
+                if top_end > start {
+                    break;
+                }
+                if pos < top_end {
+                    spans.push(HlSpan {
+                        range: pos..top_end,
+                        scope: top_scope,
+                    });
+                    pos = top_end;
+                }
+                stack.pop();
+            }
+            // Segment between the emit cursor and this node's start belongs
+            // to the enclosing open highlight (if any).
+            if pos < start {
+                if let Some(&(_, outer_scope)) = stack.last() {
+                    spans.push(HlSpan {
+                        range: pos..start,
+                        scope: outer_scope,
+                    });
+                }
+                pos = start;
+            }
+            pos = pos.max(start);
+            stack.push((end, scope));
+        }
+        // Drain: innermost first, emitting each highlight's remaining tail.
+        while let Some((top_end, top_scope)) = stack.pop() {
+            if pos < top_end {
+                spans.push(HlSpan {
+                    range: pos..top_end,
+                    scope: top_scope,
+                });
+                pos = top_end;
+            }
+        }
+        Some(spans)
     }
 
     /// Produce a flat span list for `source`. Nested highlights are flattened
@@ -441,6 +665,105 @@ const GO_SYMBOLS: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-byte scope map over `window`, resolved from a flat span list.
+    /// Both highlight paths produce non-overlapping spans, so this is the
+    /// visual ground truth a renderer would paint.
+    fn byte_scopes(spans: &[HlSpan], window: &Range<usize>) -> Vec<Option<usize>> {
+        let mut v = vec![None; window.end - window.start];
+        for s in spans {
+            let a = s.range.start.max(window.start);
+            let b = s.range.end.min(window.end);
+            for slot in v
+                .iter_mut()
+                .take(b.saturating_sub(window.start))
+                .skip(a.saturating_sub(window.start))
+            {
+                *slot = Some(s.scope);
+            }
+        }
+        v
+    }
+
+    fn fixture_files() -> Vec<std::path::PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut out: Vec<_> = std::fs::read_dir(dir)
+            .expect("fixtures dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| Language::from_path(p).is_some())
+            .collect();
+        out.sort();
+        assert!(!out.is_empty(), "no language fixtures found");
+        out
+    }
+
+    /// The windowed editor path must paint every byte in the window with
+    /// exactly the scope the full tree-sitter-highlight path would.
+    #[test]
+    fn windowed_highlight_matches_full_path_per_byte() {
+        for path in fixture_files() {
+            let lang = Language::from_path(&path).unwrap();
+            let src = std::fs::read(&path).unwrap();
+            let mut state = SyntaxState::new(lang).unwrap();
+            let full = state.highlight(&src).unwrap();
+            if !windowed_supported(lang) {
+                assert!(
+                    state.highlight_range(&src, 0..src.len(), true).is_none(),
+                    "{lang:?}: unsupported language must fall back"
+                );
+                continue;
+            }
+            let len = src.len();
+            let windows = [
+                0..len,
+                len / 3..(2 * len) / 3,
+                0..(200.min(len)),
+                len.saturating_sub(100)..len,
+            ];
+            for window in windows {
+                let spans = state
+                    .highlight_range(&src, window.clone(), true)
+                    .unwrap_or_else(|| panic!("{lang:?}: windowed path unavailable"));
+                assert_eq!(
+                    byte_scopes(&spans, &window),
+                    byte_scopes(&full, &window),
+                    "{lang:?} {}: window {window:?} diverged from full path",
+                    path.display(),
+                );
+            }
+        }
+    }
+
+    /// Scrolling reuses the retained tree: a second query over a different
+    /// window with `source_changed = false` must not need a reparse and
+    /// still match the full path.
+    #[test]
+    fn windowed_highlight_reuses_tree_across_windows() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/sample.rs");
+        let src = std::fs::read(&path).unwrap();
+        let mut state = SyntaxState::new(Language::Rust).unwrap();
+        let full = state.highlight(&src).unwrap();
+        let w1 = 0..src.len() / 2;
+        let w2 = src.len() / 2..src.len();
+        let s1 = state.highlight_range(&src, w1.clone(), true).unwrap();
+        let s2 = state.highlight_range(&src, w2.clone(), false).unwrap();
+        assert_eq!(byte_scopes(&s1, &w1), byte_scopes(&full, &w1));
+        assert_eq!(byte_scopes(&s2, &w2), byte_scopes(&full, &w2));
+    }
+
+    #[test]
+    fn best_scope_matches_configure_semantics() {
+        // "function.method" has both parts of recognized "function.method".
+        let i = best_scope_for("function.method").unwrap();
+        assert_eq!(HIGHLIGHT_NAMES[i], "function.method");
+        // Parts are set-contained, not positional: "punctuation.definition"
+        // still matches "punctuation".
+        let i = best_scope_for("punctuation.definition").unwrap();
+        assert_eq!(HIGHLIGHT_NAMES[i], "punctuation");
+        // Unrecognized names map to nothing.
+        assert!(best_scope_for("spell").is_none());
+    }
 
     #[test]
     fn language_from_path_rust() {

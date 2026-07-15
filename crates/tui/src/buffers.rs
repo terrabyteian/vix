@@ -18,6 +18,7 @@ pub(crate) struct BufferSave {
     pub(crate) syntax: Option<SyntaxState>,
     pub(crate) syntax_cache: Vec<HlSpan>,
     pub(crate) syntax_version: Option<u64>,
+    pub(crate) syntax_window: Option<std::ops::Range<usize>>,
     pub(crate) pending_insert: Option<PendingInsert>,
     pub(crate) last_change: Option<RepeatAction>,
     /// Stable creation-order id. Survives swaps; used to render a steady
@@ -110,6 +111,7 @@ impl Editor {
     pub(crate) fn invalidate_syntax_cache(&mut self) {
         self.syntax_version = None;
         self.syntax_cache.clear();
+        self.syntax_window = None;
     }
 
     /// Snapshot the currently-active buffer for parking. Leaves placeholder
@@ -124,6 +126,7 @@ impl Editor {
             syntax: self.syntax.take(),
             syntax_cache: std::mem::take(&mut self.syntax_cache),
             syntax_version: self.syntax_version.take(),
+            syntax_window: self.syntax_window.take(),
             pending_insert: self.pending_insert.take(),
             last_change: self.last_change.take(),
             bid: self.active_bid,
@@ -140,6 +143,7 @@ impl Editor {
         self.syntax = save.syntax;
         self.syntax_cache = save.syntax_cache;
         self.syntax_version = save.syntax_version;
+        self.syntax_window = save.syntax_window;
         self.pending_insert = save.pending_insert;
         self.last_change = save.last_change;
         self.active_bid = save.bid;
@@ -264,6 +268,7 @@ impl Editor {
             syntax: None,
             syntax_cache: Vec::new(),
             syntax_version: None,
+            syntax_window: None,
             pending_insert: None,
             last_change: None,
             bid,
