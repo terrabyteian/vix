@@ -1,5 +1,4 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -38,17 +37,14 @@ pub(crate) fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let y = area.y + 1;
     let rect = Rect::new(x, y, w, h);
 
-    let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let bg = ed.theme.hover_bg;
     let blank: Vec<Line> = (0..h).map(|_| Line::raw(" ".repeat(w as usize))).collect();
     f.render_widget(Paragraph::new(blank).style(bg), rect);
 
     let mut lines: Vec<Line> = Vec::with_capacity(h as usize);
     lines.push(Line::styled(
         " hover ".to_string() + &" ".repeat((w as usize).saturating_sub(7)),
-        Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        ed.theme.hover_header,
     ));
     for l in wrapped.iter().take((h as usize).saturating_sub(2)) {
         let pad = (w as usize).saturating_sub(l.chars().count() + 1);
@@ -112,11 +108,8 @@ pub(crate) fn render_completion_popup(f: &mut ratatui::Frame, area: Rect, ed: &E
     }
     let rect = Rect::new(x, y, width, h);
 
-    let bg = Style::default().bg(Color::Rgb(30, 30, 40)).fg(Color::White);
-    let sel_bg = Style::default()
-        .bg(Color::Blue)
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
+    let bg = ed.theme.popup;
+    let sel_bg = ed.theme.popup_selected;
 
     // Scroll the visible slice so `selected` is always in view.
     let start = popup

@@ -1,5 +1,4 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -11,22 +10,10 @@ use crate::Editor;
 pub(crate) fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let (line, col) = ed.buffer.char_to_line_col(ed.sel.head);
     let mode_style = match ed.mode {
-        Mode::Normal => Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-        Mode::Insert => Style::default()
-            .bg(Color::Green)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD),
-        Mode::Visual | Mode::VisualLine => Style::default()
-            .bg(Color::Magenta)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD),
-        Mode::Command => Style::default()
-            .bg(Color::Yellow)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD),
+        Mode::Normal => ed.theme.mode_normal,
+        Mode::Insert => ed.theme.mode_insert,
+        Mode::Visual | Mode::VisualLine => ed.theme.mode_visual,
+        Mode::Command => ed.theme.mode_command,
     };
     let path = ed
         .buffer
@@ -58,11 +45,8 @@ pub(crate) fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor)
     let middle = format!(" {}{}{}", path, dirty, " ".repeat(middle_pad));
     let line_widget = Line::from(vec![
         Span::styled(left_mode, mode_style),
-        Span::styled(
-            middle,
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
-        Span::styled(right, Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(middle, ed.theme.statusline),
+        Span::styled(right, ed.theme.statusline),
     ]);
     f.render_widget(Paragraph::new(line_widget), area);
 }

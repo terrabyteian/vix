@@ -12,6 +12,7 @@ mod picker;
 mod render;
 mod search;
 pub mod testing;
+mod theme;
 mod util;
 
 pub use app::run;

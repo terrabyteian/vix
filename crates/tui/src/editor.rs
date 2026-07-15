@@ -18,6 +18,7 @@ use crate::completion::CompletionPopup;
 use crate::help;
 use crate::lsp::{LspDocState, PendingRequest};
 use crate::picker::{Picker, PickerItem};
+use crate::theme::Theme;
 
 /// What action triggered the current Insert session — determines how `.`
 /// will replay it on Esc.
@@ -164,6 +165,8 @@ pub struct Editor {
     /// when no grep is in flight. Pumped each tick from the run loop so
     /// results land on `picker.items` without blocking the UI thread.
     pub(crate) grep_pending: Option<std::sync::mpsc::Receiver<Vec<PickerItem>>>,
+    /// Centralized color/style palette. See `crate::theme`.
+    pub(crate) theme: Theme,
 }
 
 impl Editor {
@@ -218,6 +221,7 @@ impl Editor {
             preview_syntax: HashMap::new(),
             grep_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grep_pending: None,
+            theme: Theme::default_dark(),
         }
     }
 

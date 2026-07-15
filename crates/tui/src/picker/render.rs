@@ -8,9 +8,9 @@ use ratatui::widgets::Paragraph;
 use crate::picker::preview::refresh_preview;
 use crate::picker::{
     fit_picker_row, substring_match_smart, wrap_picker_detail, Picker, PickerItem, PickerKind,
-    PickerLayout, PickerValue, PICKER_ACCENT, PICKER_ACCENT_HI, PICKER_BORDER, PICKER_DIM,
+    PickerLayout, PickerValue,
 };
-use crate::render::content::scope_style;
+use crate::theme::Theme;
 use crate::util::{char_index_in_byte_range, count_chars, pad_or_trunc, take_end};
 use crate::Editor;
 
@@ -72,7 +72,7 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
     let overlay = Rect::new(x, y, w, h);
 
     // Clear background then draw prompt + list.
-    let bg = Style::default().bg(Color::Black).fg(Color::White);
+    let bg = ed.theme.picker_bg;
     let blank: Vec<Line> = (0..h).map(|_| Line::raw(" ".repeat(w as usize))).collect();
     f.render_widget(Paragraph::new(blank).style(bg), overlay);
 
@@ -95,15 +95,9 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
     );
     let header_pad = (w as usize).saturating_sub(prompt.len() + count.len());
     let header = Line::from(vec![
-        Span::styled(
-            prompt,
-            Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" ".repeat(header_pad), Style::default().bg(Color::DarkGray)),
-        Span::styled(count, Style::default().bg(Color::DarkGray).fg(Color::Gray)),
+        Span::styled(prompt, ed.theme.picker_header),
+        Span::styled(" ".repeat(header_pad), Style::default().bg(ed.theme.border)),
+        Span::styled(count, Style::default().bg(ed.theme.border).fg(ed.theme.dim)),
     ]);
 
     let selected_item = p
@@ -146,14 +140,7 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
             Some(&(item_idx, _)) => {
                 let item = &p.active_items()[item_idx];
                 let is_sel = idx == p.selected;
-                let style = if is_sel {
-                    Style::default()
-                        .bg(Color::Blue)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    bg
-                };
+                let style = if is_sel { ed.theme.picker_selected } else { bg };
                 // 2-char left gutter on Files/Grep so marks have somewhere
                 // to render. Other pickers don't support multi-select, so
                 // we leave their layout untouched.
@@ -180,7 +167,9 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
                     if let Some(hint) = &grep_hint {
                         lines.push(Line::from(Span::styled(
                             format!(" {hint}"),
-                            Style::default().bg(Color::Black).fg(PICKER_DIM),
+                            Style::default()
+                                .bg(ed.theme.picker_bg.bg.unwrap())
+                                .fg(ed.theme.dim),
                         )));
                         continue;
                     }
@@ -190,7 +179,7 @@ pub(crate) fn render_picker_overlay(f: &mut ratatui::Frame, area: Rect, ed: &mut
         }
     }
     if detail_rows > 0 {
-        let detail_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+        let detail_style = ed.theme.picker_detail;
         let inner_w = (w as usize).saturating_sub(2);
         let detail = selected_item
             .map(|item| item.display.as_str())
@@ -238,15 +227,15 @@ pub(crate) fn picker_preview_anchor_line(p: &Picker) -> usize {
 /// only source of redraw cadence here, but the run loop polls every 100ms,
 /// so colors change roughly twice per second when nothing else triggers a
 /// redraw.
-pub(crate) fn picker_pulse_accent() -> Color {
+pub(crate) fn picker_pulse_accent(theme: &Theme) -> Color {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     if (ms / 600) % 2 == 0 {
-        PICKER_ACCENT
+        theme.accent
     } else {
-        PICKER_ACCENT_HI
+        theme.accent_hi
     }
 }
 
@@ -258,6 +247,13 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     }
 
     refresh_preview(ed);
+
+    // Cloned up front: the match-highlight pass below needs `&mut p.scorer`
+    // alongside a borrow of the active item storage, which requires `p`
+    // itself to be a `&mut Picker` borrowed out of `ed.picker` — an owned
+    // `Theme` clone sidesteps holding a second, immutable `&ed` borrow
+    // alongside that for the rest of the function.
+    let theme = ed.theme.clone();
 
     // `&mut` (not `&ref`): the match-highlight pass below needs `&mut
     // p.scorer` alongside a borrow of the active item storage, which only
@@ -319,9 +315,9 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     let counts = format!(" {} / {} ", p.matches.len(), p.active_items().len());
     let bread = format!(" {}  ", cwd_disp);
     let active_style = Style::default()
-        .fg(picker_pulse_accent())
+        .fg(picker_pulse_accent(&theme))
         .add_modifier(Modifier::BOLD);
-    let inactive_style = Style::default().fg(PICKER_DIM);
+    let inactive_style = Style::default().fg(theme.dim);
     let tab_row = if is_buffers {
         // No Files↔Grep toggle here; show a single "Buffers" title.
         let title = " [Buffers] ";
@@ -331,13 +327,8 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
         Line::from(vec![
             Span::styled(title, active_style),
             Span::raw(" ".repeat(middle_pad)),
-            Span::styled(bread, Style::default().fg(PICKER_DIM)),
-            Span::styled(
-                counts,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(bread, Style::default().fg(theme.dim)),
+            Span::styled(counts, theme.picker_strong),
         ])
     } else {
         // " [Files]  Grep " or "  Files  [Grep] " — square brackets call out the active.
@@ -364,13 +355,8 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
                 },
             ),
             Span::raw(" ".repeat(middle_pad)),
-            Span::styled(bread, Style::default().fg(PICKER_DIM)),
-            Span::styled(
-                counts,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(bread, Style::default().fg(theme.dim)),
+            Span::styled(counts, theme.picker_strong),
         ])
     };
     f.render_widget(
@@ -380,7 +366,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
 
     // --- Row 1: prompt -------------------------------------------------------
     let arrow_style = Style::default()
-        .fg(picker_pulse_accent())
+        .fg(picker_pulse_accent(&theme))
         .add_modifier(Modifier::BOLD);
     // The picker is always in typing mode, so the caret always blinks.
     let caret = {
@@ -397,13 +383,8 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     let prompt_line = Line::from(vec![
         Span::raw(" "),
         Span::styled("❯ ", arrow_style),
-        Span::styled(
-            p.query.clone(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(caret, Style::default().fg(picker_pulse_accent())),
+        Span::styled(p.query.clone(), theme.picker_strong),
+        Span::styled(caret, Style::default().fg(picker_pulse_accent(&theme))),
     ]);
     f.render_widget(
         Paragraph::new(prompt_line),
@@ -413,7 +394,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     // --- Row 2: top separator ------------------------------------------------
     let sep = Line::from(Span::styled(
         "─".repeat(w),
-        Style::default().fg(PICKER_BORDER),
+        Style::default().fg(theme.border),
     ));
     f.render_widget(
         Paragraph::new(sep.clone()),
@@ -466,7 +447,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
                 if let Some(hint) = &grep_hint {
                     list_lines.push(Line::from(Span::styled(
                         format!("   {hint}"),
-                        Style::default().fg(PICKER_DIM),
+                        Style::default().fg(theme.dim),
                     )));
                     continue;
                 }
@@ -478,10 +459,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
         let is_sel = match_idx == selected;
         let is_marked = p.marked.contains(&item_idx);
         let row_style = if is_sel {
-            Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
+            theme.picker_selected
         } else {
             Style::default()
         };
@@ -527,7 +505,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
         spans.push(Span::styled(
             mark_glyph.to_string(),
             if is_marked && !is_sel {
-                Style::default().fg(picker_pulse_accent())
+                Style::default().fg(picker_pulse_accent(&theme))
             } else {
                 row_style
             },
@@ -540,12 +518,12 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
                 let style = if highlight_chars.contains(&i) {
                     if is_sel {
                         Style::default()
-                            .bg(Color::Blue)
-                            .fg(Color::Yellow)
+                            .bg(theme.picker_selected.bg.unwrap())
+                            .fg(theme.match_hi)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme.match_hi)
                             .add_modifier(Modifier::BOLD)
                     }
                 } else {
@@ -570,7 +548,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     // --- Body: vertical separator + preview pane -----------------------------
     if split_enabled {
         let sep_col_lines: Vec<Line> = (0..body_h)
-            .map(|_| Line::from(Span::styled("│", Style::default().fg(PICKER_BORDER))))
+            .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.border))))
             .collect();
         f.render_widget(
             Paragraph::new(sep_col_lines),
@@ -586,6 +564,7 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
                 body_h as u16,
             ),
             p,
+            &theme,
         );
     }
 
@@ -604,12 +583,12 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
     };
     let footer_pad = w.saturating_sub(count_chars(&footer_body) + count_chars(&mark_status));
     let footer_line = Line::from(vec![
-        Span::styled(footer_body, Style::default().fg(PICKER_DIM)),
+        Span::styled(footer_body, Style::default().fg(theme.dim)),
         Span::raw(" ".repeat(footer_pad)),
         Span::styled(
             mark_status,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.match_hi)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -634,7 +613,12 @@ pub(crate) fn render_picker_fullscreen(f: &mut ratatui::Frame, area: Rect, ed: &
 
 /// Draw the preview pane for the highlighted Files/Grep row. Caller positions
 /// the rect; we own every cell inside it.
-pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: &Picker) {
+pub(crate) fn render_picker_preview_pane(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    p: &Picker,
+    theme: &Theme,
+) {
     let w = area.width as usize;
     let h = area.height as usize;
     if w < 8 || h < 3 {
@@ -662,7 +646,7 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
     let header_line = Line::from(Span::styled(
         header_text,
         Style::default()
-            .fg(PICKER_ACCENT)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(
@@ -671,7 +655,7 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
     );
     let rule = Line::from(Span::styled(
         "─".repeat(w),
-        Style::default().fg(PICKER_BORDER),
+        Style::default().fg(theme.border),
     ));
     f.render_widget(
         Paragraph::new(rule),
@@ -708,7 +692,7 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
         if line_idx >= cache.lines.len() {
             body_lines.push(Line::from(Span::styled(
                 "~",
-                Style::default().fg(PICKER_BORDER),
+                Style::default().fg(theme.border),
             )));
             continue;
         }
@@ -728,7 +712,7 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
             );
 
         let row_bg = if is_hit_line {
-            Some(Color::DarkGray)
+            Some(theme.border)
         } else {
             None
         };
@@ -737,11 +721,11 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
         let num_text_chars = count_chars(&num_text);
         let num_style = if is_hit_line {
             Style::default()
-                .bg(Color::DarkGray)
-                .fg(picker_pulse_accent())
+                .bg(theme.border)
+                .fg(picker_pulse_accent(theme))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(PICKER_BORDER)
+            Style::default().fg(theme.border)
         };
         row_spans.push(Span::styled(num_text, num_style));
 
@@ -753,7 +737,7 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
         if cache.placeholder {
             row_spans.push(Span::styled(
                 line_text.clone(),
-                Style::default().fg(PICKER_DIM),
+                Style::default().fg(theme.dim),
             ));
         } else {
             // Build per-char styles for visible chars only.
@@ -762,7 +746,7 @@ pub(crate) fn render_picker_preview_pane(f: &mut ratatui::Frame, area: Rect, p: 
                 if s.range.end <= line_byte_start || s.range.start >= line_text_byte_end {
                     continue;
                 }
-                let Some(style) = scope_style(s.scope) else {
+                let Some(style) = theme.scope_styles.get(s.scope).copied().flatten() else {
                     continue;
                 };
                 let line_chars_start = char_index_in_byte_range(

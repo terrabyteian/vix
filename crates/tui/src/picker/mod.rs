@@ -1,6 +1,5 @@
 //! Picker overlay: types, pure state, and small helpers shared by the
 //! `input`, `preview`, and `render` submodules.
-use ratatui::style::Color;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -528,11 +527,6 @@ pub(crate) fn substring_match_smart(haystack: &str, query: &str) -> Option<usize
     }
     None
 }
-
-pub(crate) const PICKER_ACCENT: Color = Color::Cyan;
-pub(crate) const PICKER_ACCENT_HI: Color = Color::LightCyan;
-pub(crate) const PICKER_BORDER: Color = Color::DarkGray;
-pub(crate) const PICKER_DIM: Color = Color::Gray;
 
 /// Cap the file size we'll attempt to read for previews. Keeps a single
 /// keystroke from triggering a multi-MB read on a stray binary.

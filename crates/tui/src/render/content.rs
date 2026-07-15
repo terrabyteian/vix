@@ -1,42 +1,15 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::collections::HashMap;
 
 use vix_core::{compile_search, find_all_in_lines, Case, Mode};
 use vix_lsp::lsp_types::DiagnosticSeverity;
-use vix_syntax::{HlSpan, HIGHLIGHT_NAMES};
+use vix_syntax::HlSpan;
 
 use crate::lsp::sev_rank;
 use crate::Editor;
-
-/// Translate a tree-sitter highlight scope index into a ratatui style.
-/// Returns `None` for unstyled ("default foreground") scopes.
-pub(crate) fn scope_style(scope_idx: usize) -> Option<Style> {
-    let name = HIGHLIGHT_NAMES.get(scope_idx)?;
-    let color = if name.starts_with("keyword") {
-        Color::Magenta
-    } else if name.starts_with("function") {
-        Color::LightBlue
-    } else if name.starts_with("type") {
-        Color::Cyan
-    } else if name.starts_with("string") {
-        Color::LightYellow
-    } else if name.starts_with("constant") {
-        Color::LightRed
-    } else {
-        match *name {
-            "comment" => Color::DarkGray,
-            "attribute" | "constructor" => Color::LightMagenta,
-            "namespace" | "label" => Color::Yellow,
-            "property" => Color::LightCyan,
-            "tag" => Color::LightGreen,
-            _ => return None,
-        }
-    };
-    Some(Style::default().fg(color))
-}
 
 pub(crate) fn render_content(
     f: &mut ratatui::Frame,
@@ -53,6 +26,22 @@ pub(crate) fn render_content(
     ed.last_gutter_cols = (gutter_width + 2) as u16;
 
     let (cursor_line, cursor_col) = ed.buffer.char_to_line_col(ed.sel.head);
+
+    // Theme values used inside the per-row loop below. Copied out up front
+    // (Style is Copy) so the loop's read-only borrows of `ed` don't have to
+    // fight a live `&ed.theme.field` borrow at each use site.
+    let theme_tilde = ed.theme.tilde;
+    let theme_gutter = ed.theme.gutter;
+    let theme_diag_error = ed.theme.diag_error;
+    let theme_diag_warn = ed.theme.diag_warn;
+    let theme_diag_info = ed.theme.diag_info;
+    let theme_diag_hint = ed.theme.diag_hint;
+    let theme_diag_none = ed.theme.diag_none;
+    let theme_search_hl = ed.theme.search_hl;
+    let theme_selection = ed.theme.selection;
+    let theme_yank_flash = ed.theme.yank_flash;
+    let theme_cursor_normal = ed.theme.cursor_normal;
+    let theme_cursor_insert = ed.theme.cursor_insert;
 
     // Per-line diagnostic severity map for the active buffer.
     let diag_by_line: HashMap<usize, DiagnosticSeverity> = {
@@ -94,24 +83,21 @@ pub(crate) fn render_content(
     for screen_row in 0..rows {
         let line_idx = ed.view_top + screen_row;
         if line_idx >= total_lines {
-            lines.push(Line::from(Span::styled(
-                "~",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(Span::styled("~", theme_tilde)));
             continue;
         }
 
         let num = format!("{:>width$} ", line_idx + 1, width = gutter_width - 1);
-        let mut spans = vec![Span::styled(num, Style::default().fg(Color::DarkGray))];
+        let mut spans = vec![Span::styled(num, theme_gutter)];
         // Diagnostic indicator column (one char).
-        let (glyph, color) = match diag_by_line.get(&line_idx) {
-            Some(&DiagnosticSeverity::ERROR) => ("●", Color::Red),
-            Some(&DiagnosticSeverity::WARNING) => ("●", Color::Yellow),
-            Some(&DiagnosticSeverity::INFORMATION) => ("●", Color::Cyan),
-            Some(&DiagnosticSeverity::HINT) => ("○", Color::Gray),
-            Some(_) | None => (" ", Color::Reset),
+        let (glyph, style) = match diag_by_line.get(&line_idx) {
+            Some(&DiagnosticSeverity::ERROR) => ("●", theme_diag_error),
+            Some(&DiagnosticSeverity::WARNING) => ("●", theme_diag_warn),
+            Some(&DiagnosticSeverity::INFORMATION) => ("●", theme_diag_info),
+            Some(&DiagnosticSeverity::HINT) => ("○", theme_diag_hint),
+            Some(_) | None => (" ", theme_diag_none),
         };
-        spans.push(Span::styled(glyph.to_string(), Style::default().fg(color)));
+        spans.push(Span::styled(glyph.to_string(), style));
         spans.push(Span::raw(" "));
 
         let line_start_char = ed.buffer.line_to_char(line_idx);
@@ -137,7 +123,7 @@ pub(crate) fn render_content(
                 let e_byte = span.range.end.min(line_end_byte);
                 let s_col = rope.byte_to_char(s_byte) - line_start_char;
                 let e_col = rope.byte_to_char(e_byte) - line_start_char;
-                let style = match scope_style(span.scope) {
+                let style = match ed.theme.scope_styles.get(span.scope).copied().flatten() {
                     Some(s) => s,
                     None => continue,
                 };
@@ -148,7 +134,7 @@ pub(crate) fn render_content(
         }
 
         // Apply search highlights that overlap this line.
-        let hl_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+        let hl_style = theme_search_hl;
         for &(s, e) in &highlights {
             let rel_s = s.saturating_sub(line_start_char);
             let rel_e = e.saturating_sub(line_start_char).min(chars.len());
@@ -163,7 +149,7 @@ pub(crate) fn render_content(
         // Apply visual selection highlight (layered over search highlight).
         if matches!(ed.mode, Mode::Visual | Mode::VisualLine) {
             let vrange = ed.visual_range();
-            let sel_style = Style::default().bg(Color::Blue).fg(Color::White);
+            let sel_style = theme_selection;
             if vrange.start < line_start_char + chars.len() + 1 && vrange.end > line_start_char {
                 let rel_s = vrange.start.saturating_sub(line_start_char);
                 let rel_e = vrange.end.saturating_sub(line_start_char).min(chars.len());
@@ -176,7 +162,7 @@ pub(crate) fn render_content(
 
         // Yank-flash highlight: brief overlay on the yanked range.
         if let Some((yr, _)) = ed.yank_flash.as_ref() {
-            let flash_style = Style::default().bg(Color::LightYellow).fg(Color::Black);
+            let flash_style = theme_yank_flash;
             if yr.start < line_start_char + chars.len() + 1 && yr.end > line_start_char {
                 let rel_s = yr.start.saturating_sub(line_start_char).min(chars.len());
                 let rel_e = yr.end.saturating_sub(line_start_char).min(chars.len());
@@ -193,10 +179,8 @@ pub(crate) fn render_content(
             let base = styles[i];
             let style = if is_cursor {
                 Some(match ed.mode {
-                    Mode::Insert => Style::default()
-                        .add_modifier(Modifier::UNDERLINED)
-                        .fg(Color::White),
-                    _ => Style::default().add_modifier(Modifier::REVERSED),
+                    Mode::Insert => theme_cursor_insert,
+                    _ => theme_cursor_normal,
                 })
             } else {
                 base
@@ -222,10 +206,8 @@ pub(crate) fn render_content(
         // If cursor is past the end of the line, draw a cursor placeholder.
         if line_idx == cursor_line && cursor_col >= chars.len() {
             let cursor_style = match ed.mode {
-                Mode::Insert => Style::default()
-                    .add_modifier(Modifier::UNDERLINED)
-                    .fg(Color::White),
-                _ => Style::default().add_modifier(Modifier::REVERSED),
+                Mode::Insert => theme_cursor_insert,
+                _ => theme_cursor_normal,
             };
             spans.push(Span::styled(" ", cursor_style));
         }
