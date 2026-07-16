@@ -86,13 +86,23 @@ if [ ! -d "$INSTALL_DIR" ]; then
 fi
 
 if [ -w "$INSTALL_DIR" ]; then
-  cp "${TMP}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
-  chmod +x "${INSTALL_DIR}/${BINARY}"
+  SUDO=""
 else
   echo "==> ${INSTALL_DIR} is not writable — using sudo"
-  sudo cp "${TMP}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
-  sudo chmod +x "${INSTALL_DIR}/${BINARY}"
+  SUDO="sudo"
 fi
+
+# Stage inside INSTALL_DIR so the final step is a same-filesystem rename().
+# Copying over the existing binary would reuse its inode, and macOS caches a
+# binary's code signature per inode: the kernel would check the new bytes
+# against the old cached hash and SIGKILL it at exec as "Code Signature
+# Invalid". A rename gives the new binary its own inode.
+STAGE="${INSTALL_DIR}/.${BINARY}.new.$$"
+trap 'rm -rf "$TMP"; $SUDO rm -f "$STAGE"' EXIT
+
+$SUDO cp "${TMP}/${BINARY}" "$STAGE"
+$SUDO chmod 755 "$STAGE"
+$SUDO mv -f "$STAGE" "${INSTALL_DIR}/${BINARY}"
 
 echo "==> Installed: $(command -v ${BINARY} || echo ${INSTALL_DIR}/${BINARY})"
 "${INSTALL_DIR}/${BINARY}" --version
