@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
-use grep_regex::RegexMatcher;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{sinks::UTF8, Searcher};
 use ignore::{WalkBuilder, WalkState};
 use nucleo_matcher::{
@@ -121,7 +121,20 @@ pub fn scan_files_streaming(
     }
 }
 
-/// Recursively grep `root` for `pattern`. Returns per-line matches.
+/// Build a literal smart-case substring matcher for `pattern`: no regex
+/// metacharacters are special (`.`, `*`, `(`, etc. all match themselves),
+/// and case sensitivity follows the query — all-lowercase matches
+/// case-insensitively, any uppercase char makes it case-sensitive. Shared by
+/// every grep entry point so their matching semantics never drift apart.
+fn literal_matcher(pattern: &str) -> anyhow::Result<RegexMatcher> {
+    Ok(RegexMatcherBuilder::new()
+        .fixed_strings(true)
+        .case_smart(true)
+        .build(pattern)?)
+}
+
+/// Recursively grep `root` for `pattern` as a literal smart-case substring
+/// (not a regex — see [`literal_matcher`]). Returns per-line matches.
 ///
 /// Uses `WalkParallel` and one `Searcher` per worker thread, the same
 /// pattern ripgrep itself uses. Worker threads send hits over an mpsc
@@ -144,7 +157,7 @@ pub fn grep_streaming(
 ) -> anyhow::Result<()> {
     const GREP_BATCH: usize = 200;
     const GREP_FLUSH_MS: u64 = 30;
-    let matcher = Arc::new(RegexMatcher::new(pattern)?);
+    let matcher = Arc::new(literal_matcher(pattern)?);
     let root: Arc<Path> = Arc::from(root.to_path_buf().into_boxed_path());
     let (tx, rx) = mpsc::channel::<GrepItem>();
 
@@ -256,7 +269,7 @@ pub fn grep_cancellable(
     current: &Arc<AtomicU64>,
     target_gen: u64,
 ) -> anyhow::Result<Vec<GrepItem>> {
-    let matcher = Arc::new(RegexMatcher::new(pattern)?);
+    let matcher = Arc::new(literal_matcher(pattern)?);
     let root: Arc<Path> = Arc::from(root.to_path_buf().into_boxed_path());
     let (tx, rx) = mpsc::channel::<GrepItem>();
 
@@ -582,5 +595,66 @@ mod tests {
         full.sort();
         streamed.sort();
         assert_eq!(full, streamed);
+    }
+
+    /// A pattern containing a regex metacharacter must match only the
+    /// literal text, not the metacharacter's regex meaning — `a.b` should
+    /// hit a line with literal `a.b` and not a line with `axb` (which a
+    /// real regex `.` would also match).
+    #[test]
+    fn grep_matches_pattern_literally_not_as_regex() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-grep-literal-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("dot.txt"), "has a.b in it\n").unwrap();
+        fs::write(dir.join("nodot.txt"), "has axb in it\n").unwrap();
+
+        let hits = grep(&dir, "a.b").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected only the literal a.b line; got {hits:?}"
+        );
+        assert!(hits[0].text.contains("a.b"));
+    }
+
+    /// Smart-case: an all-lowercase pattern matches case-insensitively.
+    #[test]
+    fn grep_lowercase_pattern_matches_case_insensitively() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("vix-grep-smartcase-lo-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.txt"), "found NEEDLE here\n").unwrap();
+
+        let hits = grep(&dir, "needle").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "lowercase query should match uppercase text; got {hits:?}"
+        );
+    }
+
+    /// Smart-case: a pattern with an uppercase char matches case-sensitively,
+    /// so it must not match a line that only has the lowercase spelling.
+    #[test]
+    fn grep_mixed_case_pattern_matches_case_sensitively() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("vix-grep-smartcase-hi-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.txt"), "found needle here\n").unwrap();
+
+        let hits = grep(&dir, "Needle").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            hits.is_empty(),
+            "uppercase-containing query must not match lowercase-only text; got {hits:?}"
+        );
     }
 }

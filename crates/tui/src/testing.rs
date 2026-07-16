@@ -24,13 +24,13 @@ impl Default for Harness {
 impl Harness {
     pub fn new() -> Self {
         Self {
-            editor: Editor::new(Buffer::empty()),
+            editor: Self::hermetic(Editor::new(Buffer::empty())),
         }
     }
 
     pub fn with_text(text: &str) -> Self {
         Self {
-            editor: Editor::new(Buffer::from_text(text)),
+            editor: Self::hermetic(Editor::new(Buffer::from_text(text))),
         }
     }
 
@@ -41,8 +41,22 @@ impl Harness {
         let mut buffer = Buffer::from_text(text);
         buffer.set_path(path.into());
         Self {
-            editor: Editor::new(buffer),
+            editor: Self::hermetic(Editor::new(buffer)),
         }
+    }
+
+    /// Strip real-world side effects an `Editor` picks up at construction
+    /// time so tests never touch the user's actual data. Currently just the
+    /// recent-files store; extend here as more such state appears.
+    fn hermetic(mut editor: Editor) -> Editor {
+        editor.recent_data_file = None;
+        editor
+    }
+
+    /// Point the harness's editor at a specific recent-files store, for
+    /// tests that want to exercise that path deliberately.
+    pub fn set_recent_data_file(&mut self, p: PathBuf) {
+        self.editor.recent_data_file = Some(p);
     }
 
     /// Send a vim-style key sequence: plain chars become `Char` events;
@@ -138,6 +152,17 @@ impl Harness {
 
     pub fn quit_requested(&self) -> bool {
         self.editor.quit
+    }
+
+    /// Simulate `app::run`'s launch branch: arm the one-shot launch flags
+    /// (`discard_active_on_swap`, `quit_on_picker_close`) and open the
+    /// omnibox exactly as `vix` does when invoked with no file / a
+    /// directory. Lets tests exercise "Esc at launch quits" without a real
+    /// terminal loop.
+    pub fn open_launch_picker(&mut self) {
+        self.editor.discard_active_on_swap = true;
+        self.editor.quit_on_picker_close = true;
+        self.editor.open_files_picker();
     }
 
     pub fn active_language(&self) -> Option<vix_syntax::Language> {

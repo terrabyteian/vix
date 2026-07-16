@@ -36,6 +36,7 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
     ed.ensure_lsp_open();
     if open_files_picker {
         ed.discard_active_on_swap = true;
+        ed.quit_on_picker_close = true;
         ed.open_files_picker();
     }
     let result = (|| -> io::Result<()> {

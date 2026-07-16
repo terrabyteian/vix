@@ -9,8 +9,8 @@ use vix_picker::{grep_streaming, scan_files_streaming, Utf32String};
 use vix_syntax::{Language, Symbol, SyntaxState};
 
 use crate::picker::{
-    file_item_to_picker_item, grep_hit_to_picker_item, PendingSource, Picker, PickerItem,
-    PickerKind, PickerValue, PICKER_REFRESH_DEBOUNCE_MS,
+    file_item_to_picker_item, grep_hit_to_picker_item, ItemRef, PendingSource, Picker, PickerItem,
+    PickerKind, PickerValue, SourceFilter, MIN_CONTENT_QUERY_LEN, PICKER_REFRESH_DEBOUNCE_MS,
 };
 use crate::Editor;
 
@@ -22,8 +22,9 @@ pub(crate) enum PickerAction {
     Close,
     Select(PickerValue),
     SelectMany(Vec<PickerValue>),
-    Toggle,
-    // Re-score (Files) or re-grep (Grep) after the query changed.
+    /// `<Tab>`: cycle the omni source filter All → Files → Content → All.
+    CycleFilter,
+    // Re-score / re-grep after the query changed.
     Refresh,
     // Buffer-picker management actions; idx is into the buffer list
     // (0 = active, 1.. = parked), not the picker match list.
@@ -44,8 +45,8 @@ enum BufOp {
 /// `PickerAction::None` if the row isn't a `BufferIndex` (shouldn't happen
 /// for the Buffers kind, but keeps this total).
 fn buffer_op_action(p: &Picker, op: BufOp) -> PickerAction {
-    let idx = p.matches.get(p.selected).and_then(|&(item_idx, _)| {
-        if let PickerValue::BufferIndex(idx) = p.active_items()[item_idx].value {
+    let idx = p.matches.get(p.selected).and_then(|&(r, _)| {
+        if let PickerValue::BufferIndex(idx) = p.item(r).value {
             Some(idx)
         } else {
             None
@@ -63,19 +64,19 @@ fn buffer_op_action(p: &Picker, op: BufOp) -> PickerAction {
 /// `picker_key_action`'s `KeyCode::Enter` arm.
 fn enter_action(p: &Picker) -> PickerAction {
     if !p.marked.is_empty() {
-        // Batch-open: collect marked items in match order so the
-        // last-marked-in-list ends up active. Items not currently visible
-        // (filtered out by the live query) are still picked up — we walk
-        // all items, not just the match list.
+        // Batch-open: collect marked refs in match order so the
+        // last-marked-in-list ends up active. Marks not currently visible
+        // (filtered out by the live query or source filter) are still picked
+        // up — we walk all marks, not just the match list.
         let mut values: Vec<PickerValue> = p
             .matches
             .iter()
-            .filter(|(item_idx, _)| p.marked.contains(item_idx))
-            .map(|(item_idx, _)| p.active_items()[*item_idx].value.clone())
+            .filter(|(r, _)| p.marked.contains(r))
+            .map(|(r, _)| p.item(*r).value.clone())
             .collect();
-        for &item_idx in &p.marked {
-            if !p.matches.iter().any(|(i, _)| *i == item_idx) {
-                values.push(p.active_items()[item_idx].value.clone());
+        for &r in &p.marked {
+            if !p.matches.iter().any(|(x, _)| *x == r) {
+                values.push(p.item(r).value.clone());
             }
         }
         if values.is_empty() {
@@ -83,8 +84,8 @@ fn enter_action(p: &Picker) -> PickerAction {
         } else {
             PickerAction::SelectMany(values)
         }
-    } else if let Some(&(idx, _)) = p.matches.get(p.selected) {
-        PickerAction::Select(p.active_items()[idx].value.clone())
+    } else if let Some(&(r, _)) = p.matches.get(p.selected) {
+        PickerAction::Select(p.item(r).value.clone())
     } else {
         PickerAction::Close
     }
@@ -132,8 +133,8 @@ pub(crate) fn picker_key_action(p: &mut Picker, k: KeyEvent) -> PickerAction {
         KeyCode::Esc => return PickerAction::Close,
         KeyCode::Char('c') if ctrl => return PickerAction::Close,
         KeyCode::Tab => {
-            return if supports_marks {
-                PickerAction::Toggle
+            return if matches!(p.kind, PickerKind::Omni) {
+                PickerAction::CycleFilter
             } else {
                 PickerAction::None
             };
@@ -175,9 +176,9 @@ pub(crate) fn picker_key_action(p: &mut Picker, k: KeyEvent) -> PickerAction {
         // apply to kinds that support batch-open.
         KeyCode::Char(' ') if ctrl => {
             if supports_marks {
-                if let Some(&(item_idx, _)) = p.matches.get(p.selected) {
-                    if !p.marked.insert(item_idx) {
-                        p.marked.remove(&item_idx);
+                if let Some(&(r, _)) = p.matches.get(p.selected) {
+                    if !p.marked.insert(r) {
+                        p.marked.remove(&r);
                     }
                 }
                 p.move_selection(1);
@@ -246,9 +247,9 @@ pub(crate) fn label_for_buffer(buf: &Buffer, idx: usize, active: bool) -> String
 
 impl Editor {
     /// If the picker's query has been dirty for at least
-    /// `PICKER_REFRESH_DEBOUNCE_MS`, fire the pending refresh. Files
-    /// rescore on the main thread (cheap); Grep dispatches to a worker
-    /// thread so the disk walk doesn't stall typing.
+    /// `PICKER_REFRESH_DEBOUNCE_MS`, fire the pending refresh. File names
+    /// rescore on the main thread (cheap); a content search dispatches to a
+    /// worker thread so the disk walk doesn't stall typing.
     pub(crate) fn flush_picker_query_if_due(&mut self) {
         let due = match self.picker.as_ref().and_then(|p| p.query_dirty_at) {
             Some(t) => {
@@ -265,25 +266,32 @@ impl Editor {
         } else {
             return;
         }
-        let is_grep = matches!(
-            self.picker.as_ref().map(|p| &p.kind),
-            Some(PickerKind::Grep)
-        );
-        if is_grep {
+        // Omni: restart the content walk whenever its cache is stale and the
+        // Content source is visible. `start_grep_stream` clears stale hits
+        // and gates the actual walk on `MIN_CONTENT_QUERY_LEN`, so backspacing
+        // below the threshold clears content rows without walking, and the
+        // file rescore inside still fires so name results update instantly.
+        // Everything else (and a warm content cache) just rescores.
+        let restart_content = self.picker.as_ref().is_some_and(|p| {
+            matches!(p.kind, PickerKind::Omni)
+                && p.filter != SourceFilter::Files
+                && p.last_grep_query.as_deref() != Some(p.query.as_str())
+        });
+        if restart_content {
             self.start_grep_stream();
         } else if let Some(p) = self.picker.as_mut() {
             p.rescore_query_changed();
         }
         // The debounced refresh just changed the match list (or kicked off a
-        // grep whose "scanning…" state should show).
+        // content walk whose "scanning…" state should show).
         self.request_redraw();
     }
 
     /// Force-run the deferred rescore right now. Used on commit-style
-    /// events (Enter, mouse click). In-memory kinds rescore synchronously
-    /// (cheap) so the commit reads matches for the query as typed; Grep
-    /// follows fzf semantics instead — *Enter acts on what's on screen* —
-    /// so a dirty query is simply dropped rather than re-walked.
+    /// events (Enter, mouse click). File names rescore synchronously (cheap)
+    /// so the commit reads matches for the query as typed; the content walk
+    /// follows fzf semantics instead — *Enter acts on what's on screen* — so
+    /// a dirty query is simply dropped rather than re-walked.
     pub(crate) fn flush_picker_query_now(&mut self) {
         let dirty = self
             .picker
@@ -294,11 +302,9 @@ impl Editor {
         } else {
             return;
         }
-        let is_grep = matches!(
-            self.picker.as_ref().map(|p| &p.kind),
-            Some(PickerKind::Grep)
-        );
-        if dirty && !is_grep {
+        // Synchronous rescore picks up file-name matches for the just-typed
+        // query; the content source is left as-is (fzf: act on what's shown).
+        if dirty {
             if let Some(p) = self.picker.as_mut() {
                 p.rescore_query_changed();
             }
@@ -334,13 +340,17 @@ impl Editor {
         });
     }
 
-    /// Spawn the streaming grep worker for the picker's current query.
-    /// Clears the previous query's hits immediately (they're stale), then
-    /// batches stream in via `pump_picker_sources`. Queries shorter than
-    /// `min_query_len` just clear — no walk.
+    /// Spawn the streaming content-search (grep) worker for the omni
+    /// picker's current query. Clears the previous query's hits immediately
+    /// (they're stale) and drops any now-invalid content marks, then batches
+    /// stream in via `pump_picker_sources`. Queries shorter than
+    /// `MIN_CONTENT_QUERY_LEN` just clear — no walk. No-op unless the omni
+    /// picker's filter has the Content source visible.
     pub(crate) fn start_grep_stream(&mut self) {
         let query = match self.picker.as_ref() {
-            Some(p) if matches!(p.kind, PickerKind::Grep) => p.query.clone(),
+            Some(p) if matches!(p.kind, PickerKind::Omni) && p.filter != SourceFilter::Files => {
+                p.query.clone()
+            }
             _ => return,
         };
         // Cancel any in-flight grep; stale batches also fail the receiver-side
@@ -350,12 +360,17 @@ impl Editor {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
         self.grep_source = None;
-        let run = query.len() >= PickerKind::Grep.spec().min_query_len;
+        let run = query.trim().chars().count() >= MIN_CONTENT_QUERY_LEN;
         if let Some(p) = self.picker.as_mut() {
             p.grep_items.clear();
-            p.marked.clear();
+            p.grep_match_count = 0;
+            // The grep source is being replaced, so any `Grep(_)` marks now
+            // point at the wrong rows; file/other marks survive.
+            p.marked.retain(|r| !matches!(r, ItemRef::Grep(_)));
             p.grep_items_complete = !run;
             p.last_grep_query = Some(query.clone());
+            // Rescore now so file-name results update instantly while the
+            // content walk restarts underneath.
             p.rescore_query_changed();
         }
         if !run {
@@ -423,7 +438,7 @@ impl Editor {
     }
 
     /// Append one scan batch to `file_items` (if it's still wanted) and
-    /// extend the match list in place when the Files tab is active.
+    /// extend the omni match list in place.
     fn apply_files_batch(&mut self, batch: Vec<PickerItem>, gen: u64) {
         // Receiver-side generation check: a bump (close/reopen) after the
         // worker's own check but before this pump must not apply.
@@ -431,11 +446,11 @@ impl Editor {
             self.files_source = None;
             return;
         }
-        let unified = matches!(
+        let is_omni = matches!(
             self.picker.as_ref().map(|p| &p.kind),
-            Some(PickerKind::Files | PickerKind::Grep)
+            Some(PickerKind::Omni)
         );
-        if !unified {
+        if !is_omni {
             // Picker closed or switched to an unrelated kind: cancel the walk.
             self.files_source = None;
             self.files_gen
@@ -445,26 +460,24 @@ impl Editor {
         if let Some(p) = self.picker.as_mut() {
             let from_idx = p.file_items.len();
             p.file_items.extend(batch);
-            if matches!(p.kind, PickerKind::Files) {
-                p.append_matches(from_idx);
-            }
+            p.append_file_matches(from_idx);
         }
         // New rows (or at least a new total in the counts line).
         self.request_redraw();
     }
 
     /// Append one grep batch to `grep_items` (if it's still wanted) and
-    /// extend the match list in place when the Grep tab is active.
+    /// extend the omni match list in place.
     fn apply_grep_batch(&mut self, batch: Vec<PickerItem>, gen: u64) {
         if gen != self.grep_gen.load(std::sync::atomic::Ordering::SeqCst) {
             self.grep_source = None;
             return;
         }
-        let unified = matches!(
+        let is_omni = matches!(
             self.picker.as_ref().map(|p| &p.kind),
-            Some(PickerKind::Files | PickerKind::Grep)
+            Some(PickerKind::Omni)
         );
-        if !unified {
+        if !is_omni {
             self.grep_source = None;
             self.grep_gen
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -473,22 +486,20 @@ impl Editor {
         if let Some(p) = self.picker.as_mut() {
             let from_idx = p.grep_items.len();
             p.grep_items.extend(batch);
-            if matches!(p.kind, PickerKind::Grep) {
-                p.append_matches(from_idx);
-            }
+            p.append_grep_matches(from_idx);
         }
         self.request_redraw();
     }
 
     /// The scan worker hung up: everything is delivered. Apply the one-time
     /// ranked re-sort for a live query (streamed hits sat at the end in
-    /// arrival order), keeping the highlight on the same item.
+    /// arrival order), keeping the highlight on the same ref.
     fn finish_files_source(&mut self) {
         self.files_source = None;
         if let Some(p) = self.picker.as_mut() {
             p.file_items_complete = true;
-            if matches!(p.kind, PickerKind::Files) && !p.query.trim().is_empty() {
-                p.rescore_files_preserving_selection();
+            if matches!(p.kind, PickerKind::Omni) && !p.query.trim().is_empty() {
+                p.rescore_omni_preserving_selection();
             }
         }
         // The "scanning…" indicator drops (and the re-sort may have
@@ -500,6 +511,12 @@ impl Editor {
         self.grep_source = None;
         if let Some(p) = self.picker.as_mut() {
             p.grep_items_complete = true;
+            // Grep hits streamed in at the end in arrival order; fold them
+            // into the ranked blend now (below the file hits), keeping the
+            // highlight where it is.
+            if matches!(p.kind, PickerKind::Omni) {
+                p.rescore_omni_preserving_selection();
+            }
         }
         self.request_redraw();
     }
@@ -580,11 +597,12 @@ impl Editor {
             if let Some(p) = self.picker.as_mut() {
                 p.query_dirty_at = None;
             }
-            let is_grep = matches!(
-                self.picker.as_ref().map(|p| &p.kind),
-                Some(PickerKind::Grep)
-            );
-            if is_grep {
+            let restart_content = self.picker.as_ref().is_some_and(|p| {
+                matches!(p.kind, PickerKind::Omni)
+                    && p.filter != SourceFilter::Files
+                    && p.last_grep_query.as_deref() != Some(p.query.as_str())
+            });
+            if restart_content {
                 self.start_grep_stream();
             } else if let Some(p) = self.picker.as_mut() {
                 p.rescore_query_changed();
@@ -593,68 +611,100 @@ impl Editor {
         self.pump_picker_sources_blocking_for_test();
     }
 
-    /// Open the file finder picker rooted at the current working directory.
+    /// Open the omnibox with the All filter and an empty query — the plain
+    /// "find files" entry point. Thin wrapper over `open_omnibox` (kept for
+    /// app.rs + tests).
     pub fn open_files_picker(&mut self) {
-        self.open_picker_unified(PickerKind::Files, "");
+        self.open_omnibox(SourceFilter::All, "");
     }
 
-    /// Unified Files↔Grep picker. `<Tab>` toggles submode, query carries
-    /// over. Opening is instant: the file scan (and grep, when opening
-    /// straight into Grep with a long-enough query) streams in from worker
-    /// threads while the picker is already on screen.
-    pub(crate) fn open_picker_unified(&mut self, initial: PickerKind, initial_query: &str) {
-        if !matches!(initial, PickerKind::Files | PickerKind::Grep) {
-            return;
-        }
+    /// Open the unified omni picker. One query live-searches file names
+    /// (streamed scan) and file contents (streamed grep) at once, blended
+    /// into one ranked list; `<Tab>` cycles the source `filter`. Opening is
+    /// instant: the file scan always starts, and the content walk starts too
+    /// when the Content source is visible and the query is long enough — both
+    /// stream in from worker threads while the picker is already on screen.
+    ///
+    /// Recents for the current project are loaded here: their rank feeds a
+    /// ranking bonus so recently-opened files float up in the name results,
+    /// and (empty query, All filter) they drive the dedicated recents view
+    /// — see `Picker::rescore_omni`.
+    pub(crate) fn open_omnibox(&mut self, filter: SourceFilter, initial_query: &str) {
         self.cancel_picker_sources();
-        let is_grep = matches!(initial, PickerKind::Grep);
-        self.picker = Some(Picker::new(initial, Vec::new()).with_query(initial_query));
-        // The file scan always starts — `file_items` doubles as the
-        // Files↔Grep toggle cache, so a picker opened straight into Grep
-        // still gets the scan banked for the first `<Tab>`.
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.filter = filter;
+        self.load_recents_into(&mut p);
+        // `with_query` rescores with the filter + recents already in place.
+        self.picker = Some(p.with_query(initial_query));
         self.start_files_scan();
-        if is_grep {
+        if filter != SourceFilter::Files
+            && initial_query.trim().chars().count() >= MIN_CONTENT_QUERY_LEN
+        {
             self.start_grep_stream();
         }
     }
 
-    /// Toggle the active picker between Files and Grep submodes. The query
-    /// is preserved and the flip is instant: Files reuses `file_items`
-    /// as-is (still streaming in if the scan hasn't finished); Grep reuses
-    /// `grep_items` when they were produced for the same query, otherwise
-    /// kicks off a fresh streaming grep.
-    pub(crate) fn toggle_picker_mode(&mut self) {
-        let (new_kind, query, grep_warm) = {
-            let Some(p) = self.picker.as_mut() else {
-                return;
-            };
-            let new_kind = match p.kind {
-                PickerKind::Files => PickerKind::Grep,
-                PickerKind::Grep => PickerKind::Files,
-                _ => return,
-            };
-            let grep_warm = p.last_grep_query.as_deref() == Some(p.query.as_str());
-            (new_kind, p.query.clone(), grep_warm)
+    /// Populate an omni picker's recent-files source + ranking map from the
+    /// per-project recent store. Best-effort: no store, no cwd, or an empty
+    /// store just leaves the fields empty. `recent_rank` covers every
+    /// recorded rel-path (so the ranking bonus is live for file-scan rows);
+    /// `recent_items` is filtered to entries that still exist on disk.
+    fn load_recents_into(&self, p: &mut Picker) {
+        let (Some(file), Ok(cwd)) = (self.recent_data_file.as_ref(), std::env::current_dir())
+        else {
+            return;
         };
+        for (rank, rel) in crate::recent::load_recent_from(file, &cwd)
+            .into_iter()
+            .enumerate()
         {
+            let disp = rel.to_string_lossy().into_owned();
+            p.recent_rank.insert(disp.clone(), rank);
+            if cwd.join(&rel).is_file() {
+                let haystack = Utf32String::from(disp.as_str());
+                p.recent_items.push(PickerItem {
+                    display: disp,
+                    value: PickerValue::File(rel),
+                    haystack,
+                });
+            }
+        }
+    }
+
+    /// `<Tab>`: cycle the omni source filter All → Files → Content → All.
+    /// The query is preserved; marks survive (they're `ItemRef`-keyed, so a
+    /// marked `File(3)` stays marked whichever filter is active); selection
+    /// and scroll reset to the top. Cycling into Content or All with a stale
+    /// content cache and a long-enough query kicks off a fresh walk;
+    /// otherwise it just re-blends the visible sources.
+    pub(crate) fn cycle_omni_filter(&mut self) {
+        let warm = {
             let Some(p) = self.picker.as_mut() else {
                 return;
             };
-            p.kind = new_kind.clone();
-            p.selected = 0;
-            p.scroll = 0;
-            // Item indices change when the active item storage is swapped, so
-            // any previously-marked entries now point at the wrong rows.
-            p.marked.clear();
-        }
-        let needs_grep = matches!(new_kind, PickerKind::Grep)
-            && !grep_warm
-            && query.len() >= PickerKind::Grep.spec().min_query_len;
-        if needs_grep {
-            // Starts the walk and rescores (clearing stale hits) in one go.
+            if !matches!(p.kind, PickerKind::Omni) {
+                return;
+            }
+            p.filter = match p.filter {
+                SourceFilter::All => SourceFilter::Files,
+                SourceFilter::Files => SourceFilter::Content,
+                SourceFilter::Content => SourceFilter::All,
+            };
+            p.last_grep_query.as_deref() == Some(p.query.as_str())
+        };
+        let need_content = self.picker.as_ref().is_some_and(|p| {
+            p.filter != SourceFilter::Files
+                && !warm
+                && p.query.trim().chars().count() >= MIN_CONTENT_QUERY_LEN
+        });
+        if need_content {
+            // Starts the walk and rescores (clearing stale hits, resetting
+            // selection) in one go.
             self.start_grep_stream();
         } else if let Some(p) = self.picker.as_mut() {
-            p.rescore_query_changed();
+            p.rescore_omni();
+            p.selected = 0;
+            p.scroll = 0;
         }
     }
 
@@ -693,10 +743,11 @@ impl Editor {
         self.picker = Some(Picker::new(PickerKind::Symbols, items));
     }
 
-    /// Open the grep picker, optionally pre-filled with `pattern`. Pattern
-    /// becomes the initial query; the live grep machinery handles results.
+    /// Open the omnibox filtered to Content, optionally pre-filled with
+    /// `pattern`. Thin wrapper over `open_omnibox` (`:Grep` + Space-g entry
+    /// point).
     pub(crate) fn open_grep_picker(&mut self, pattern: &str) {
-        self.open_picker_unified(PickerKind::Grep, pattern);
+        self.open_omnibox(SourceFilter::Content, pattern);
     }
 
     /// Handle a key event while the picker overlay is active. Returns true if
@@ -721,13 +772,23 @@ impl Editor {
             PickerAction::Close => {
                 self.picker = None;
                 self.cancel_picker_sources();
+                // Nothing was picked. At launch (see `quit_on_picker_close`)
+                // that means there's no buffer to edit, so quit outright
+                // instead of leaving the `[No Name]` placeholder on screen.
+                if self.quit_on_picker_close {
+                    self.quit = true;
+                }
             }
             PickerAction::Select(v) => {
+                // A pick happened: the launch-quit-on-close flag no longer
+                // applies, even if this Select came from the launch omnibox.
+                self.quit_on_picker_close = false;
                 self.picker = None;
                 self.cancel_picker_sources();
                 self.pick_result(v);
             }
             PickerAction::SelectMany(values) => {
+                self.quit_on_picker_close = false;
                 self.picker = None;
                 self.cancel_picker_sources();
                 // Park every selection except the last directly into
@@ -752,8 +813,8 @@ impl Editor {
                     self.pick_result(last.clone());
                 }
             }
-            PickerAction::Toggle => {
-                self.toggle_picker_mode();
+            PickerAction::CycleFilter => {
+                self.cycle_omni_filter();
             }
             PickerAction::Refresh => {
                 // Mark the query dirty; the actual rescore / regrep is
@@ -833,11 +894,11 @@ impl Editor {
                         return;
                     }
                     let match_idx = self.last_picker_scroll + list_row;
-                    if let Some(&(item_idx, _)) = p.matches.get(match_idx) {
+                    if let Some(&(r, _)) = p.matches.get(match_idx) {
                         // First click on a row just focuses it; a second
                         // click on the same already-selected row activates.
                         if p.selected == match_idx {
-                            Some(p.active_items()[item_idx].value.clone())
+                            Some(p.item(r).value.clone())
                         } else {
                             p.selected = match_idx;
                             None
@@ -850,6 +911,7 @@ impl Editor {
             }
         };
         if let Some(v) = selected_value {
+            self.quit_on_picker_close = false;
             self.picker = None;
             self.cancel_picker_sources();
             self.pick_result(v);
@@ -1129,7 +1191,7 @@ mod tests {
                 haystack: Utf32String::from(display),
             })
             .collect();
-        let p = Picker::new(PickerKind::Files, items);
+        let p = Picker::new(PickerKind::Omni, items);
         ed.picker = Some(p);
         ed.last_picker_rect = Some(Rect::new(0, 0, 20, 5));
         ed.last_picker_scroll = 0;

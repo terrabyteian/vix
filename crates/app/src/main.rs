@@ -18,9 +18,12 @@ fn main() -> Result<()> {
                 "vix {VERSION} — slim vim-motion editor\n\n\
                  usage: vix [PATH]\n\n\
                  PATH may be:\n  \
-                   omitted        open the file picker in the current directory\n  \
-                   a directory    chdir into it and open the file picker\n  \
-                   a file         open it (creates an empty buffer if it doesn't exist)"
+                   omitted        open the search box in the current directory\n  \
+                   a directory    chdir into it and open the search box\n  \
+                   a file         open it (creates an empty buffer if it doesn't exist)\n\n\
+                 With PATH omitted (or a directory), vix opens straight into the\n\
+                 omnibox — search file names and contents in one box. Esc quits\n\
+                 vix at that point; picking a result opens it as normal."
             );
             return Ok(());
         }

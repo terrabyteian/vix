@@ -361,3 +361,63 @@ every phase landed green. Verify with `cargo test --workspace -- --test-threads=
 - Delete `FORCED_REDRAW_MS` safety net after a dogfood period.
 - Fix the parallel-test chdir race (tests that `set_current_dir` race
   across threads; suite is verified with `--test-threads=1`).
+
+## Omnibox redesign — COMPLETE ✓ (2026-07-15)
+
+Replaced the old separate Files/Grep pickers with one unified "Omni" picker.
+6 phases, all landed. Verify with `cargo test --workspace -- --test-threads=1`
+— 418 tests passing, clippy zero-warning, `cargo fmt --all` idempotent.
+
+### Delivered
+- **Unified Omni picker**: one query blends two streamed sources into a
+  single ranked list — file names (`Picker::file_items`, `ItemRef::File`) and
+  file contents (`Picker::grep_items`, `ItemRef::Grep`). Ranking is a baked-in
+  i64 band score (`Picker::rescore_omni` / `score_file_display` in
+  `picker/mod.rs`): `FILE_BAND` (2,000,000) for name hits, `+BASENAME_BONUS`
+  (1,000,000) when the first token hits the basename, an offset/length
+  penalty, and a recency bonus `(50 − rank)·4,000` for files in
+  `recent_rank`; content hits live in the lower `GREP_BAND` (1,000,000) in
+  discovery order. Consequence: any realistic file hit outranks every content
+  hit, so the blend reads as "ranked name hits, then content hits."
+- **Literal smart-case grep**: content search is a literal substring match
+  (`literal_matcher` in `vix_picker`, ASCII smart-case), not a regex — case-
+  sensitive only when the query has an uppercase letter. Runs off the UI
+  thread via `grep_streaming`, cancellable per-file and per-line by a
+  generation token so a fresh keystroke supersedes an in-flight walk.
+- **Recent-files store** (`crates/tui/src/recent.rs`): `$XDG_DATA_HOME/vix/recent`
+  (falls back to `~/.local/share/vix/recent`), one line per open
+  (`timestamp\tproject\trel_path`), capped at 50 entries per project and 1000
+  globally. Loaded per-project at omnibox-open time into `recent_items` /
+  `recent_rank`; best-effort (missing/unwritable store just disables
+  persistence).
+- **Empty-query recents view**: with an empty query and the All filter,
+  `showing_recents()` shows the recent-files list (most-recent-first) instead
+  of the ordinary file list; any other filter or a non-empty query falls back
+  to file/content scoring, with the recency bonus still nudging recent files
+  upward.
+- **Minimal centered omnibox UI** (`picker/render.rs`, `PickerLayout::Omni`):
+  a bordered input box in the upper third of the terminal (3/5 width clamped
+  to [50, 96]), an edge-to-edge blended result list under it, and a status
+  footer with match counts / "scanning…" / short-query hint on the left and
+  key hints on the right. The input box's top border carries the `All ·
+  Files · Content` filter indicator. Degrades to a borderless full-width
+  column on terminals under 46 cols / 12 rows.
+- **`<Tab>` filter cycle**: All → Files → Content → All, preserving the query
+  and marks (`ItemRef`-keyed, so they survive a filter switch); reuses a warm
+  grep cache when the query hasn't changed, otherwise kicks off a fresh walk.
+- **`<C-p>` binding** alongside `<Space>f`/`:Files` (all three open the same
+  omnibox, All filter, empty query); `<Space>g`/`:Grep [pat]` opens it with
+  the Content filter and the pattern pre-filled.
+- **Esc-quits-at-launch**: `quit_on_picker_close` is set only by the launch
+  path (`vix` with no file argument); closing that omnibox with nothing
+  picked quits vix instead of leaving an empty `[No Name]` buffer. Any
+  selection (single or batch) clears the flag.
+- **Preview pane removed for file/grep**: the omnibox has no preview pane —
+  `KindSpec::has_preview` is `false` for `PickerKind::Omni`. `:Buffers` is now
+  the only kind with a preview (`PickerLayout::Full`, its own fullscreen
+  split), unchanged from the fresh-coat pass.
+
+### Verification
+- `cargo test --workspace -- --test-threads=1`: 418 tests passing.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.

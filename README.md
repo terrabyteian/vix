@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh 
 Pin a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | VIX_VERSION=v0.5.0 sh
+curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/master/install.sh | VIX_VERSION=v0.6.0 sh
 ```
 
 **Build from source** (requires Rust):
@@ -22,17 +22,21 @@ cargo install --path crates/app
 
 ## What it does
 
-`vix` opens files, navigates, and edits them with traditional Vim motions. It ships with tree-sitter highlighting for 13 languages, an LSP client for 4 of those, and a unified fuzzy file/grep picker — none of which require a config file or a plugin manager. There is no Vimscript, no Lua, no plugin system. All behaviour is baked into the binary.
+`vix` opens files, navigates, and edits them with traditional Vim motions. It ships with tree-sitter highlighting for 13 languages, an LSP client for 4 of those, and a single omnibox that blends fuzzy file-name search with live content grep into one ranked list — none of which require a config file or a plugin manager. There is no Vimscript, no Lua, no plugin system. All behaviour is baked into the binary.
 
 ## Quickstart
 
 ```sh
-vix                  # open the file picker in the current directory
-vix path/to/dir/     # chdir into the directory and open the picker
+vix                  # open the omnibox in the current directory
+vix path/to/dir/     # chdir into the directory and open the omnibox
 vix path/to/file     # open a single file (creates an empty buffer if missing)
 vix --help           # one-screen help
 vix --version
 ```
+
+Launched with no file, `vix` opens the omnibox with an empty query, which
+shows this project's recently-opened files first. `<Esc>` at launch — before
+anything is picked — quits vix instead of leaving an empty buffer open.
 
 Inside the editor, `:help` opens the in-binary help index; `:help <topic>` jumps to a topic.
 
@@ -62,20 +66,25 @@ Inside the editor, `:help` opens the in-binary help index; `:help <topic>` jumps
 
 ## Pickers
 
-`<Space>` is the leader. Held picker query is preserved when you `<Tab>` between Files and Grep.
+`<Space>` is the leader. `<C-p>`, `<Space>f`, `<Space>g`, `:Files`, and `:Grep`
+all open the same omnibox — one centered, bordered box that fuzzy-searches
+file names and literally (smart-case) greps file contents at once, blended
+into a single ranked list (name hits sort above content hits). An empty query
+shows this project's recently-opened files instead of the whole tree.
 
-| Trigger | Picker |
+| Trigger | Opens |
 |---|---|
-| `<Space>f` or `:Files` | Fuzzy file finder (`ignore`-walked; honours `.gitignore`) |
-| `<Space>g` or `:Grep [pat]` | Live regex grep across the project (ripgrep guts) |
-| `<Tab>` (in picker) | Toggle Files ⇆ Grep, preserving the query |
-| `:Buffers` / `:ls` | Open buffers |
+| `<C-p>` or `<Space>f` or `:Files` | The omnibox, All filter, empty query |
+| `<Space>g` or `:Grep [pat]` | The omnibox, Content filter, query pre-filled from `pat` |
+| `<Tab>` (in the omnibox) | Cycle the filter All → Files → Content → All, preserving the query |
+| `:Buffers` / `:ls` | Open buffers (its own fullscreen list + preview pane) |
 | `:Symbols` | Tree-sitter outline of the current buffer |
 | `:jumps` | Jump list |
 
-Inside a picker — it's single-mode, fzf-style: you're always typing, and
-everything else lives on a non-printable key or a Ctrl/Alt chord so it never
-collides with a query character.
+Every picker — omnibox included — is single-mode, fzf-style: you're always
+typing, and everything else lives on a non-printable key or a Ctrl/Alt chord
+so it never collides with a query character. Only `:Buffers` renders a
+preview pane; the omnibox is preview-free.
 
 | Key | Action |
 |---|---|
@@ -87,13 +96,13 @@ collides with a query character.
 | `<PageUp>` / `<PageDown>` | Move selection by a page |
 | `<Home>` / `<End>` | Jump to the first / last match |
 | `<Enter>` | Open the selected entry (or every marked entry, if any) |
-| `<Tab>` | Toggle Files ⇆ Grep, preserving the query |
+| `<Tab>` | Omnibox only: cycle All → Files → Content → All, preserving the query |
 | `<C-Space>` | Mark the current row for batch-open, then advance |
 | `<A-c>` | Clear all marks |
 | `<C-s>` / `<C-q>` / `<A-q>` / `<C-r>` / `<A-r>` | Buffers only: save / close / force-close / reload / force-reload |
 | First click on a row | Focus the row |
 | Second click on the focused row | Open it |
-| `<Esc>` / `<C-c>` | Close the picker immediately |
+| `<Esc>` / `<C-c>` | Close the picker immediately — at launch, with nothing picked yet, `<Esc>` quits vix instead |
 
 ## Buffers
 
@@ -120,8 +129,8 @@ vix uses Vim's `hidden` semantics — parked buffers can be dirty.
 | `:b <n\|name>` | Switch buffer |
 | `:bn` / `:bp` / `:bd[!]` | Next / prev / delete buffer |
 | `:ls` / `:Buffers` | Buffer picker |
-| `:Files` | File picker |
-| `:Grep [pat]` | Grep picker, optionally pre-filled |
+| `:Files` | Omnibox, All filter |
+| `:Grep [pat]` | Omnibox, Content filter, optionally pre-filled |
 | `:Symbols` | Symbol picker for the current buffer |
 | `:jumps` | Jump list picker |
 | `:%s/pat/rep/[g][i]` | Substitute over the whole file |

@@ -19,14 +19,22 @@ use statusline::{render_cmdline, render_statusline};
 pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let area = f.area();
 
-    // Files / Grep / Buffers picker takes the whole screen — skip drawing
-    // the editor, statusline, and cmdline so we don't peek through.
+    // A fullscreen-split picker (Buffers) takes the whole screen — skip
+    // drawing the editor, statusline, and cmdline so we don't peek through.
     let fullscreen_picker = ed
         .picker
         .as_ref()
         .map(|p| matches!(p.kind.spec().layout, PickerLayout::Full))
         .unwrap_or(false);
     if fullscreen_picker {
+        render_picker(f, area, ed);
+        return;
+    }
+
+    // The launch omnibox floats on a blank screen — no buffer, statusline,
+    // or cmdline behind it. `quit_on_picker_close` is true exactly until
+    // the first pick or Esc-quit, so this can't trigger in-editor.
+    if ed.picker.is_some() && ed.quit_on_picker_close {
         render_picker(f, area, ed);
         return;
     }

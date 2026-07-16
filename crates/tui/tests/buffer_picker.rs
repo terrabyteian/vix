@@ -1,8 +1,9 @@
-//! `<Space>b` opens a Buffers picker with the same fullscreen feel as the
-//! Files/Grep picker. It's single-mode fzf-style like every other picker —
-//! plain typing filters the query — so buffer management moves to Ctrl/Alt
-//! chords that never collide with query characters: `<C-s>` save, `<C-q>` /
-//! `<A-q>` close / force-close, `<C-r>` / `<A-r>` reload / force-reload.
+//! `<Space>b` opens a Buffers picker with its own fullscreen split + preview
+//! pane. It's single-mode fzf-style like every other picker (including the
+//! unified Omni picker) — plain typing filters the query — so buffer
+//! management moves to Ctrl/Alt chords that never collide with query
+//! characters: `<C-s>` save, `<C-q>` / `<A-q>` close / force-close, `<C-r>` /
+//! `<A-r>` reload / force-reload.
 
 #![allow(non_snake_case)]
 

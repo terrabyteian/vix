@@ -1,8 +1,10 @@
-//! `<Space>` leader opens the unified Files/Grep picker. `<Tab>` toggles
-//! submode preserving the query. The picker is single-mode, fzf-style: it is
-//! always typing. Printable keys (no Ctrl/Alt) filter the query; navigation,
-//! marks, and picker-management all live on Ctrl/Alt chords or non-printable
-//! keys (arrows, Home/End, PageUp/PageDown) so they never collide with query
+//! `<Space>` leader / `<C-p>` open the unified "omni" picker: one query
+//! live-searches file names AND file contents, blended into one ranked list.
+//! `<Tab>` cycles the source filter All → Files → Content → All, preserving
+//! the query and marks. The picker is single-mode, fzf-style: it is always
+//! typing. Printable keys (no Ctrl/Alt) filter the query; navigation, marks,
+//! and picker-management all live on Ctrl/Alt chords or non-printable keys
+//! (arrows, Home/End, PageUp/PageDown) so they never collide with query
 //! characters. `<Enter>` opens the highlighted row (or every marked row, if
 //! any are marked); `<Esc>`/`<C-c>` closes immediately regardless of query.
 
@@ -12,15 +14,46 @@ use ratatui::layout::Rect;
 use std::fs;
 use vix_tui::testing::Harness;
 
-/// Build a temp dir with a few files and chdir into it. Returns the dir so
-/// the caller can drop it (we leak — tempdirs in /tmp).
-fn setup_repo() -> std::path::PathBuf {
+/// Process-wide lock serializing these tests. The current directory is
+/// global process state, and every test `chdir`s into its own fixture then
+/// spawns a streaming file scan that captures the cwd — so two tests running
+/// in parallel would scan each other's directories. Each `setup_*` returns
+/// the held guard (bound as `_dir`), which keeps the lock for the test's
+/// whole body.
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A held `CWD_LOCK` guard. Kept alive by the test's `let _dir = …` binding
+/// so the next test can't chdir until this one returns.
+type CwdGuard = std::sync::MutexGuard<'static, ()>;
+
+fn lock_cwd() -> CwdGuard {
+    // Recover from a poisoned lock: a panicking test still leaves the cwd
+    // invariant we care about (we always chdir before doing anything).
+    CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Build a temp dir with a few files and chdir into it under the cwd lock.
+/// (Tempdirs leak in /tmp; only the returned guard matters to the caller.)
+fn setup_repo() -> CwdGuard {
+    let guard = lock_cwd();
     let dir = tempdir();
     fs::write(dir.join("alpha.txt"), "hello world\nthe quick brown fox\n").unwrap();
     fs::write(dir.join("beta.txt"), "lorem ipsum dolor\n").unwrap();
     fs::write(dir.join("gamma.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
     std::env::set_current_dir(&dir).unwrap();
-    dir
+    guard
+}
+
+/// A repo where one file is NAMED `hello.txt` and another (`world.rs`)
+/// CONTAINS the word `hello`. Lets the blend tests assert a file-name row
+/// ranks above a content hit for the same query.
+fn setup_blend_repo() -> CwdGuard {
+    let guard = lock_cwd();
+    let dir = tempdir();
+    fs::write(dir.join("hello.txt"), "unrelated contents\n").unwrap();
+    fs::write(dir.join("world.rs"), "fn hello() { /* hi */ }\n").unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    guard
 }
 
 fn tempdir() -> std::path::PathBuf {
@@ -38,25 +71,39 @@ fn tempdir() -> std::path::PathBuf {
 }
 
 #[test]
-fn space_f_opens_files_picker() {
+fn space_f_opens_omni_picker_all_filter() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     assert!(!h.picker_open());
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
-    assert_eq!(h.picker_kind(), Some("files"));
+    assert_eq!(h.picker_kind(), Some("omni"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
     assert_eq!(h.picker_query(), Some(""));
 }
 
 #[test]
-fn space_g_opens_grep_picker() {
+fn space_g_opens_omni_content_filter() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>g");
     h.pump_picker();
     assert!(h.picker_open());
-    assert_eq!(h.picker_kind(), Some("grep"));
+    assert_eq!(h.picker_kind(), Some("omni"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("content"));
+}
+
+#[test]
+fn ctrl_p_opens_omni_picker() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    assert!(!h.picker_open());
+    h.keys("<C-p>");
+    h.pump_picker();
+    assert!(h.picker_open());
+    assert_eq!(h.picker_kind(), Some("omni"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
 }
 
 #[test]
@@ -80,24 +127,77 @@ fn esc_clears_pending_leader() {
 }
 
 #[test]
-fn tab_toggles_files_to_grep_preserving_query() {
+fn tab_cycles_filter_preserving_query() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>fhe");
-    assert_eq!(h.picker_kind(), Some("files"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
+    assert_eq!(h.picker_query(), Some("he"));
+    // All -> Files -> Content -> All, query carries over the whole way.
+    h.keys("<Tab>");
+    assert_eq!(h.editor.picker_filter_for_test(), Some("files"));
     assert_eq!(h.picker_query(), Some("he"));
     h.keys("<Tab>");
-    assert_eq!(h.picker_kind(), Some("grep"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("content"));
+    assert_eq!(h.picker_query(), Some("he"));
+    h.keys("<Tab>");
+    assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
     assert_eq!(h.picker_query(), Some("he"));
 }
 
 #[test]
-fn tab_toggles_grep_back_to_files_preserving_query() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
-    h.keys("<Space>ghello<Tab>");
-    assert_eq!(h.picker_kind(), Some("files"));
-    assert_eq!(h.picker_query(), Some("hello"));
+fn omni_blends_names_first_then_contents() {
+    let _dir = setup_blend_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>f");
+    h.keys("hello");
+    h.flush_picker();
+    // Both sources contributed: a file NAMED hello.txt and a content hit.
+    let (files, content) = h.editor.picker_counts_for_test();
+    assert!(
+        files >= 1,
+        "expected a file-name hit for hello.txt: {files}"
+    );
+    assert!(
+        content >= 1,
+        "expected a content hit for `hello`: {content}"
+    );
+    // The file-name row ranks first (bands: file hits outrank content hits).
+    assert_eq!(h.editor.picker_selected_source_for_test(), Some("file"));
+}
+
+#[test]
+fn files_filter_hides_content_rows() {
+    let _dir = setup_blend_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>f"); // All
+    h.keys("hello");
+    h.flush_picker();
+    let with_content = h.editor.picker_matches_count_for_test();
+    // Switch to Files: content rows drop, so the match count shrinks (or at
+    // least never grows) and the top row is still a file.
+    h.keys("<Tab>");
+    assert_eq!(h.editor.picker_filter_for_test(), Some("files"));
+    h.flush_picker();
+    let files_only = h.editor.picker_matches_count_for_test();
+    assert!(
+        files_only <= with_content,
+        "files filter must not add rows: {files_only} vs {with_content}"
+    );
+    assert_eq!(h.editor.picker_selected_source_for_test(), Some("file"));
+}
+
+#[test]
+fn content_filter_hides_file_rows() {
+    let _dir = setup_blend_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>g"); // Content
+    h.keys("hello");
+    h.flush_picker();
+    assert_eq!(h.editor.picker_filter_for_test(), Some("content"));
+    // Every visible row is a content hit — the selected source is grep.
+    assert!(h.editor.picker_matches_count_for_test() >= 1);
+    assert_eq!(h.editor.picker_selected_source_for_test(), Some("grep"));
 }
 
 #[test]
@@ -164,7 +264,10 @@ fn typing_filters_matches() {
     h.keys("gamma");
     h.flush_picker();
     assert_eq!(h.picker_query(), Some("gamma"));
-    assert_eq!(h.editor.picker_matches_count_for_test(), 1);
+    // Exactly one file name matches; `gamma` is short enough that no content
+    // hit is expected in this fixture.
+    let (files, _content) = h.editor.picker_counts_for_test();
+    assert_eq!(files, 1);
 }
 
 #[test]
@@ -176,7 +279,8 @@ fn ctrl_u_clears_query() {
     h.keys("<C-u>");
     assert_eq!(h.picker_query(), Some(""));
     h.flush_picker();
-    assert_eq!(h.editor.picker_matches_count_for_test(), 3);
+    let (files, _content) = h.editor.picker_counts_for_test();
+    assert_eq!(files, 3);
 }
 
 #[test]
@@ -208,13 +312,14 @@ fn pagedown_moves_selection_forward_and_pageup_back() {
 }
 
 #[test]
-fn ex_files_command_opens_unified_picker() {
+fn ex_files_command_opens_omni_picker() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.cmd("Files");
-    assert_eq!(h.picker_kind(), Some("files"));
+    assert_eq!(h.picker_kind(), Some("omni"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
     h.keys("<Tab>");
-    assert_eq!(h.picker_kind(), Some("grep"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("files"));
 }
 
 #[test]
@@ -250,7 +355,7 @@ fn first_click_focuses_second_click_activates() {
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
-    // Fullscreen picker geometry: list pane only (no header inside the rect).
+    // Compact-box list rect (Omni renders through the compact centered box).
     h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
     // Click on the second list row — default selection is row 0, so this is
     // a focus-only click; picker stays open with new selection.
@@ -299,44 +404,33 @@ fn click_outside_picker_is_ignored() {
 }
 
 #[test]
-fn click_above_list_area_is_ignored() {
-    // The fullscreen picker reserves rows 0..2 for chrome (tabs / prompt /
-    // separator). `last_picker_rect` is the list area, so clicks above it
-    // fall outside the rect and are ignored — same behavior the old
-    // overlay enforced via a "row 0 is header" check.
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
-    h.keys("<Space>f");
-    h.pump_picker();
-    h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
-    h.click(5, 0); // chrome row, above the list
-    assert!(h.picker_open(), "click above the list should not activate");
-}
-
-#[test]
 fn ex_grep_command_prefills_query() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.cmd("Grep hello");
-    assert_eq!(h.picker_kind(), Some("grep"));
+    assert_eq!(h.picker_kind(), Some("omni"));
+    assert_eq!(h.editor.picker_filter_for_test(), Some("content"));
     assert_eq!(h.picker_query(), Some("hello"));
 }
 
 #[test]
-fn grep_short_query_shows_hint() {
-    // Grep requires 2+ chars before it populates items; below that, the
-    // match list is empty (the hint itself is render-only, so we just
-    // assert there's no crash and no matches).
+fn content_short_query_has_no_matches() {
+    // The omni content source requires 2+ chars before it walks; below that,
+    // a Content-filtered query has no content rows (the hint is render-only,
+    // so we assert the model state: zero content matches).
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>g");
     h.pump_picker();
     assert!(h.picker_open());
+    assert_eq!(h.editor.picker_filter_for_test(), Some("content"));
     assert_eq!(h.picker_query(), Some(""));
     assert_eq!(h.editor.picker_matches_count_for_test(), 0);
     h.keys("h");
     h.flush_picker();
     assert_eq!(h.picker_query(), Some("h"));
+    let (_files, content) = h.editor.picker_counts_for_test();
+    assert_eq!(content, 0, "1-char content query must not walk");
     assert_eq!(h.editor.picker_matches_count_for_test(), 0);
 }
 
@@ -413,17 +507,19 @@ fn enter_with_marked_opens_all_marked_files() {
 }
 
 #[test]
-fn tab_clears_marks_when_swapping_files_and_grep() {
+fn marks_survive_a_full_filter_cycle() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
     h.keys("<Space>f");
     h.pump_picker();
+    // Mark two file rows.
     h.keys("<Nul><Nul>");
     assert_eq!(h.editor.picker_marked_count_for_test(), 2);
-    // Tab switches to grep; marks would point at the wrong items, so they
-    // must be dropped.
-    h.keys("<Tab>");
-    assert_eq!(h.editor.picker_marked_count_for_test(), 0);
+    // Cycle All -> Files -> Content -> All. Marks are ItemRef-keyed, so the
+    // file marks survive the whole cycle.
+    h.keys("<Tab><Tab><Tab>");
+    assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
+    assert_eq!(h.editor.picker_marked_count_for_test(), 2);
 }
 
 #[test]
@@ -472,6 +568,50 @@ fn grep_enter_acts_on_whats_on_screen() {
 }
 
 #[test]
+fn empty_query_omnibox_shows_last_opened_file_on_top() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("scratch\n");
+    // Point the harness at a real (temp) recent-files store — the default
+    // harness disables persistence, so this opts back in deliberately.
+    h.set_recent_data_file(tempdir().join("recent-store"));
+
+    // Open beta.txt so it's recorded as this project's most-recently-opened
+    // file.
+    h.cmd("e beta.txt");
+    assert_eq!(
+        h.editor
+            .buffer
+            .path()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned()),
+        Some("beta.txt".to_string()),
+        "beta.txt should be the active buffer after :e"
+    );
+
+    // Close (implicitly, by switching to a fresh scratch buffer state isn't
+    // needed — the omnibox is opened fresh each time) and reopen the
+    // omnibox: the empty-query, All-filter view must show the just-opened
+    // file on top instead of the shortest-path fallback.
+    h.keys("<Space>f");
+    h.pump_picker();
+    assert!(h.picker_open());
+    assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
+    assert_eq!(h.picker_query(), Some(""));
+    assert_eq!(
+        h.editor.picker_top_display_for_test(),
+        Some("beta.txt".to_string()),
+        "the recents view should surface the last-opened file on top"
+    );
+    let (files, _content) = h.editor.picker_counts_for_test();
+    assert_eq!(files, 3, "footer's file count stays honest under the view");
+
+    // Enter on the top row reopens beta.txt.
+    h.keys("<CR>");
+    assert!(!h.picker_open(), "enter should pick the recents row");
+    h.assert_text("lorem ipsum dolor\n");
+}
+
+#[test]
 fn closing_picker_cancels_streaming_sources() {
     let _dir = setup_repo();
     let mut h = Harness::with_text("hello\n");
@@ -483,4 +623,84 @@ fn closing_picker_cancels_streaming_sources() {
     // most importantly must not panic or resurrect picker state.
     h.pump_picker();
     assert!(!h.picker_open());
+}
+
+// --- "Esc at launch quits vix" -------------------------------------------
+//
+// `vix` with no file (or a directory) argument boots into the omnibox with
+// an empty `[No Name]` placeholder buffer behind it. Dismissing that launch
+// omnibox without picking anything leaves nothing to edit, so it quits the
+// whole process instead of dropping the user into an empty buffer. Picking
+// a result — by Enter, a marked multi-select, or a mouse click — cancels
+// that and behaves exactly like any other omnibox pick. Opening the
+// omnibox again afterwards (or from any other in-editor entry point) is
+// unaffected: only the launch omnibox itself carries the quit-on-close
+// behavior.
+
+#[test]
+fn launch_esc_quits() {
+    let _dir = setup_repo();
+    let mut h = Harness::new();
+    h.open_launch_picker();
+    h.pump_picker();
+    assert!(h.picker_open());
+    h.keys("<Esc>");
+    assert!(!h.picker_open());
+    assert!(h.quit_requested(), "Esc at launch should quit vix");
+}
+
+#[test]
+fn launch_ctrl_c_quits() {
+    let _dir = setup_repo();
+    let mut h = Harness::new();
+    h.open_launch_picker();
+    h.pump_picker();
+    assert!(h.picker_open());
+    h.keys("<C-c>");
+    assert!(!h.picker_open());
+    assert!(h.quit_requested(), "Ctrl-C at launch should quit vix");
+}
+
+#[test]
+fn launch_select_does_not_quit() {
+    let _dir = setup_repo();
+    let mut h = Harness::new();
+    h.open_launch_picker();
+    h.pump_picker();
+    h.keys("alpha");
+    h.pump_picker();
+    h.keys("<CR>");
+    assert!(!h.picker_open());
+    assert!(
+        !h.quit_requested(),
+        "picking a file at launch should not quit"
+    );
+    h.assert_text("hello world\nthe quick brown fox\n");
+
+    // The launch flag must not linger: opening the omnibox again in-editor
+    // and Esc-ing out of it just closes the picker as normal.
+    h.keys("<Space>f");
+    h.pump_picker();
+    assert!(h.picker_open());
+    h.keys("<Esc>");
+    assert!(!h.picker_open());
+    assert!(
+        !h.quit_requested(),
+        "a later in-editor Esc must not quit — the launch flag shouldn't linger"
+    );
+}
+
+#[test]
+fn in_editor_esc_does_not_quit() {
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("hello\n");
+    h.keys("<Space>f");
+    h.pump_picker();
+    assert!(h.picker_open());
+    h.keys("<Esc>");
+    assert!(!h.picker_open());
+    assert!(
+        !h.quit_requested(),
+        "Esc on an in-editor omnibox must never quit"
+    );
 }

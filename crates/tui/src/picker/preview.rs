@@ -38,42 +38,6 @@ impl PreviewCache {
     }
 }
 
-/// Read `path` and return its source text, or a fully-formed placeholder
-/// `PreviewCache` if it's unreadable / too large / binary / non-UTF8.
-///
-/// Reads at most `PREVIEW_MAX_BYTES + 1` so we don't slurp a multi-MB file
-/// just to throw it away at the size check below.
-pub(crate) fn read_preview_source(path: &Path) -> Result<String, Box<PreviewCache>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| {
-        Box::new(PreviewCache::placeholder(
-            path,
-            &format!("(cannot read: {e})"),
-        ))
-    })?;
-    let mut bytes: Vec<u8> = Vec::new();
-    std::io::BufReader::new(file)
-        .take((PREVIEW_MAX_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| {
-            Box::new(PreviewCache::placeholder(
-                path,
-                &format!("(cannot read: {e})"),
-            ))
-        })?;
-    if bytes.len() > PREVIEW_MAX_BYTES {
-        return Err(Box::new(PreviewCache::placeholder(
-            path,
-            "(file too large to preview)",
-        )));
-    }
-    if bytes.iter().take(1024).any(|&b| b == 0) {
-        return Err(Box::new(PreviewCache::placeholder(path, "(binary file)")));
-    }
-    String::from_utf8(bytes)
-        .map_err(|_| Box::new(PreviewCache::placeholder(path, "(non-utf8 file)")))
-}
-
 /// Build a `PreviewCache` from in-memory text plus precomputed syntax spans.
 /// `path` is used for display / cache key only — language routing happens
 /// in the caller, since they own the per-language `SyntaxState` cache.
@@ -193,13 +157,9 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
     }
 
     let cache = match &target {
-        PreviewKey::Path(path) => match read_preview_source(path) {
-            Ok(source) => {
-                let spans = preview_spans(ed, path, &source);
-                build_preview_from_text(path, &source, spans)
-            }
-            Err(placeholder) => *placeholder,
-        },
+        // Buffers is the only preview kind, so `current_preview_key` only ever
+        // yields a `Buffer` target; a `Path` key can't reach here.
+        PreviewKey::Path(_) => return,
         PreviewKey::Buffer { idx, .. } => {
             // The rope view is what the user wants — it reflects unsaved edits.
             let mut c = build_preview_for_buffer_idx(ed, *idx);
@@ -237,15 +197,12 @@ pub(crate) fn preview_wake_deadline(ed: &Editor) -> Option<Instant> {
 /// there's no selection or the row isn't previewable.
 fn current_preview_key(ed: &Editor, kind: &PickerKind) -> Option<PreviewKey> {
     let p = ed.picker.as_ref()?;
-    let &(item_idx, _) = p.matches.get(p.selected)?;
+    let &(r, _) = p.matches.get(p.selected)?;
     match kind {
-        PickerKind::Files | PickerKind::Grep => match &p.active_items()[item_idx].value {
-            PickerValue::File(path) => Some(PreviewKey::Path(path.clone())),
-            PickerValue::GrepHit { path, .. } => Some(PreviewKey::Path(path.clone())),
-            _ => None,
-        },
+        // Buffers is the only preview kind now; Omni has no preview pane
+        // (`refresh_preview` early-outs on `has_preview`), so no path arm.
         PickerKind::Buffers => {
-            if let PickerValue::BufferIndex(idx) = p.active_items()[item_idx].value {
+            if let PickerValue::BufferIndex(idx) = p.item(r).value {
                 let version = buffer_version(ed, idx);
                 Some(PreviewKey::Buffer { idx, version })
             } else {

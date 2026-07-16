@@ -100,21 +100,31 @@ $BIN /tmp/big.rs
 $BIN tests/fixtures/project/src/main.rs
 ```
 
-- [ ] `:Files` (or whatever the bound key is) opens the file picker in
-      browse (nav) mode; `j` / `k` move the selection, `<CR>` opens the
-      highlighted row.
-- [ ] `/` from browse enters input mode where typing filters results
-      incrementally with no visible lag.
-- [ ] `<Esc>` or `<CR>` from input returns to browse mode with the query
-      preserved. A second `<Esc>` from browse closes the picker.
-- [ ] `:Buffers` lists the active + parked buffers; selecting one switches to
-      it without disturbing the unnamed register.
-- [ ] `:Grep foo` opens grep results; entries show `file:line` and a snippet.
+- [ ] `Ctrl-P` / `<Space>f` / `:Files` opens the omnibox: a centered,
+      bordered input box with an edge-to-edge result list under it. It's
+      single-mode — you're always typing, no separate nav/input modes. `j`/
+      `k`/`Ctrl-j`/`Ctrl-k`/arrows move the selection while typing continues
+      to filter.
+- [ ] With an empty query, the list shows this project's recently-opened
+      files (most-recent first), not every file in the tree.
+- [ ] Typing a query blends fuzzy file-name hits and (once you type
+      `MIN_CONTENT_QUERY_LEN`+ chars) literal smart-case content hits into
+      one ranked list — file-name hits sort above content hits.
+- [ ] `<Tab>` cycles the filter indicator All → Files → Content → All (shown
+      on the input box's top border), preserving the query.
+- [ ] `<Esc>` closes the omnibox immediately. If it's the launch omnibox
+      (`vix` with no file argument) and nothing has been picked yet, `<Esc>`
+      quits vix instead of leaving an empty placeholder buffer.
+- [ ] `:Buffers` lists the active + parked buffers in vix's own fullscreen
+      split-pane layout (list + preview pane, ≥ 80 cols); selecting one
+      switches to it without disturbing the unnamed register.
+- [ ] `:Grep foo` / `<Space>g` opens the omnibox pre-filtered to Content with
+      the query pre-filled; entries show `file:line` and a snippet.
 - [ ] `:Symbols` on a Rust file shows top-level fns/structs/impls; on
       `notes.unknownext` it surfaces the "no language" message and refuses to
       open.
-- [ ] Picker honours `.gitignore` (drop a `node_modules/` or `target/` and
-      verify they're skipped).
+- [ ] Omnibox honours `.gitignore` (drop a `node_modules/` or `target/` and
+      verify they're skipped) for both the file-name and content sources.
 
 ## 4. LSP — rust-analyzer
 

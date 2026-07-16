@@ -62,6 +62,18 @@ impl Editor {
             return;
         }
 
+        // Ctrl-P in Normal mode: open the omnibox (file names + contents).
+        // The picker intercepts keys first while it's up, so its own Ctrl-P
+        // (selection up) still wins once open; Insert-mode Ctrl-P completion
+        // lives in the Insert arm and is untouched.
+        if self.mode == Mode::Normal
+            && k.modifiers.contains(KeyModifiers::CONTROL)
+            && k.code == KeyCode::Char('p')
+        {
+            self.open_files_picker();
+            return;
+        }
+
         // Tab / Shift-Tab in Normal mode: cycle to next/prev open buffer
         // (Alt-Tab style — wraps around at the ends).
         if self.mode == Mode::Normal && k.code == KeyCode::Tab {

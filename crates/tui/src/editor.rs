@@ -124,7 +124,8 @@ pub struct Editor {
     /// edits rebuild it; navigation reuses it byte-for-byte.
     pub(crate) syntax_src: String,
     pub(crate) syntax_src_key: Option<(u64, u64)>,
-    /// Active picker overlay (file finder / grep). Intercepts input while set.
+    /// Active picker overlay (omni file/content search, buffers, symbols, …).
+    /// Intercepts input while set.
     pub(crate) picker: Option<Picker>,
     /// Registered LSP clients keyed by `cmd`. We spawn lazily — one client per
     /// language per editor lifetime — and route per-buffer requests based on
@@ -196,6 +197,16 @@ pub struct Editor {
     /// pop the file picker. The first buffer they pick should *replace*
     /// that placeholder rather than park it. Consumed on the first swap.
     pub(crate) discard_active_on_swap: bool,
+    /// One-shot flag used at launch: when the launch omnibox (see
+    /// `discard_active_on_swap`) is dismissed via `PickerAction::Close`
+    /// (Esc or Ctrl-C) with nothing picked, there's no file to edit, so we
+    /// quit vix outright rather than leave the `[No Name]` placeholder on
+    /// screen. Set only by the launch branch in `app::run`; every selection
+    /// path (`Select`, `SelectMany`, mouse activation) clears it before
+    /// dispatching so a pick always leaves the editor running normally, and
+    /// no in-editor picker-open path (Ctrl-P, Space-f/g/b, `:Files` etc.)
+    /// ever sets it.
+    pub(crate) quit_on_picker_close: bool,
     /// One `SyntaxState` per language, reused across picker preview rebuilds
     /// so we don't re-compile tree-sitter highlight queries on every j/k.
     /// The active buffer keeps its own `syntax` field; this cache exists
@@ -218,6 +229,11 @@ pub struct Editor {
     /// `picker.file_items` batch by batch — the picker opens instantly and
     /// the list grows under it.
     pub(crate) files_source: Option<PendingSource>,
+    /// Recent-files store location, resolved once at startup (see
+    /// `crate::recent::default_data_file`). `None` disables persistence —
+    /// tests force this off via `Harness` so they never touch the real
+    /// user file.
+    pub(crate) recent_data_file: Option<std::path::PathBuf>,
     /// Centralized color/style palette. See `crate::theme`.
     pub(crate) theme: Theme,
     /// Dirty flag for the main loop: draw a frame only when something
@@ -280,6 +296,7 @@ impl Editor {
             last_picker_list_rows: 0,
             pending_leader: false,
             discard_active_on_swap: false,
+            quit_on_picker_close: false,
             active_bid: 0,
             next_bid: 1,
             preview_syntax: HashMap::new(),
@@ -287,6 +304,7 @@ impl Editor {
             files_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grep_source: None,
             files_source: None,
+            recent_data_file: crate::recent::default_data_file(),
             theme: Theme::default_dark(),
             needs_redraw: true,
         }

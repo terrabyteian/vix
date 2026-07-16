@@ -88,6 +88,7 @@ impl Editor {
         if let Some(idx) = self.buffer_index_by_path(path) {
             self.switch_to_buffer(idx);
             self.msg = format!("switched to \"{}\"", path.display());
+            self.record_recent(path);
             return;
         }
         match Buffer::load(path) {
@@ -100,9 +101,30 @@ impl Editor {
                         .map(|p| p.display().to_string())
                         .unwrap_or_default()
                 );
+                self.record_recent(path);
             }
             Err(e) => self.msg = format!("error: {e}"),
         }
+    }
+
+    /// Best-effort recent-files bookkeeping for `open_path`. No-op if
+    /// persistence is disabled (`recent_data_file` is `None`, e.g. in
+    /// tests) or `path` isn't under the current working directory — the
+    /// store only tracks project-relative paths.
+    fn record_recent(&self, path: &std::path::Path) {
+        let Some(file) = self.recent_data_file.as_deref() else {
+            return;
+        };
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        let Ok(canonical) = path.canonicalize() else {
+            return;
+        };
+        let Ok(rel) = canonical.strip_prefix(&cwd) else {
+            return;
+        };
+        crate::recent::record_recent_in(file, &cwd, rel);
     }
 
     /// Invalidate the syntax cache. Call this after swapping the buffer so

@@ -9,6 +9,7 @@ mod input;
 mod jumps;
 mod lsp;
 mod picker;
+mod recent;
 mod render;
 mod search;
 pub mod testing;
