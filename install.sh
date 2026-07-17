@@ -6,11 +6,13 @@
 #
 # Specific version:
 #   curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.5.0 sh
+#
+# Installs to ~/.local/bin by default; override the location with VIX_INSTALL_DIR.
 set -e
 
 REPO="terrabyteian/vix"
 BINARY="vix"
-INSTALL_DIR="${VIX_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${VIX_INSTALL_DIR:-$HOME/.local/bin}"
 
 # ---------------------------------------------------------------------------
 # Detect OS
@@ -106,3 +108,12 @@ $SUDO mv -f "$STAGE" "${INSTALL_DIR}/${BINARY}"
 
 echo "==> Installed: $(command -v ${BINARY} || echo ${INSTALL_DIR}/${BINARY})"
 "${INSTALL_DIR}/${BINARY}" --version
+
+# Warn if the install dir isn't on PATH (common for ~/.local/bin on a fresh setup).
+case ":${PATH}:" in
+  *":${INSTALL_DIR}:"*) ;;
+  *)
+    echo "==> note: ${INSTALL_DIR} is not on your PATH — add it with:"
+    echo "         export PATH=\"${INSTALL_DIR}:\$PATH\""
+    ;;
+esac
