@@ -492,8 +492,7 @@ impl Editor {
         self.buffer.remove_range(range.clone());
         self.buffer.insert_str(range.start, new_text);
         let new_len = new_text.chars().count();
-        self.sel =
-            Selection::at(range.start + new_len.saturating_sub(1).max(0)).clamped(&self.buffer);
+        self.sel = Selection::at(range.start + new_len.saturating_sub(1)).clamped(&self.buffer);
         let mut tx = Transaction::new();
         tx.sel_before = Some(sel_before);
         tx.push(Change::Delete {
@@ -705,7 +704,7 @@ impl Editor {
                 text: text.clone(),
             });
             let n = text.chars().count();
-            cursor_after = insert_at + n.saturating_sub(1).max(0);
+            cursor_after = insert_at + n.saturating_sub(1);
         }
 
         self.sel = Selection::at(cursor_after).clamped(&self.buffer);

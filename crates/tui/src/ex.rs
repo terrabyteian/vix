@@ -202,7 +202,7 @@ impl Editor {
         }
 
         // Apply in reverse char-offset order so earlier offsets stay valid.
-        replacements.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+        replacements.sort_by_key(|r| std::cmp::Reverse(r.0.start));
         let sel_before = self.sel;
         let mut tx = Transaction::new();
         tx.sel_before = Some(sel_before);

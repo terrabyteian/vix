@@ -99,10 +99,10 @@ impl NormalKeyState {
         self.prefix == Some('g')
     }
     fn count(&self) -> usize {
-        self.count_buf.parse::<usize>().ok().unwrap_or(0).max(0)
+        self.count_buf.parse::<usize>().ok().unwrap_or(0)
     }
     fn op_count(&self) -> usize {
-        self.op_count_buf.parse::<usize>().ok().unwrap_or(0).max(0)
+        self.op_count_buf.parse::<usize>().ok().unwrap_or(0)
     }
     /// Final count = (leading count or 1) × (op count or 1).
     fn effective_count(&self) -> usize {

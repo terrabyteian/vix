@@ -168,7 +168,7 @@ fn right(buf: &Buffer, sel: Selection, n: usize) -> Selection {
     let (line, col) = buf.char_to_line_col(sel.head);
     let line_len = buf.line_len_chars(line);
     // Vim: cursor stops at the last char of the line in Normal mode, not past it.
-    let new_col = (col + n).min(line_len.saturating_sub(1).max(0));
+    let new_col = (col + n).min(line_len.saturating_sub(1));
     let new_pos = buf.line_to_char(line) + new_col;
     sel.move_to(new_pos).with_virt_col(None)
 }
@@ -179,7 +179,7 @@ fn vertical(buf: &Buffer, sel: Selection, delta: isize) -> Selection {
     let last_line = buf.len_lines().saturating_sub(1);
     let new_line = (line as isize + delta).clamp(0, last_line as isize) as usize;
     let line_len = buf.line_len_chars(new_line);
-    let new_col = virt.min(line_len.saturating_sub(1).max(0));
+    let new_col = virt.min(line_len.saturating_sub(1));
     let new_pos = buf.line_to_char(new_line) + new_col;
     Selection {
         anchor: new_pos,
@@ -213,7 +213,7 @@ fn line_first_non_blank(buf: &Buffer, sel: Selection) -> Selection {
 fn line_end(buf: &Buffer, sel: Selection) -> Selection {
     let (line, _) = buf.char_to_line_col(sel.head);
     let line_len = buf.line_len_chars(line);
-    let new_pos = buf.line_to_char(line) + line_len.saturating_sub(1).max(0);
+    let new_pos = buf.line_to_char(line) + line_len.saturating_sub(1);
     sel.move_to(new_pos).with_virt_col(None)
 }
 

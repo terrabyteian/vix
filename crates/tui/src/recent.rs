@@ -101,7 +101,7 @@ pub(crate) fn load_recent_from(file: &Path, project: &Path) -> Vec<PathBuf> {
         .collect();
     // Stable: entries were already written newest-first, so ties (possible
     // when several records land in the same second) keep that order.
-    entries.sort_by(|a, b| b.epoch.cmp(&a.epoch));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.epoch));
 
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(RECENT_PER_PROJECT_CAP);
