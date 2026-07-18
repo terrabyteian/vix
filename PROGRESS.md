@@ -494,3 +494,38 @@ content-only search.
 - Known pre-existing flake (untouched, follow-up): `buffer_picker`/
   `multi_buffer` tests name temp files by `SystemTime::now().as_nanos()` and
   can collide under parallel load — reproduces on clean HEAD.
+
+## Omnibox preview pane + input coalescing (v0.8.0) — COMPLETE ✓ (2026-07-18)
+
+### Omnibox preview pane (`picker/mod.rs`, `preview.rs`, `render.rs`, `render/mod.rs`)
+- Omni flips `has_preview: true` and renders fullscreen: full-width input +
+  result list stacked above a full-width preview pane at ≥ 24 rows
+  (`omni_geometry` returns the split; `PickerLayout::Full | Omni` share the
+  fullscreen path). `:Buffers` keeps its side-by-side pane at ≥ 80 cols.
+- `build_preview_for_path` reads + whole-file tree-sitter-highlights files
+  from disk (256 KiB cap, LRU'd via the existing `PreviewCache` machinery);
+  content hits center the preview on the matching line.
+
+### Scrolling-perf fixes the pane exposed (`render.rs`, `preview.rs`, `app.rs`)
+- `render_picker_preview_pane` scanned the *whole file's* span vector once
+  per visible row per frame (O(rows × spans)) and allocated a String per
+  visible char. Now: `partition_point` to the first overlapping span +
+  early-break past the window (spans defensively sorted once at cache
+  build), and style-run-grouped Spans. Net: O(rows × (log S + width)).
+- Event loop read one input event per full redraw; once frames were slower
+  than key-repeat the terminal buffer grew unboundedly — stuck scrolling,
+  Esc/Ctrl-C queued behind the backlog (dirty-flag pass removed the 10 Hz
+  cap that masked it). Now drains up to `MAX_EVENTS_PER_FRAME` (128) pending
+  events before drawing one frame, breaking early on quit.
+
+### Verification
+- 2 new render unit tests: span-window boundaries (span ending exactly at
+  `line_byte_start` excluded; multiline spans styled; out-of-order input
+  proves the build-time sort) and focused-row selection bg across
+  gutter/runs/pad after the run-grouping refactor.
+- `cargo test -p vix-tui` green across all suites; clippy `-D warnings` +
+  fmt clean.
+- Headless (screen-driven, release build): omnibox previewing
+  `crates/syntax/src/lib.rs`, 400-arrow burst then Esc → process exit in
+  0.32 s at launch; in-editor Ctrl-P, same burst + Esc closes only the
+  picker, editor responsive.
