@@ -1,12 +1,14 @@
 //! Picker preview machinery: reading/caching file or buffer contents and
-//! syntax-highlighting them for the fullscreen picker's preview pane.
+//! syntax-highlighting them for the picker preview panes (the Buffers
+//! fullscreen split and the omnibox).
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use vix_core::Buffer;
 use vix_syntax::{HlSpan, Language, SyntaxState};
 
-use crate::picker::{PickerKind, PickerLayout, PickerValue, PreviewCache, PreviewKey};
+use crate::picker::{omni_key_path, PickerKind, PickerValue, PreviewCache, PreviewKey};
 use crate::picker::{PREVIEW_DEBOUNCE_MS, PREVIEW_LRU_CAP, PREVIEW_MAX_BYTES};
 use crate::Editor;
 
@@ -44,7 +46,7 @@ impl PreviewCache {
 pub(crate) fn build_preview_from_text(
     path: &Path,
     source: &str,
-    spans: Vec<HlSpan>,
+    mut spans: Vec<HlSpan>,
 ) -> PreviewCache {
     if source.len() > PREVIEW_MAX_BYTES {
         return PreviewCache::placeholder(path, "(buffer too large to preview)");
@@ -71,6 +73,11 @@ pub(crate) fn build_preview_from_text(
         lines.push(source[start..].to_string());
     }
     line_byte_starts.push(src_bytes.len());
+
+    // Spans arrive in ascending byte order from tree-sitter's event stream
+    // and never overlap; the renderer binary-searches on that invariant.
+    // Sort defensively — one-time O(n log n) at build, free when already sorted.
+    spans.sort_by_key(|s| s.range.start);
 
     PreviewCache {
         // Defaults to a path key; the Buffers builder overrides it with a
@@ -107,8 +114,8 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
         Some(k) => k,
         None => return,
     };
-    // Cheap guard: only a fullscreen kind with a preview pane does any work.
-    if !(matches!(kind.spec().layout, PickerLayout::Full) && kind.spec().has_preview) {
+    // Cheap guard: only kinds with a preview pane do any work.
+    if !kind.spec().has_preview {
         return;
     }
 
@@ -157,9 +164,13 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
     }
 
     let cache = match &target {
-        // Buffers is the only preview kind, so `current_preview_key` only ever
-        // yields a `Buffer` target; a `Path` key can't reach here.
-        PreviewKey::Path(_) => return,
+        // Omni rows: read the file from disk. The key path is already
+        // normalized (cwd-relative when possible) by `omni_key_path`.
+        PreviewKey::Path(path) => {
+            let mut c = build_preview_for_path(ed, path);
+            c.key = target.clone();
+            c
+        }
         PreviewKey::Buffer { idx, .. } => {
             // The rope view is what the user wants — it reflects unsaved edits.
             let mut c = build_preview_for_buffer_idx(ed, *idx);
@@ -182,8 +193,7 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
 /// rebuild by missing a stored deadline.
 pub(crate) fn preview_wake_deadline(ed: &Editor) -> Option<Instant> {
     let p = ed.picker.as_ref()?;
-    let spec = p.kind.spec();
-    if !(matches!(spec.layout, PickerLayout::Full) && spec.has_preview) {
+    if !p.kind.spec().has_preview {
         return None;
     }
     let target = current_preview_key(ed, &p.kind)?;
@@ -199,8 +209,6 @@ fn current_preview_key(ed: &Editor, kind: &PickerKind) -> Option<PreviewKey> {
     let p = ed.picker.as_ref()?;
     let &(r, _) = p.matches.get(p.selected)?;
     match kind {
-        // Buffers is the only preview kind now; Omni has no preview pane
-        // (`refresh_preview` early-outs on `has_preview`), so no path arm.
         PickerKind::Buffers => {
             if let PickerValue::BufferIndex(idx) = p.item(r).value {
                 let version = buffer_version(ed, idx);
@@ -209,6 +217,16 @@ fn current_preview_key(ed: &Editor, kind: &PickerKind) -> Option<PreviewKey> {
                 None
             }
         }
+        // Omni rows key on the normalized file path. The grep LINE is
+        // deliberately not part of the key — every hit in the same file
+        // shares one cache entry; centering on the hit line is a
+        // render-time concern.
+        PickerKind::Omni => match &p.item(r).value {
+            PickerValue::File(path) | PickerValue::GrepHit { path, .. } => {
+                Some(PreviewKey::Path(omni_key_path(path)))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -255,4 +273,199 @@ pub(crate) fn build_preview_for_buffer_idx(ed: &mut Editor, idx: usize) -> Previ
     };
     let spans = preview_spans(ed, &path, &text);
     build_preview_from_text(&path, &text, spans)
+}
+
+/// Build a preview by reading `path` from disk (unlike Buffers previews,
+/// which read the live rope). Size-gated before the read, binary-gated
+/// after, lossy-UTF-8. Whole-file highlight — `highlight_range` is the
+/// follow-up if preview parses ever show up as jank.
+///
+/// `path` is the normalized (possibly cwd-relative) key path; a relative
+/// path resolves against the cwd, which is the omni scan root.
+fn build_preview_for_path(ed: &mut Editor, path: &Path) -> PreviewCache {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > PREVIEW_MAX_BYTES as u64 {
+            return PreviewCache::placeholder(path, "(file too large to preview)");
+        }
+    }
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return PreviewCache::placeholder(path, "(unable to read file)"),
+    };
+    // A NUL in the head is the cheap classic binary sniff.
+    if bytes.iter().take(1024).any(|&b| b == 0) {
+        return PreviewCache::placeholder(path, "(binary file)");
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let spans = preview_spans(ed, path, &text);
+    build_preview_from_text(path, &text, spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picker::{ItemRef, Picker, PickerItem};
+    use crate::testing::Harness;
+    use vix_picker::Utf32String;
+
+    /// Serializes the tests that read or change the process-global cwd:
+    /// `omni_key_path` resolves against it, and the harness test chdirs
+    /// into a scratch repo before spawning a file scan. Mirrors the cwd
+    /// lock in `tests/leader_picker.rs`.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
+        // Recover from a poisoned lock: a panicking test leaves nothing
+        // half-done that later tests care about.
+        CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Unique scratch dir per test so parallel test runs (same pid) never
+    /// collide, mirroring `recent.rs`'s temp-dir tests.
+    fn test_dir(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "vix-preview-test-{}-{name}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn file_item(path: &Path) -> PickerItem {
+        let d = path.to_string_lossy().into_owned();
+        PickerItem {
+            display: d.clone(),
+            value: PickerValue::File(path.to_path_buf()),
+            haystack: Utf32String::from(d.as_str()),
+        }
+    }
+
+    fn grep_item(path: &Path, line: u64) -> PickerItem {
+        let d = path.to_string_lossy().into_owned();
+        PickerItem {
+            display: d.clone(),
+            value: PickerValue::GrepHit {
+                path: path.to_path_buf(),
+                line,
+            },
+            haystack: Utf32String::from(d.as_str()),
+        }
+    }
+
+    #[test]
+    fn omni_key_path_normalizes_absolute_to_relative() {
+        let _cwd = lock_cwd();
+        let cwd = std::env::current_dir().unwrap();
+        let rel = Path::new("src/foo.rs");
+        assert_eq!(omni_key_path(&cwd.join(rel)), omni_key_path(rel));
+        assert_eq!(omni_key_path(rel), rel);
+    }
+
+    #[test]
+    fn omni_file_and_grep_rows_share_a_preview_key() {
+        let _cwd = lock_cwd();
+        let cwd = std::env::current_dir().unwrap();
+        let mut ed = Editor::new(Buffer::empty());
+        // A File row with a relative path plus two GrepHit rows for the SAME
+        // file at an absolute path and different lines: all three selections
+        // must resolve to one cache key.
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.file_items.push(file_item(Path::new("src/foo.rs")));
+        p.grep_items.push(grep_item(&cwd.join("src/foo.rs"), 3));
+        p.grep_items.push(grep_item(&cwd.join("src/foo.rs"), 9));
+        p.matches = vec![
+            (ItemRef::File(0), 0),
+            (ItemRef::Grep(0), 0),
+            (ItemRef::Grep(1), 0),
+        ];
+        ed.picker = Some(p);
+
+        let key_at = |ed: &mut Editor, sel: usize| {
+            ed.picker.as_mut().unwrap().selected = sel;
+            current_preview_key(ed, &PickerKind::Omni).expect("previewable row")
+        };
+        let file_key = key_at(&mut ed, 0);
+        assert_eq!(file_key, PreviewKey::Path(PathBuf::from("src/foo.rs")));
+        assert_eq!(key_at(&mut ed, 1), file_key, "grep hit shares the file key");
+        assert_eq!(
+            key_at(&mut ed, 2),
+            file_key,
+            "the hit line is not part of the key"
+        );
+    }
+
+    #[test]
+    fn build_preview_for_path_reads_file() {
+        let dir = test_dir("reads");
+        let path = dir.join("sample.rs");
+        fs::write(&path, "fn sample() {}\nsecond line\n").unwrap();
+        let mut ed = Editor::new(Buffer::empty());
+        let c = build_preview_for_path(&mut ed, &path);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(!c.placeholder);
+        assert_eq!(c.key, PreviewKey::Path(path.clone()));
+        assert_eq!(c.path, path);
+        assert_eq!(c.lines, vec!["fn sample() {}", "second line"]);
+    }
+
+    #[test]
+    fn build_preview_for_path_oversize_placeholder() {
+        let dir = test_dir("oversize");
+        let path = dir.join("big.txt");
+        fs::write(&path, vec![b'a'; PREVIEW_MAX_BYTES + 1]).unwrap();
+        let mut ed = Editor::new(Buffer::empty());
+        let c = build_preview_for_path(&mut ed, &path);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(c.placeholder);
+        assert_eq!(c.lines, vec!["(file too large to preview)"]);
+    }
+
+    #[test]
+    fn build_preview_for_path_binary_placeholder() {
+        let dir = test_dir("binary");
+        let path = dir.join("blob.bin");
+        fs::write(&path, b"\x7fELF\x00\x01\x02rest").unwrap();
+        let mut ed = Editor::new(Buffer::empty());
+        let c = build_preview_for_path(&mut ed, &path);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(c.placeholder);
+        assert_eq!(c.lines, vec!["(binary file)"]);
+    }
+
+    #[test]
+    fn build_preview_for_path_missing_placeholder() {
+        let dir = test_dir("missing");
+        let path = dir.join("no_such_file.rs");
+        let mut ed = Editor::new(Buffer::empty());
+        let c = build_preview_for_path(&mut ed, &path);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(c.placeholder);
+        assert_eq!(c.lines, vec!["(unable to read file)"]);
+    }
+
+    #[test]
+    fn omni_selection_builds_a_disk_preview() {
+        // End-to-end: open the omnibox over a scratch repo, land the
+        // selection on the file row, and refresh. The MRU is empty, so the
+        // first build skips the debounce and the pane fills immediately.
+        let _cwd = lock_cwd();
+        let dir = test_dir("omni-e2e");
+        fs::write(dir.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let mut h = Harness::new();
+        h.editor.open_files_picker();
+        h.pump_picker();
+        refresh_preview(&mut h.editor);
+        let p = h.editor.picker.as_ref().expect("picker open");
+        let c = p
+            .previews
+            .first()
+            .expect("first preview builds immediately when the MRU is empty");
+        assert!(!c.placeholder);
+        assert_eq!(c.path, Path::new("alpha.rs"));
+        assert_eq!(c.key, PreviewKey::Path(PathBuf::from("alpha.rs")));
+        assert!(c.lines.iter().any(|l| l.contains("fn alpha")));
+    }
 }

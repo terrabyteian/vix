@@ -69,7 +69,7 @@ Inside the editor, `:help` opens the in-binary help index; `:help <topic>` jumps
 ## Pickers
 
 `<Space>` is the leader. `<C-p>`, `<Space>f`, `<Space>g`, `:Files`, and `:Grep`
-all open the same omnibox — one centered, bordered box that fuzzy-searches
+all open the same omnibox — a fullscreen page that fuzzy-searches
 file names and literally (smart-case) greps file contents at once, blended
 into a single ranked list (name hits sort above content hits). An empty query
 shows this project's recently-opened files instead of the whole tree.
@@ -85,8 +85,10 @@ shows this project's recently-opened files instead of the whole tree.
 
 Every picker — omnibox included — is single-mode, fzf-style: you're always
 typing, and everything else lives on a non-printable key or a Ctrl/Alt chord
-so it never collides with a query character. Only `:Buffers` renders a
-preview pane; the omnibox is preview-free.
+so it never collides with a query character. The omnibox stacks its results
+above a full-width preview pane when the terminal is at least 24 rows tall
+(`:Buffers` keeps its side-by-side pane at ≥ 80 columns); in the omnibox,
+content hits center the preview on the matching line.
 
 | Key | Action |
 |---|---|

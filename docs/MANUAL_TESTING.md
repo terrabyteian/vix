@@ -100,11 +100,12 @@ $BIN /tmp/big.rs
 $BIN tests/fixtures/project/src/main.rs
 ```
 
-- [ ] `Ctrl-P` / `<Space>f` / `:Files` opens the omnibox: a centered,
-      bordered input box with an edge-to-edge result list under it. It's
-      single-mode — you're always typing, no separate nav/input modes. `j`/
-      `k`/`Ctrl-j`/`Ctrl-k`/arrows move the selection while typing continues
-      to filter.
+- [ ] `Ctrl-P` / `<Space>f` / `:Files` opens the omnibox: a fullscreen page
+      with a full-width bordered input box at the top, the result list under
+      it, and (≥ 24 rows) a full-width preview pane below showing the
+      highlighted file. It's single-mode — you're always typing, no separate nav/input
+      modes. `j`/`k`/`Ctrl-j`/`Ctrl-k`/arrows move the selection while typing
+      continues to filter.
 - [ ] With an empty query, the list shows this project's recently-opened
       files (most-recent first), not every file in the tree.
 - [ ] Typing a query blends fuzzy file-name hits and (once you type
@@ -119,7 +120,8 @@ $BIN tests/fixtures/project/src/main.rs
       split-pane layout (list + preview pane, ≥ 80 cols); selecting one
       switches to it without disturbing the unnamed register.
 - [ ] `:Grep foo` / `<Space>g` opens the omnibox pre-filtered to Content with
-      the query pre-filled; entries show `file:line` and a snippet.
+      the query pre-filled; entries show `file:line` and a snippet, and the
+      preview pane centers and highlights the matching line.
 - [ ] `:Symbols` on a Rust file shows top-level fns/structs/impls; on
       `notes.unknownext` it surfaces the "no language" message and refuses to
       open.

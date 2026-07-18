@@ -355,7 +355,8 @@ fn first_click_focuses_second_click_activates() {
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
-    // Compact-box list rect (Omni renders through the compact centered box).
+    // Inject a known list rect: mouse hit-testing reads the geometry recorded
+    // by the last render, so pin one instead of depending on the omni layout.
     h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
     // Click on the second list row — default selection is row 0, so this is
     // a focus-only click; picker stays open with new selection.

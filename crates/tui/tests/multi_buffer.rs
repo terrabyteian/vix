@@ -7,15 +7,13 @@ use std::fs;
 use vix_tui::testing::Harness;
 
 fn tmpfile(content: &str) -> std::path::PathBuf {
+    // pid keeps concurrent *processes* apart; the counter keeps concurrent
+    // *tests in this process* apart (a coarse clock hands parallel tests the
+    // same nanosecond, so a timestamp alone collides). Mirrors `recent.rs`.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!(
-        "vix-multi-{}-{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    p.push(format!("vix-multi-{}-{n}.txt", std::process::id()));
     fs::write(&p, content).unwrap();
     p
 }

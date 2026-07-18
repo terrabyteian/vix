@@ -1,6 +1,6 @@
 //! Picker overlay: types, pure state, and small helpers shared by the
 //! `input`, `preview`, and `render` submodules.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use vix_picker::{GrepItem, Scorer, Utf32String};
@@ -99,10 +99,10 @@ pub(crate) struct Picker {
     pub(crate) marked: std::collections::HashSet<ItemRef>,
     /// Small MRU cache of built previews (front = most-recently used, cap
     /// `PREVIEW_LRU_CAP`). Keyed by `PreviewCache::key` — (buffer index,
-    /// version) for Buffers, the only preview kind. Selecting a row whose target is
-    /// already cached promotes it to the front instantly; a miss builds and
-    /// pushes to the front, evicting the tail. The renderer draws
-    /// `previews.first()`.
+    /// version) for Buffers, normalized file path for Omni rows. Selecting a
+    /// row whose target is already cached promotes it to the front instantly;
+    /// a miss builds and pushes to the front, evicting the tail. The renderer
+    /// draws `previews.first()`.
     pub(crate) previews: Vec<PreviewCache>,
     /// `selected` value the last time `refresh_preview` ran. Used to detect
     /// scroll movement so the preview rebuild can be debounced — see
@@ -130,12 +130,19 @@ pub(crate) struct Picker {
 
 /// Identity of a cached preview, used to look it up in the MRU. Buffers key
 /// on the buffer index plus its version, so an edited buffer misses and
-/// rebuilds. The `Path` variant is retained for the buffer preview
-/// placeholder builder (unnamed buffers).
-#[derive(Clone, PartialEq, Eq)]
+/// rebuilds. Omni rows key on the file's normalized path (see
+/// [`omni_key_path`]), read from disk at build time.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum PreviewKey {
     Path(PathBuf),
     Buffer { idx: usize, version: u64 },
+}
+
+/// Cache-key path for an omni row: cwd-relative when possible, so a File
+/// row and a GrepHit row for the same file share one preview cache entry.
+pub(crate) fn omni_key_path(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    path.strip_prefix(&cwd).unwrap_or(path).to_path_buf()
 }
 
 /// Cached file/buffer preview data. Built lazily for a selected row and kept
@@ -201,8 +208,8 @@ pub(crate) enum SourceFilter {
 }
 
 /// Whether a picker kind renders as a fullscreen split (list + preview), the
-/// upper-third omnibox (input box + edge-to-edge list + footer), or the
-/// legacy centered compact overlay.
+/// fullscreen omnibox (full-width input box, result list with an optional
+/// preview split, footer), or the legacy centered compact overlay.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PickerLayout {
     Full,
@@ -227,12 +234,13 @@ pub(crate) struct KindSpec {
 
 impl PickerKind {
     pub(crate) fn spec(&self) -> &'static KindSpec {
-        // Omni renders through the dedicated upper-third omnibox layout.
+        // Omni renders through the dedicated omnibox layout; its preview
+        // pane reads files from disk (see `picker::preview`).
         const OMNI: KindSpec = KindSpec {
             label: "omni",
             layout: PickerLayout::Omni,
             supports_marks: true,
-            has_preview: false,
+            has_preview: true,
             buffer_actions: false,
         };
         const BUFFERS: KindSpec = KindSpec {

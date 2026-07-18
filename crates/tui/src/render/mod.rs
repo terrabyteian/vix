@@ -19,22 +19,20 @@ use statusline::{render_cmdline, render_statusline};
 pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let area = f.area();
 
-    // A fullscreen-split picker (Buffers) takes the whole screen — skip
-    // drawing the editor, statusline, and cmdline so we don't peek through.
+    // A fullscreen picker — the Buffers split or the omnibox — takes the
+    // whole screen: skip drawing the editor, statusline, and cmdline so we
+    // don't peek through.
     let fullscreen_picker = ed
         .picker
         .as_ref()
-        .map(|p| matches!(p.kind.spec().layout, PickerLayout::Full))
+        .map(|p| {
+            matches!(
+                p.kind.spec().layout,
+                PickerLayout::Full | PickerLayout::Omni
+            )
+        })
         .unwrap_or(false);
     if fullscreen_picker {
-        render_picker(f, area, ed);
-        return;
-    }
-
-    // The launch omnibox floats on a blank screen — no buffer, statusline,
-    // or cmdline behind it. `quit_on_picker_close` is true exactly until
-    // the first pick or Esc-quit, so this can't trigger in-editor.
-    if ed.picker.is_some() && ed.quit_on_picker_close {
         render_picker(f, area, ed);
         return;
     }
@@ -67,6 +65,8 @@ pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
         render_completion_popup(f, content_area, ed);
     }
     if ed.picker.is_some() {
+        // Only compact-layout pickers (Symbols/CodeActions/Jumps) reach this
+        // in-editor overlay path; fullscreen layouts returned above.
         render_picker(f, content_area, ed);
     } else {
         ed.last_picker_rect = None;

@@ -1,7 +1,7 @@
 //! Picker rendering: a single geometry-driven path that lays out three
-//! layouts — the fullscreen split-pane picker (Buffers), the upper-third
-//! omnibox (Omni: bordered input + edge-to-edge blended result list +
-//! status footer), and the legacy centered compact overlay
+//! layouts — the fullscreen split-pane picker (Buffers), the fullscreen
+//! omnibox (Omni: full-width bordered input, blended result list with an
+//! optional preview split, status footer), and the legacy centered compact overlay
 //! (Symbols/CodeActions/Jumps, plus a narrow-terminal degrade of Buffers).
 //! `compute_geometry` resolves rects for the active layout; the matching
 //! `render_*_body` reads them.
@@ -11,9 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::picker::{
-    fit_picker_row, layout_grep_row, parse_omni_query, substring_match_smart, wrap_picker_detail,
-    GrepRowLayout, ItemRef, Picker, PickerItem, PickerKind, PickerLayout, PickerValue,
-    SourceFilter, MIN_CONTENT_QUERY_LEN,
+    fit_picker_row, layout_grep_row, omni_key_path, parse_omni_query, substring_match_smart,
+    wrap_picker_detail, GrepRowLayout, ItemRef, Picker, PickerItem, PickerKind, PickerLayout,
+    PickerValue, PreviewKey, SourceFilter, MIN_CONTENT_QUERY_LEN,
 };
 use crate::theme::Theme;
 use crate::util::{char_index_in_byte_range, count_chars, pad_or_trunc, take_end};
@@ -39,12 +39,13 @@ pub(crate) fn picker_hint_line(supports_marks: bool, buffer_actions: bool) -> St
 /// chosen (it drives body dispatch and backdrop). A `None` slot means "not
 /// shown for this layout": the compact box has no `tabs_row`/`preview`/
 /// `input_block`, the full split no `detail`/`input_block`, the omnibox no
-/// `tabs_row`/`preview`/`detail`.
+/// `tabs_row`/`detail`.
 pub(crate) struct PickerGeometry {
     /// Which layout these rects were computed for.
     pub layout_tag: PickerLayout,
-    /// Whole picker area — the full terminal for the full split, the centered
-    /// box for compact/omnibox. Backdrop is filled across this rect.
+    /// Whole picker area — the full terminal for the full split and the
+    /// omnibox, the centered box for compact. Backdrop is filled across this
+    /// rect.
     pub outer: Rect,
     /// Row 0 strip for the full layout: the Buffers title. `None` otherwise.
     pub tabs_row: Option<Rect>,
@@ -56,7 +57,8 @@ pub(crate) struct PickerGeometry {
     pub prompt: Rect,
     /// The scrolling result list. This is what `last_picker_rect` records.
     pub list: Rect,
-    /// Right-hand preview pane (full kinds, width ≥ 80).
+    /// Preview pane (full: right-hand at width ≥ 80; omni: full-width below
+    /// the list at height ≥ 24).
     pub preview: Option<Rect>,
     /// 2-row detail strip at the bottom of the compact box.
     pub detail: Option<Rect>,
@@ -78,10 +80,11 @@ pub(crate) fn compute_geometry(kind: PickerKind, area: Rect) -> PickerGeometry {
     }
 }
 
-/// Upper-third omnibox geometry (fzf/Claude-Code style): a bordered input box
-/// near the top, an edge-to-edge result list under it, and a footer. Degrades
-/// on a small terminal (< 46 cols or < 12 rows) to a borderless full-width
-/// column anchored at the top.
+/// Fullscreen omnibox geometry (telescope style): a full-width bordered
+/// input box flush at the top, the result list under it — splitting off a
+/// full-width preview pane below it at height ≥ 24 — and a footer on the
+/// bottom screen row. Degrades on a small terminal (< 46 cols or < 12 rows)
+/// to a borderless full-width column anchored at the top.
 fn omni_geometry(area: Rect) -> PickerGeometry {
     if area.width < 46 || area.height < 12 {
         // Borderless degrade: 1 input row, list fills the middle, 1 footer.
@@ -100,36 +103,35 @@ fn omni_geometry(area: Rect) -> PickerGeometry {
         };
     }
 
-    // Centered upper-third box, 3/5 of the width clamped to [50, 96] and to
-    // the terminal minus a small margin.
-    let w =
-        ((area.width as u32 * 3 / 5).clamp(50, 96)).min(area.width.saturating_sub(4) as u32) as u16;
-    let x = area.x + (area.width - w) / 2;
-    let top_off = area.height / 6;
-    let top = area.y + top_off;
+    let w = area.width;
+    let h = area.height;
+    // Rows: 0..3 bordered input (border, "> query", border) · 3..h-1 body ·
+    // h-1 footer. Prompt is the input's inner row, inset one column past the
+    // left border.
+    let input_block = Rect::new(area.x, area.y, w, 3);
+    let prompt = Rect::new(area.x + 1, area.y + 1, w.saturating_sub(2), 1);
+    let body_top = area.y + 3;
+    let body_h = h.saturating_sub(4);
 
-    // Input block: 3 rows (border, "> query", border). Prompt is the inner
-    // row, inset one column past the left border.
-    let input_block = Rect::new(x, top, w, 3);
-    let prompt = Rect::new(x + 1, top + 1, w.saturating_sub(2), 1);
-
-    // List sits directly under the input block, edge-to-edge in `w`.
-    let list_top_off = top_off + 3;
-    let list_h = 15u16.min(area.height.saturating_sub(list_top_off).saturating_sub(2));
-    let list_top = area.y + list_top_off;
-    let list = Rect::new(x, list_top, w, list_h);
-    let footer = Rect::new(x, list_top + list_h, w, 1);
+    // Body split: list on top, preview below, 50/50.
+    let split_enabled = h >= 24;
+    let list_h = if split_enabled { body_h / 2 } else { body_h };
+    let preview = if split_enabled {
+        Some(Rect::new(area.x, body_top + list_h, w, body_h - list_h))
+    } else {
+        None
+    };
 
     PickerGeometry {
         layout_tag: PickerLayout::Omni,
-        outer: Rect::new(x, top, w, 3 + list_h + 1),
+        outer: area,
         tabs_row: None,
         input_block: Some(input_block),
         prompt,
-        list,
-        preview: None,
+        list: Rect::new(area.x, body_top, w, list_h),
+        preview,
         detail: None,
-        footer,
+        footer: Rect::new(area.x, area.y + h - 1, w, 1),
     }
 }
 
@@ -213,7 +215,8 @@ pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
     };
     let geo = compute_geometry(kind.clone(), area);
     // The full split owns the whole terminal and wipes to Reset; the omnibox
-    // and compact box are overlays that paint the picker background.
+    // (also fullscreen now) and the compact box paint the picker background
+    // across `geo.outer` instead.
     let overlay = !matches!(geo.layout_tag, PickerLayout::Full);
 
     // Preview I/O happens in the main loop (`refresh_preview`), not here — the
@@ -241,8 +244,8 @@ pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
         };
         p.last_list_rows = list_rows;
 
-        // Backdrop: overlays paint the picker background; the full split owns
-        // the whole terminal and wipes to Reset.
+        // Backdrop: the omnibox (whole screen) and compact box paint the
+        // picker background across `outer`; the full split wipes to Reset.
         let ow = geo.outer.width as usize;
         let oh = geo.outer.height as usize;
         let blank: Vec<Line> = (0..oh).map(|_| Line::raw(" ".repeat(ow))).collect();
@@ -536,7 +539,7 @@ fn render_full_body(
             Paragraph::new(sep_col_lines),
             Rect::new(geo.list.x + geo.list.width, geo.list.y, 1, geo.list.height),
         );
-        render_picker_preview_pane(f, preview_rect, p, theme);
+        render_picker_preview_pane(f, preview_rect, p, theme, None);
     }
 
     // --- Footer hints --------------------------------------------------------
@@ -669,10 +672,10 @@ fn filter_indicator_spans(p: &Picker, theme: &Theme) -> (Vec<Span<'static>>, usi
     (spans, width)
 }
 
-/// Upper-third omnibox body: bordered input box with an embedded filter
-/// indicator, an edge-to-edge blended result list (file-name + content rows),
-/// and a status footer with counts / scanning / hint on the left and key
-/// hints on the right.
+/// Fullscreen omnibox body: full-width bordered input box with an embedded
+/// filter indicator, a blended result list (file-name + content rows) on
+/// top with an optional full-width preview pane below, and a status footer
+/// with counts / scanning / hint on the left and key hints on the right.
 fn render_omni_body(
     f: &mut ratatui::Frame,
     geo: &PickerGeometry,
@@ -833,6 +836,32 @@ fn render_omni_body(
     }
     f.render_widget(Paragraph::new(lines), geo.list);
 
+    // --- Preview pane ---------------------------------------------------------
+    // No separator row: the pane's own header (relative path) + thin rule at
+    // the top of its rect is the visual divider between list and preview.
+    if let Some(preview_rect) = geo.preview {
+        // Center + mark the matched line when the selected row is a grep hit
+        // AND its file's preview is the one actually in the pane. Mid-debounce
+        // the pane may still show the PREVIOUS file's preview — the key check
+        // makes it render un-centered rather than centering the wrong file at
+        // the new line. File / recent rows always preview from the top.
+        let focus_line = p
+            .matches
+            .get(p.selected)
+            .map(|&(r, _)| p.item(r))
+            .and_then(|item| match &item.value {
+                PickerValue::GrepHit { path, line } => {
+                    let key = PreviewKey::Path(omni_key_path(path));
+                    p.previews
+                        .first()
+                        .filter(|c| c.key == key)
+                        .map(|_| (*line as usize).saturating_sub(1))
+                }
+                _ => None,
+            });
+        render_picker_preview_pane(f, preview_rect, p, theme, focus_line);
+    }
+
     // --- Footer -------------------------------------------------------------
     render_omni_footer(f, geo, p, theme, quit_on_picker_close);
 }
@@ -925,13 +954,18 @@ fn render_omni_footer(
 
 // --- Preview pane ----------------------------------------------------------
 
-/// Draw the preview pane for the highlighted Buffers row. Caller positions
-/// the rect; we own every cell inside it.
+/// Draw the preview pane for the highlighted row (Buffers rows and omni
+/// file/grep rows). Caller positions the rect; we own every cell inside it.
+/// With `focus_line: None` the pane renders from the top of the file. A
+/// `Some(line)` (0-based) scrolls that line to the pane's vertical center
+/// (clamped at file start/end) and marks its whole row with
+/// `theme.selection` — the omni grep-hit case.
 pub(crate) fn render_picker_preview_pane(
     f: &mut ratatui::Frame,
     area: Rect,
     p: &Picker,
     theme: &Theme,
+    focus_line: Option<usize>,
 ) {
     let w = area.width as usize;
     let h = area.height as usize;
@@ -952,18 +986,12 @@ pub(crate) fn render_picker_preview_pane(
         return;
     };
 
-    // Pane header: file name, dimmed, with a thin bottom rule.
-    let header_text = pad_or_trunc(
-        &format!(
-            " {} ",
-            cache
-                .path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        ),
-        w,
-    );
+    // Pane header: the cwd-relative path (falling back to the cache path as
+    // stored — omni keys are already relative; `[No Name]` passes through),
+    // with a thin bottom rule. The full path keeps same-basename files apart.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let header_path = cache.path.strip_prefix(&cwd).unwrap_or(&cache.path);
+    let header_text = pad_or_trunc(&format!(" {} ", header_path.to_string_lossy()), w);
     let header_line = Line::from(Span::styled(
         header_text,
         Style::default()
@@ -989,12 +1017,19 @@ pub(crate) fn render_picker_preview_pane(
     }
     let body_y = area.y + 2;
 
-    // Buffers preview always renders from the top of the buffer.
+    // Scroll window: from the top by default; a focus line is centered,
+    // clamped at the file's start (saturating_sub) and end (min max_top).
+    let max_top = cache.lines.len().saturating_sub(body_h);
+    let top = match focus_line {
+        Some(fl) => fl.saturating_sub(body_h.saturating_sub(1) / 2).min(max_top),
+        None => 0,
+    };
     let line_num_w = (cache.lines.len()).to_string().len().max(3);
     let content_w = w.saturating_sub(line_num_w + 2);
 
     let mut body_lines: Vec<Line> = Vec::with_capacity(body_h);
-    for line_idx in 0..body_h {
+    for row in 0..body_h {
+        let line_idx = top + row;
         if line_idx >= cache.lines.len() {
             body_lines.push(Line::from(Span::styled(
                 "~",
@@ -1002,13 +1037,21 @@ pub(crate) fn render_picker_preview_pane(
             )));
             continue;
         }
+        // The focus row carries `theme.selection` across its full width —
+        // gutter, text, and trailing pad — patched over each span's own
+        // style so syntax fg survives where the theme only sets a bg.
+        let focused = focus_line == Some(line_idx);
+        let mark = |s: Style| if focused { s.patch(theme.selection) } else { s };
         let line_text = &cache.lines[line_idx];
         let visible_chars: Vec<char> = line_text.chars().take(content_w).collect();
 
         let mut row_spans: Vec<Span> = Vec::new();
         let num_text = format!(" {:>w$} ", line_idx + 1, w = line_num_w);
         let num_text_chars = count_chars(&num_text);
-        row_spans.push(Span::styled(num_text, Style::default().fg(theme.border)));
+        row_spans.push(Span::styled(
+            num_text,
+            mark(Style::default().fg(theme.border)),
+        ));
 
         // Per-char styling: the syntax base layer.
         let line_byte_start = cache.line_byte_starts[line_idx];
@@ -1017,14 +1060,20 @@ pub(crate) fn render_picker_preview_pane(
         if cache.placeholder {
             row_spans.push(Span::styled(
                 line_text.clone(),
-                Style::default().fg(theme.dim),
+                mark(Style::default().fg(theme.dim)),
             ));
         } else {
-            // Build per-char styles for visible chars only.
+            // Build per-char styles for visible chars only. `cache.spans` is
+            // sorted by (and non-overlapping in) byte start, so it's also
+            // sorted by byte end — a windowed walk from the first span that
+            // could possibly reach this line replaces the old full-file scan.
             let mut styles: Vec<Style> = vec![Style::default(); visible_chars.len()];
-            for s in &cache.spans {
-                if s.range.end <= line_byte_start || s.range.start >= line_text_byte_end {
-                    continue;
+            let first = cache
+                .spans
+                .partition_point(|s| s.range.end <= line_byte_start);
+            for s in &cache.spans[first..] {
+                if s.range.start >= line_text_byte_end {
+                    break;
                 }
                 let Some(style) = theme.scope_styles.get(s.scope).copied().flatten() else {
                     continue;
@@ -1045,15 +1094,26 @@ pub(crate) fn render_picker_preview_pane(
                     *slot = style;
                 }
             }
+            // Run-group consecutive chars sharing a base style into one Span
+            // instead of allocating a String + Span per character.
+            let mut run = String::new();
+            let mut run_style = Style::default();
             for (i, c) in visible_chars.iter().enumerate() {
-                row_spans.push(Span::styled(c.to_string(), styles[i]));
+                if i > 0 && styles[i] != run_style {
+                    row_spans.push(Span::styled(std::mem::take(&mut run), mark(run_style)));
+                }
+                run_style = styles[i];
+                run.push(*c);
+            }
+            if !run.is_empty() {
+                row_spans.push(Span::styled(run, mark(run_style)));
             }
         }
 
         let used = num_text_chars + visible_chars.len();
         let pad = w.saturating_sub(used);
         if pad > 0 {
-            row_spans.push(Span::styled(" ".repeat(pad), Style::default()));
+            row_spans.push(Span::styled(" ".repeat(pad), mark(Style::default())));
         }
         body_lines.push(Line::from(row_spans));
     }
@@ -1154,32 +1214,51 @@ mod tests {
         assert_eq!(narrow.footer.height, 0, "compact box has no footer row");
     }
 
-    /// Omni geometry: a centered upper-third box whose width is clamped into
-    /// [50, 96], a bordered 3-row input block, an edge-to-edge list, and a
-    /// footer directly under it.
+    /// Omni geometry: fullscreen — full-width bordered input flush at the
+    /// top, list above a full-width preview pane (50/50 split at height
+    /// ≥ 24), footer on the bottom screen row.
     #[test]
-    fn omni_geometry_centered_and_clamped() {
-        let g = compute_geometry(PickerKind::Omni, Rect::new(0, 0, 120, 40));
+    fn omni_geometry_fullscreen_split() {
+        let area = Rect::new(0, 0, 120, 40);
+        let g = compute_geometry(PickerKind::Omni, area);
         assert!(matches!(g.layout_tag, PickerLayout::Omni));
-        // 120 * 3/5 = 72, within [50, 96].
-        assert_eq!(g.list.width, 72);
-        // Centered horizontally.
-        assert_eq!(g.list.x, (120 - 72) / 2);
-        // Upper-third box top (height/6).
-        assert_eq!(g.outer.y, 40 / 6);
-        // Bordered input: 3 rows, list directly under it, footer under that.
+        assert_eq!(g.outer, area, "omnibox owns the whole screen");
+        // Bordered input: 3 rows, full width, flush top; prompt inset (1,1).
         let block = g.input_block.expect("bordered input block");
-        assert_eq!(block.height, 3);
-        assert_eq!(g.prompt.y, block.y + 1);
-        assert_eq!(g.prompt.x, block.x + 1);
-        assert_eq!(g.list.y, block.y + 3);
-        assert_eq!(g.footer.y, g.list.y + g.list.height);
-        assert!(g.tabs_row.is_none() && g.preview.is_none() && g.detail.is_none());
+        assert_eq!(block, Rect::new(0, 0, 120, 3));
+        assert_eq!((g.prompt.x, g.prompt.y), (1, 1));
+        // Body rows 3..39 (36 rows): list on top at half the body height,
+        // the full-width preview pane filling the rest below.
+        assert_eq!(g.list, Rect::new(0, 3, 120, 18));
+        let preview = g.preview.expect("preview pane at height >= 24");
+        assert_eq!(preview, Rect::new(0, 21, 120, 18));
+        // Footer sits on the bottom screen row, full width.
+        assert_eq!(g.footer, Rect::new(0, 39, 120, 1));
+        assert!(g.tabs_row.is_none() && g.detail.is_none());
+    }
 
-        // Small terminal (60x20): width clamps up to the 50 floor.
-        let g = compute_geometry(PickerKind::Omni, Rect::new(0, 0, 60, 20));
-        assert_eq!(g.list.width, 50);
-        assert_eq!(g.list.x, (60 - 50) / 2);
+    /// Below the 24-row split gate the omnibox stays fullscreen but drops
+    /// the preview pane: the list fills the body, bordered input still
+    /// present. Width doesn't gate the split — a narrow-but-tall terminal
+    /// gets the pane.
+    #[test]
+    fn omni_geometry_no_preview_when_short() {
+        // Wide but short: no pane, list fills the body.
+        let g = compute_geometry(PickerKind::Omni, Rect::new(0, 0, 100, 20));
+        assert!(matches!(g.layout_tag, PickerLayout::Omni));
+        assert!(g.input_block.is_some(), "bordered input above the degrade");
+        assert!(g.preview.is_none(), "no preview below 24 rows");
+        assert_eq!(g.list, Rect::new(0, 3, 100, 16));
+        assert_eq!(g.footer, Rect::new(0, 19, 100, 1));
+
+        // Narrow but tall: the split appears.
+        let g = compute_geometry(PickerKind::Omni, Rect::new(0, 0, 46, 24));
+        assert!(matches!(g.layout_tag, PickerLayout::Omni));
+        assert_eq!(g.list, Rect::new(0, 3, 46, 10));
+        assert_eq!(
+            g.preview.expect("preview pane at height >= 24"),
+            Rect::new(0, 13, 46, 10)
+        );
     }
 
     /// Omni degrade (< 46 cols or < 12 rows): borderless, full-width, y = 0,
@@ -1361,8 +1440,8 @@ mod tests {
     }
 
     /// The launch omnibox (`quit_on_picker_close` true, as set by `app.rs`'s
-    /// launch branch) floats on a blank screen: no `[No Name]` statusline, no
-    /// gutter/tilde filler behind the box.
+    /// launch branch) owns the whole screen: no `[No Name]` statusline, no
+    /// gutter/tilde filler bleeding through.
     #[test]
     fn launch_omnibox_renders_on_blank_screen() {
         let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
@@ -1389,10 +1468,12 @@ mod tests {
         assert!(rect.height > 0);
     }
 
-    /// Same picker, opened in-editor (`quit_on_picker_close` false) instead
-    /// of at launch: the buffer/statusline/cmdline stay visible behind it.
+    /// Same picker, opened in-editor (`quit_on_picker_close` false) over a
+    /// real buffer: the omnibox is fullscreen now, so the editor content,
+    /// statusline, and cmdline are all skipped — no mode text, no tilde
+    /// gutter peeking through.
     #[test]
-    fn in_editor_omnibox_keeps_statusline() {
+    fn in_editor_omnibox_takes_full_screen() {
         let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
         ed.quit_on_picker_close = false;
         ed.picker = Some(Picker::new(PickerKind::Omni, Vec::new()));
@@ -1403,8 +1484,234 @@ mod tests {
         let text = backend_text(term.backend());
 
         assert!(
-            text.contains("NORMAL"),
-            "in-editor statusline mode text missing: {text}"
+            !text.contains("NORMAL"),
+            "fullscreen omnibox should hide the statusline: {text}"
+        );
+        assert!(
+            !text.contains('~'),
+            "fullscreen omnibox should hide the tilde gutter: {text}"
+        );
+    }
+
+    /// Build a `PreviewCache` of `n` numbered lines ("content line 1"…)
+    /// without touching the filesystem, keyed on `path` (relative, so it
+    /// round-trips `omni_key_path` unchanged).
+    fn numbered_cache(path: &str, n: usize) -> crate::picker::PreviewCache {
+        let text: String = (1..=n).map(|i| format!("content line {i}\n")).collect();
+        crate::picker::preview::build_preview_from_text(
+            std::path::Path::new(path),
+            &text,
+            Vec::new(),
+        )
+    }
+
+    /// Flatten the cells of rows `y0..` (the omni preview region at 40 tall:
+    /// pane header at row 21, body below) to a newline-joined string.
+    fn region_text(backend: &TestBackend, y0: u16) -> String {
+        let buf = backend.buffer();
+        let area = *buf.area();
+        let mut out = String::new();
+        for y in y0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A selected File row with its preview cached: the pane below the list
+    /// shows the file's content from the top. On a terminal too short for
+    /// the split (< 24 rows) there is no pane and no content.
+    #[test]
+    fn omni_preview_pane_shows_file_content() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.file_items.push(PickerItem {
+            display: "src/alpha.rs".to_string(),
+            value: PickerValue::File("src/alpha.rs".into()),
+            haystack: Utf32String::from("src/alpha.rs"),
+        });
+        p.query = "alpha".to_string();
+        p.rescore();
+        p.previews.push(numbered_cache("src/alpha.rs", 5));
+        ed.picker = Some(p);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+        // Content shows in the pane (rows 21.. below the list), and only
+        // there — the list rows above carry just the file-name row.
+        let bottom = region_text(term.backend(), 21);
+        assert!(
+            bottom.contains("content line 1"),
+            "preview content missing below the split: {bottom}"
+        );
+        let top = {
+            let buf = term.backend().buffer();
+            let mut s = String::new();
+            for y in 0..21u16 {
+                for x in 0..120u16 {
+                    s.push_str(buf[(x, y)].symbol());
+                }
+                s.push('\n');
+            }
+            s
+        };
+        assert!(
+            !top.contains("content line 1"),
+            "preview content leaked into the list rows: {top}"
+        );
+
+        // 20 rows: omni layout without the split — no pane, no content.
+        let backend = TestBackend::new(100, 20);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+        let text = backend_text(term.backend());
+        assert!(
+            !text.contains("content line 1"),
+            "no preview content without the split: {text}"
+        );
+    }
+
+    /// A selected GrepHit row whose file's preview is in the pane: the
+    /// matched line is scrolled to the pane's vertical center and its whole
+    /// row carries `theme.selection`'s background.
+    #[test]
+    fn omni_grep_hit_centers_focus_line() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.grep_items.push(PickerItem {
+            display: "content line 50".to_string(),
+            value: PickerValue::GrepHit {
+                path: "src/big.rs".into(),
+                line: 50,
+            },
+            haystack: Utf32String::from("src/big.rs:50: content line 50"),
+        });
+        p.query = "content".to_string();
+        p.rescore();
+        p.previews.push(numbered_cache("src/big.rs", 100));
+        ed.picker = Some(p);
+        let sel_bg = ed.theme.selection.bg;
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+
+        // Geometry (see `omni_geometry_fullscreen_split`): pane at y=21,
+        // header y=21, rule y=22, body rows y=23..39 (16 rows). Centering
+        // line 50 (idx 49) puts top at 42, so the focus row lands at
+        // y = 23 + (49 - 42) = 30 — the pane's vertical middle.
+        let bottom = region_text(term.backend(), 21);
+        let buf = term.backend().buffer();
+        // Header shows the cwd-relative path, not just the basename, so
+        // same-named files in different directories stay distinguishable.
+        let header_row: String = (0..120u16).map(|x| buf[(x, 21)].symbol()).collect();
+        assert!(
+            header_row.contains("src/big.rs"),
+            "pane header should show the relative path: {header_row}"
+        );
+        assert!(
+            bottom.contains("50 content line 50"),
+            "focus line missing from the pane: {bottom}"
+        );
+        assert!(
+            !bottom.contains("content line 1 "),
+            "line 1 should be scrolled out when line 50 is centered: {bottom}"
+        );
+        let focus_row: String = (0..120u16).map(|x| buf[(x, 30)].symbol()).collect();
+        assert!(
+            focus_row.contains("50 content line 50"),
+            "line 50 not at the pane's vertical middle: {focus_row}"
+        );
+        // The mark spans the full pane width: gutter, text, and trailing pad.
+        for x in [0u16, 2, 40, 119] {
+            assert_eq!(
+                buf[(x, 30)].style().bg,
+                sel_bg,
+                "focus row cell at x={x} missing the selection bg"
+            );
+        }
+        // A neighboring row is unmarked.
+        assert_ne!(
+            buf[(40, 29)].style().bg,
+            sel_bg,
+            "non-focus row should not carry the selection bg"
+        );
+    }
+
+    /// Stale-guard: the selected GrepHit points at file B, but the pane still
+    /// holds file A's preview (mid-debounce). The pane renders file A from
+    /// the top — never centering the wrong file at B's line — with no
+    /// selection-marked row.
+    #[test]
+    fn omni_stale_preview_not_centered() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.grep_items.push(PickerItem {
+            display: "content line 50".to_string(),
+            value: PickerValue::GrepHit {
+                path: "src/b.rs".into(),
+                line: 50,
+            },
+            haystack: Utf32String::from("src/b.rs:50: content line 50"),
+        });
+        p.query = "content".to_string();
+        p.rescore();
+        p.previews.push(numbered_cache("src/a.rs", 100));
+        ed.picker = Some(p);
+        let sel_bg = ed.theme.selection.bg;
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+
+        let bottom = region_text(term.backend(), 21);
+        assert!(
+            bottom.contains("  1 content line 1"),
+            "stale preview should render from the top: {bottom}"
+        );
+        let buf = term.backend().buffer();
+        for y in 23..39u16 {
+            for x in 0..120u16 {
+                assert_ne!(
+                    buf[(x, y)].style().bg,
+                    sel_bg,
+                    "stale preview must not mark any row (x={x}, y={y})"
+                );
+            }
+        }
+    }
+
+    /// The empty-query recents view: a recent (File-valued) row previews
+    /// from the top of the file — no centering.
+    #[test]
+    fn recents_row_previews_from_top() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.recent_items.push(PickerItem {
+            display: "src/rec.rs".to_string(),
+            value: PickerValue::File("src/rec.rs".into()),
+            haystack: Utf32String::from("src/rec.rs"),
+        });
+        p.rescore();
+        assert!(p.showing_recents(), "empty query + recents = recents view");
+        p.previews.push(numbered_cache("src/rec.rs", 100));
+        ed.picker = Some(p);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+
+        let bottom = region_text(term.backend(), 21);
+        assert!(
+            bottom.contains("  1 content line 1"),
+            "recents preview should render from the top: {bottom}"
+        );
+        assert!(
+            !bottom.contains("content line 50"),
+            "recents preview should not be scrolled: {bottom}"
         );
     }
 
@@ -1421,5 +1728,201 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// Build a `PreviewCache` of `n` uniform "lineNN\n" rows — each exactly 7
+    /// bytes (a 4-char prefix, 2-digit zero-padded index, newline) — plus the
+    /// given highlight spans, routed through `build_preview_from_text` so the
+    /// build-time sort runs exactly as it does for real previews. Byte
+    /// offsets are easy to hand-compute: line `i`'s text occupies
+    /// `[7*i, 7*i + 6)`, and line `i+1` starts at `7*(i+1)`.
+    fn windowed_cache(
+        path: &str,
+        n: usize,
+        spans: Vec<vix_syntax::HlSpan>,
+    ) -> crate::picker::PreviewCache {
+        let text: String = (0..n).map(|i| format!("line{i:02}\n")).collect();
+        crate::picker::preview::build_preview_from_text(std::path::Path::new(path), &text, spans)
+    }
+
+    /// The `"string"` scope's index into `HIGHLIGHT_NAMES` — a scope every
+    /// theme in `theme.rs` actually maps to a style (see
+    /// `ansi_scope_style_for`), so `theme.scope_styles.get(scope)` resolves
+    /// to `Some` instead of silently no-op'ing.
+    fn string_scope() -> usize {
+        vix_syntax::HIGHLIGHT_NAMES
+            .iter()
+            .position(|n| *n == "string")
+            .expect("theme scope table defines \"string\"")
+    }
+
+    /// A one-row Omni picker (a File row) with `cache` as its sole preview,
+    /// ready to hand straight to `render_picker_preview_pane`.
+    fn preview_picker(path: &str, cache: crate::picker::PreviewCache) -> Picker {
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.file_items.push(PickerItem {
+            display: path.to_string(),
+            value: PickerValue::File(path.into()),
+            haystack: Utf32String::from(path),
+        });
+        p.matches = vec![(ItemRef::File(0), 0)];
+        p.previews.push(cache);
+        p
+    }
+
+    /// The renderer windows `cache.spans` per row via `partition_point`
+    /// instead of scanning the whole file. Cover the four span placements
+    /// relative to a scrolled preview window: fully before it, ending
+    /// exactly at a visible line's `line_byte_start` (the partition_point
+    /// boundary — must not bleed onto that line), spanning two lines, and
+    /// fully past it. The spans are handed in deliberately out of byte
+    /// order, so a correct result also proves `build_preview_from_text`'s
+    /// defensive sort covers it.
+    #[test]
+    fn preview_pane_windows_spans_and_respects_sort_and_boundaries() {
+        let scope = string_scope();
+        let spans = vec![
+            // Fully past the window (line 25) — listed first, out of order.
+            vix_syntax::HlSpan {
+                range: 7 * 25..7 * 25 + 6,
+                scope,
+            },
+            // Boundary: all of line 12, ending exactly at line 13's
+            // line_byte_start (84..91, and 7*13 == 91). Must style line 12,
+            // must NOT style line 13.
+            vix_syntax::HlSpan {
+                range: 84..91,
+                scope,
+            },
+            // Multiline: line 16 local offset 3 through line 17 local offset 3.
+            vix_syntax::HlSpan {
+                range: 115..122,
+                scope,
+            },
+            // Fully before the scrolled-in window (line 5).
+            vix_syntax::HlSpan {
+                range: 7 * 5..7 * 5 + 6,
+                scope,
+            },
+        ];
+        let cache = windowed_cache("src/w.rs", 30, spans);
+        let p = preview_picker("src/w.rs", cache);
+        let theme = Theme::default_dark();
+
+        // 20x10 pane: body_h = 8, centering line 15 (0-based) gives
+        // top = 15 - (8-1)/2 = 12, so the visible window is lines 12..=19.
+        // Body rows start at y=2, so line N renders at y = 2 + (N - 12).
+        let backend = TestBackend::new(20, 10);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            render_picker_preview_pane(f, Rect::new(0, 0, 20, 10), &p, &theme, Some(15));
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let styled = Some(ratatui::style::Color::LightYellow);
+        // Unstyled cells: the syntax layer never touches them, so they carry
+        // whatever the Paragraph widget's background fill left behind — not
+        // `None`, `Color::Reset` (ratatui's default terminal-color marker).
+        let unstyled = Some(ratatui::style::Color::Reset);
+
+        // Line 12 (y=2): the boundary span covers it fully — chars 0..6,
+        // i.e. x=5..11 (content starts after the 5-char gutter).
+        for x in 5..11u16 {
+            assert_eq!(
+                buf[(x, 2)].style().fg,
+                styled,
+                "line12 x={x} should carry the boundary span"
+            );
+        }
+        // Line 13 (y=3): the boundary span's end lands exactly on this
+        // line's line_byte_start — must not bleed forward.
+        for x in 5..11u16 {
+            assert_eq!(
+                buf[(x, 3)].style().fg,
+                unstyled,
+                "line13 x={x} must not be styled by the boundary span"
+            );
+        }
+        // Line 16 (y=6): multiline span covers local chars[3..6) only.
+        for x in 5..8u16 {
+            assert_eq!(
+                buf[(x, 6)].style().fg,
+                unstyled,
+                "line16 x={x} is before the multiline span's start"
+            );
+        }
+        for x in 8..11u16 {
+            assert_eq!(
+                buf[(x, 6)].style().fg,
+                styled,
+                "line16 x={x} is inside the multiline span"
+            );
+        }
+        // Line 17 (y=7): multiline span covers local chars[0..3) only.
+        for x in 5..8u16 {
+            assert_eq!(
+                buf[(x, 7)].style().fg,
+                styled,
+                "line17 x={x} is inside the multiline span"
+            );
+        }
+        for x in 8..11u16 {
+            assert_eq!(
+                buf[(x, 7)].style().fg,
+                unstyled,
+                "line17 x={x} is after the multiline span's end"
+            );
+        }
+    }
+
+    /// A focused row whose text carries a syntax span in the middle splits
+    /// into three style runs (default prefix, scoped middle, default
+    /// suffix) under the run-grouping refactor. The selection mark must
+    /// still land on every run — not just the first — plus the gutter and
+    /// trailing pad.
+    #[test]
+    fn preview_pane_focused_row_selection_spans_all_runs() {
+        let scope = string_scope();
+        // Line 1 ("line01"), local chars[2..4) = "ne" — byte range 9..11
+        // (line 1 starts at byte 7).
+        let spans = vec![vix_syntax::HlSpan {
+            range: 9..11,
+            scope,
+        }];
+        let cache = windowed_cache("src/f.rs", 3, spans);
+        let p = preview_picker("src/f.rs", cache);
+        let theme = Theme::default_dark();
+        let sel = theme.selection;
+
+        let backend = TestBackend::new(20, 10);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            render_picker_preview_pane(f, Rect::new(0, 0, 20, 10), &p, &theme, Some(1));
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+
+        // y=3: gutter (top=0, line1 is body row 1 -> y = 2 + 1). x=2 gutter,
+        // x=5/x=10 default-style runs either side of the span, x=7/8 the
+        // scoped run, x=19 the trailing pad.
+        let y = 3;
+        for x in [0u16, 2, 5, 7, 8, 10, 19] {
+            assert_eq!(
+                buf[(x, y)].style().bg,
+                sel.bg,
+                "x={x} missing the selection bg"
+            );
+            assert_eq!(
+                buf[(x, y)].style().fg,
+                sel.fg,
+                "x={x} missing the selection fg"
+            );
+        }
+        // A neighboring, non-focused row keeps its own (unmarked) style.
+        assert_ne!(
+            buf[(5, 2)].style().bg,
+            sel.bg,
+            "non-focus row should not carry the selection bg"
+        );
     }
 }

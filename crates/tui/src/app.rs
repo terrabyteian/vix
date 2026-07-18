@@ -21,6 +21,10 @@ const IDLE_POLL_QUIET_MS: u64 = 1000;
 /// dirty-flag path shows up as a 500 ms lag instead of a stuck screen.
 /// Delete (set to u64::MAX) once dirty-flag coverage has been dogfooded.
 const FORCED_REDRAW_MS: u64 = 500;
+/// Max input events handled per frame; bounds worst-case frame latency
+/// under an event flood (mouse capture is on). Leftovers drain next
+/// iteration — poll() returns instantly while the queue is non-empty.
+const MAX_EVENTS_PER_FRAME: usize = 128;
 
 pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
     terminal::enable_raw_mode()?;
@@ -78,22 +82,29 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
                 .map(|t| t.saturating_duration_since(now))
                 .map_or(idle, |until_wake| until_wake.min(idle));
             if event::poll(timeout)? {
-                match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => {
-                        ed.handle_key(k);
-                        ed.request_redraw();
+                let mut budget = MAX_EVENTS_PER_FRAME;
+                loop {
+                    match event::read()? {
+                        Event::Key(k) if k.kind == KeyEventKind::Press => {
+                            ed.handle_key(k);
+                            ed.request_redraw();
+                        }
+                        Event::Mouse(m) => {
+                            ed.handle_mouse(m);
+                            ed.request_redraw();
+                        }
+                        Event::Resize(_, _) => {
+                            // ratatui re-queries the size on draw; we just need
+                            // to actually draw. (The old 10 Hz loop masked that
+                            // this event was silently dropped.)
+                            ed.request_redraw();
+                        }
+                        _ => {}
                     }
-                    Event::Mouse(m) => {
-                        ed.handle_mouse(m);
-                        ed.request_redraw();
+                    budget -= 1;
+                    if ed.quit || budget == 0 || !event::poll(Duration::ZERO)? {
+                        break;
                     }
-                    Event::Resize(_, _) => {
-                        // ratatui re-queries the size on draw; we just need
-                        // to actually draw. (The old 10 Hz loop masked that
-                        // this event was silently dropped.)
-                        ed.request_redraw();
-                    }
-                    _ => {}
                 }
             }
         }
