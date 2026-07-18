@@ -421,3 +421,76 @@ Replaced the old separate Files/Grep pickers with one unified "Omni" picker.
 - `cargo test --workspace -- --test-threads=1`: 418 tests passing.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
 - `cargo fmt --all -- --check`: clean.
+
+## Deterministic omnibox + `/regex` search (v0.7.0) — COMPLETE ✓ (2026-07-17)
+
+Two changes to the omnibox: identical query + tree + recency state now always
+produces an identical result list, and a leading `/` switches to regex
+content-only search.
+
+### Deterministic ranking (`picker/mod.rs`)
+- **Root cause fixed**: content hits were scored `GREP_BAND - arrival_index`,
+  so the parallel walker's thread scheduling *was* the ranking. Grep hits now
+  all score a constant `GREP_BAND`; order comes from a total order `omni_cmp`
+  (score descending, ties broken by `OmniTieKey` — file display path
+  lexicographic, grep `(path, line)` ascending, File before Grep at equal
+  score). Net: file band unchanged (recency bonus kept), content hits in
+  classic grep order (path A→Z, line ascending).
+- **Sorted at all times**: `append_file_matches`/`append_grep_matches` now
+  binary-search-insert (`insert_match_sorted`) instead of appending unranked;
+  the list never shuffles mid-stream. The 1000-row cap (`OMNI_MATCH_CAP`,
+  hoisted) is a deterministic top-K (insert-position drop + evict-worst)
+  instead of first-N-to-arrive. `matches` widened to `Vec<(ItemRef, i64)>` so
+  resident scores survive for the insert comparisons.
+- Selection: a user-moved highlight follows its *item* as rows insert above
+  it; the untouched fresh-open top-row default keeps tracking the best match
+  (fzf behavior — a literal always-follow rule would have made the highlight
+  arrival-order dependent).
+- `rescore_omni_preserving_selection` kept as a completion-time
+  reconciliation pass (produces the identical list by construction).
+- Latent bug fixed en route: `append_file_matches` now uses the same scoring
+  rule as `rescore_omni` at empty query + Files filter (`score_file_recency`).
+- Data layer: `grep`/`grep_cancellable` sort output by `(path, line)`;
+  `grep_streaming` batches stay arrival-order by design (documented —
+  ordering is the consumer's job). Walks stay unsorted: with deterministic
+  tie-breaks, readdir order no longer affects any settled result.
+
+### `/regex` content search (`picker/mod.rs`, `input.rs`, `render.rs`)
+- `parse_omni_query`: a query whose *first* char is `/` is regex mode; the
+  sigil is stripped and the rest is the pattern. Compat break (intentional):
+  a leading `/` no longer literal-searches a slash — `/\/foo` regex-escapes
+  it; non-leading `/` (e.g. `src/mod`) is untouched.
+- Regex mode is content-only: file rows drop out (`file_match_count = 0`),
+  `content_visible()` *bypasses* the Tab filter without mutating it (Tab is a
+  no-op; deleting the `/` restores the prior filter). Smart-case via the
+  shared `build_matcher(pattern, PatternKind::{Literal,Regex})` in
+  `vix_picker` (`fixed_strings` off for regex, `case_smart` both);
+  `MIN_CONTENT_QUERY_LEN` gates on the *stripped* pattern
+  (`content_pattern_len`).
+- Invalid/incomplete patterns: the matcher is built synchronously on the UI
+  thread in `start_grep_stream` before any worker spawns; a build failure
+  sets `Picker::grep_error`, clears stale hits, and spawns nothing — empty
+  list + `Regex · invalid` badge (prompt border) + `[invalid regex]` footer,
+  self-healing on the next parsable keystroke.
+- Render: `Regex` badge replaces the `All · Files · Content` tabs in regex
+  mode; footer shows `{n} matches · regex`; highlights use the stripped
+  pattern (regex metachar patterns simply miss the literal substring lookup →
+  no highlight; regex-aware highlighting is a follow-up).
+
+### Verification
+- `cargo test --workspace`: green (sole failure: `vix-lsp` smoke test,
+  environmental — rust-analyzer not spawnable in the sandbox). 46
+  `leader_picker` integration tests incl. determinism smoke tests
+  (same settled query twice ⇒ byte-identical, explicitly-expected lists;
+  10 consecutive runs, zero flakes) and regex end-to-end (content-only,
+  invalid-pattern indicator + recovery, smart-case, non-leading `/`).
+- Live headless check (screen-driven): `picker` typed in two separate app
+  runs ⇒ byte-identical settled screens (1038 matches); `/fn\s+\w+_test` ⇒
+  14 regex hits in (path, line) order with the badge; `/foo[` ⇒ empty list,
+  `Regex · invalid`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean (also fixed
+  six pre-existing lints newly flagged by clippy 1.97 in `core`/`tui`).
+- `cargo fmt --all -- --check`: clean.
+- Known pre-existing flake (untouched, follow-up): `buffer_picker`/
+  `multi_buffer` tests name temp files by `SystemTime::now().as_nanos()` and
+  can collide under parallel load — reproduces on clean HEAD.
