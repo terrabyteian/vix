@@ -11,8 +11,9 @@ vix is a modal (vim-flavored) terminal editor. Cargo workspace: `crates/core`
 - Keep `README.md` in sync with user-visible behavior changes.
 - Before any release: `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo fmt --all -- --check`. Known environmental failure: the `vix-lsp`
-  smoke test needs a spawnable rust-analyzer.
+  `cargo fmt --all -- --check`. The `vix-lsp` smoke test needs a working
+  rust-analyzer and skips itself (still green) when there isn't one — e.g.
+  when only the rustup shim is present without the component installed.
 
 ## Release process
 

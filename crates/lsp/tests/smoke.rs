@@ -11,7 +11,7 @@ use vix_lsp::{path_to_uri, LspClient, ServerConfig, ServerEvent};
 fn rust_analyzer_reports_a_diagnostic() {
     let cfg = ServerConfig::rust_analyzer();
     if !cfg.available() {
-        eprintln!("skipping: rust-analyzer not on PATH");
+        eprintln!("skipping: rust-analyzer not on PATH or not runnable");
         return;
     }
 

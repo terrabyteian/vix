@@ -54,6 +54,9 @@ pub struct ServerConfig {
     pub args: Vec<String>,
     /// LSP `languageId` for `didOpen`.
     pub language_id: String,
+    /// Arguments that make the binary print its version and exit 0; used by
+    /// [`available`](Self::available) to verify the binary actually runs.
+    pub probe_args: Vec<String>,
 }
 
 impl ServerConfig {
@@ -62,6 +65,7 @@ impl ServerConfig {
             cmd: "rust-analyzer".into(),
             args: vec![],
             language_id: "rust".into(),
+            probe_args: vec!["--version".into()],
         }
     }
     pub fn pyright() -> Self {
@@ -69,6 +73,7 @@ impl ServerConfig {
             cmd: "pyright-langserver".into(),
             args: vec!["--stdio".into()],
             language_id: "python".into(),
+            probe_args: vec!["--version".into()],
         }
     }
     pub fn typescript() -> Self {
@@ -76,6 +81,7 @@ impl ServerConfig {
             cmd: "typescript-language-server".into(),
             args: vec!["--stdio".into()],
             language_id: "typescript".into(),
+            probe_args: vec!["--version".into()],
         }
     }
     pub fn gopls() -> Self {
@@ -83,12 +89,28 @@ impl ServerConfig {
             cmd: "gopls".into(),
             args: vec![],
             language_id: "go".into(),
+            probe_args: vec!["version".into()],
         }
     }
 
-    /// True if the configured binary exists on `$PATH`.
+    /// True if the configured binary exists on `$PATH` and actually runs.
+    ///
+    /// A plain PATH check is not enough: rustup installs a `rust-analyzer`
+    /// shim that is present even when the component itself is not, and it
+    /// exits immediately when spawned. Probe with the server's version flag
+    /// and require a successful exit.
     pub fn available(&self) -> bool {
-        which_on_path(&self.cmd).is_some()
+        if which_on_path(&self.cmd).is_none() {
+            return false;
+        }
+        std::process::Command::new(&self.cmd)
+            .args(&self.probe_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
 
@@ -239,7 +261,7 @@ impl LspClient {
     pub fn start(config: ServerConfig, root: &Path) -> Result<Self> {
         if !config.available() {
             return Err(anyhow!(
-                "language server binary not found on PATH: {}",
+                "language server binary not found on PATH (or not runnable): {}",
                 config.cmd
             ));
         }
@@ -822,12 +844,30 @@ mod tests {
             cmd: "__definitely_not_a_real_binary__".into(),
             args: vec![],
             language_id: "rust".into(),
+            probe_args: vec![],
         };
         let err = LspClient::start(cfg, Path::new("/"))
             .err()
             .expect("should fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn available_requires_probe_success() {
+        let cfg = |cmd: &str| ServerConfig {
+            cmd: cmd.into(),
+            args: vec![],
+            language_id: "rust".into(),
+            probe_args: vec![],
+        };
+        // Not on PATH at all.
+        assert!(!cfg("__definitely_not_a_real_binary__").available());
+        // On PATH but the probe exits nonzero — the rustup-shim false
+        // positive that used to pass a bare PATH check.
+        assert!(!cfg("false").available());
+        // On PATH and the probe succeeds.
+        assert!(cfg("true").available());
     }
 
     #[test]

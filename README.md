@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | 
 Pin a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.6.0 sh
+curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.8.0 sh
 ```
 
 The installer places the `vix` binary in `~/.local/bin` (override with `VIX_INSTALL_DIR`) — make sure that directory is on your `PATH`.

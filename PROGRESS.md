@@ -529,3 +529,33 @@ content-only search.
   `crates/syntax/src/lib.rs`, 400-arrow burst then Esc → process exit in
   0.32 s at launch; in-editor Ctrl-P, same burst + Esc closes only the
   picker, editor responsive.
+
+## Repo sanity pass: fix LSP availability probe — COMPLETE ✓ (2026-07-18)
+
+Full pre-release gauntlet run (fmt/clippy/tests): everything green except the
+`vix-lsp` smoke test, whose skip-guard had a hole.
+
+### `ServerConfig::available()` probes the binary (`lsp/src/lib.rs`)
+- The old check was PATH-presence only. rustup installs a `rust-analyzer`
+  shim that exists on PATH even when the component isn't installed for the
+  active toolchain and exits 1 immediately — so the smoke test spawned it and
+  failed with "server closed stdout" instead of skipping, and the editor got
+  a mid-handshake "lsp loop error" on `.rs` files instead of a clean no-server
+  result.
+- New `probe_args` field on `ServerConfig` (`--version` for rust-analyzer /
+  pyright-langserver / typescript-language-server, `version` for gopls);
+  `available()` now also spawns `cmd probe_args` (stdio nulled) and requires
+  exit success. Runs once per `LspClient::start`, so the extra spawn is
+  negligible.
+- `LspClient::start` error reworded to "not found on PATH (or not runnable)".
+
+### Docs
+- AGENTS.md: the smoke test is no longer a "known environmental failure" —
+  it self-skips (still green) when rust-analyzer can't actually run.
+- README: version-pinning example bumped v0.6.0 → v0.8.0.
+
+### Verification
+- New unit test `available_requires_probe_success`: missing binary → false;
+  on-PATH-but-probe-fails (`false`, the shim scenario) → false; `true` → true.
+- `cargo test --workspace` fully green on this machine (smoke test now skips
+  itself against the dead shim); clippy `-D warnings` + fmt clean.
