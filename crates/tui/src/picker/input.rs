@@ -9,8 +9,9 @@ use vix_picker::{grep_streaming, scan_files_streaming, Utf32String};
 use vix_syntax::{Language, Symbol, SyntaxState};
 
 use crate::picker::{
-    file_item_to_picker_item, grep_hit_to_picker_item, ItemRef, PendingSource, Picker, PickerItem,
-    PickerKind, PickerValue, SourceFilter, MIN_CONTENT_QUERY_LEN, PICKER_REFRESH_DEBOUNCE_MS,
+    file_item_to_picker_item, grep_hit_to_picker_item, parse_omni_query, ItemRef, PendingSource,
+    Picker, PickerItem, PickerKind, PickerValue, SourceFilter, MIN_CONTENT_QUERY_LEN,
+    PICKER_REFRESH_DEBOUNCE_MS,
 };
 use crate::Editor;
 
@@ -133,7 +134,9 @@ pub(crate) fn picker_key_action(p: &mut Picker, k: KeyEvent) -> PickerAction {
         KeyCode::Esc => return PickerAction::Close,
         KeyCode::Char('c') if ctrl => return PickerAction::Close,
         KeyCode::Tab => {
-            return if matches!(p.kind, PickerKind::Omni) {
+            // Regex mode (leading `/`) is content-only and bypasses the
+            // source filter, so cycling it would be dead UI — no-op.
+            return if matches!(p.kind, PickerKind::Omni) && !p.regex_mode() {
                 PickerAction::CycleFilter
             } else {
                 PickerAction::None
@@ -271,10 +274,12 @@ impl Editor {
         // and gates the actual walk on `MIN_CONTENT_QUERY_LEN`, so backspacing
         // below the threshold clears content rows without walking, and the
         // file rescore inside still fires so name results update instantly.
-        // Everything else (and a warm content cache) just rescores.
+        // Everything else (and a warm content cache) just rescores. The
+        // staleness check compares RAW query strings, so adding/removing the
+        // `/` regex sigil registers stale and re-walks correctly.
         let restart_content = self.picker.as_ref().is_some_and(|p| {
             matches!(p.kind, PickerKind::Omni)
-                && p.filter != SourceFilter::Files
+                && p.content_visible()
                 && p.last_grep_query.as_deref() != Some(p.query.as_str())
         });
         if restart_content {
@@ -343,14 +348,15 @@ impl Editor {
     /// Spawn the streaming content-search (grep) worker for the omni
     /// picker's current query. Clears the previous query's hits immediately
     /// (they're stale) and drops any now-invalid content marks, then batches
-    /// stream in via `pump_picker_sources`. Queries shorter than
-    /// `MIN_CONTENT_QUERY_LEN` just clear — no walk. No-op unless the omni
-    /// picker's filter has the Content source visible.
+    /// stream in via `pump_picker_sources`. A leading `/` sigil makes the
+    /// pattern a regex (see `parse_omni_query`); an invalid/incomplete
+    /// regex sets `grep_error` and spawns nothing, so the content list is
+    /// empty rather than stale. Patterns shorter than
+    /// `MIN_CONTENT_QUERY_LEN` (after the sigil) just clear — no walk.
+    /// No-op unless the omni picker's Content source is visible.
     pub(crate) fn start_grep_stream(&mut self) {
         let query = match self.picker.as_ref() {
-            Some(p) if matches!(p.kind, PickerKind::Omni) && p.filter != SourceFilter::Files => {
-                p.query.clone()
-            }
+            Some(p) if matches!(p.kind, PickerKind::Omni) && p.content_visible() => p.query.clone(),
             _ => return,
         };
         // Cancel any in-flight grep; stale batches also fail the receiver-side
@@ -360,29 +366,48 @@ impl Editor {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
         self.grep_source = None;
-        let run = query.trim().chars().count() >= MIN_CONTENT_QUERY_LEN;
+        let oq = parse_omni_query(&query);
+        let kind = if oq.regex {
+            vix_picker::PatternKind::Regex
+        } else {
+            vix_picker::PatternKind::Literal
+        };
+        let run = oq.pattern.trim().chars().count() >= MIN_CONTENT_QUERY_LEN;
+        // Build the matcher up front on the UI thread, so an invalid regex
+        // surfaces here — error field set, no worker spawned — instead of
+        // inside the walk. (A fixed-strings build can't practically fail.)
+        let matcher = if run {
+            Some(vix_picker::build_matcher(oq.pattern, kind))
+        } else {
+            None
+        };
+        let will_spawn = matches!(matcher, Some(Ok(_)));
         if let Some(p) = self.picker.as_mut() {
             p.grep_items.clear();
             p.grep_match_count = 0;
             // The grep source is being replaced, so any `Grep(_)` marks now
             // point at the wrong rows; file/other marks survive.
             p.marked.retain(|r| !matches!(r, ItemRef::Grep(_)));
-            p.grep_items_complete = !run;
+            p.grep_items_complete = !will_spawn;
+            p.grep_error = match &matcher {
+                Some(Err(_)) => Some("invalid regex".into()),
+                _ => None,
+            };
             p.last_grep_query = Some(query.clone());
             // Rescore now so file-name results update instantly while the
-            // content walk restarts underneath.
+            // content walk restarts underneath (and so an invalid regex
+            // shows its empty content list immediately, not stale hits).
             p.rescore_query_changed();
         }
-        if !run {
+        let Some(Ok(matcher)) = matcher else {
             return;
-        }
+        };
+        let matcher = Arc::new(matcher);
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let gen_arc = Arc::clone(&self.grep_gen);
         let (tx, rx) = std::sync::mpsc::channel::<Vec<PickerItem>>();
         std::thread::spawn(move || {
-            // Regex errors (mid-typing patterns like `[`) collapse to an
-            // empty stream — same silence as the old sync path.
-            let _ = grep_streaming(&cwd, &query, &gen_arc, target_gen, |batch| {
+            grep_streaming(&cwd, matcher, &gen_arc, target_gen, |batch| {
                 tx.send(
                     batch
                         .into_iter()
@@ -403,10 +428,7 @@ impl Editor {
     /// per-source storage without touching the selection; sender disconnect
     /// marks the source complete.
     pub(crate) fn pump_picker_sources(&mut self) {
-        loop {
-            let Some(src) = self.files_source.as_ref() else {
-                break;
-            };
+        while let Some(src) = self.files_source.as_ref() {
             match src.rx.try_recv() {
                 Ok(batch) => {
                     let gen = src.gen;
@@ -419,10 +441,7 @@ impl Editor {
                 }
             }
         }
-        loop {
-            let Some(src) = self.grep_source.as_ref() else {
-                break;
-            };
+        while let Some(src) = self.grep_source.as_ref() {
             match src.rx.try_recv() {
                 Ok(batch) => {
                     let gen = src.gen;
@@ -599,7 +618,7 @@ impl Editor {
             }
             let restart_content = self.picker.as_ref().is_some_and(|p| {
                 matches!(p.kind, PickerKind::Omni)
-                    && p.filter != SourceFilter::Files
+                    && p.content_visible()
                     && p.last_grep_query.as_deref() != Some(p.query.as_str())
             });
             if restart_content {
@@ -637,8 +656,12 @@ impl Editor {
         // `with_query` rescores with the filter + recents already in place.
         self.picker = Some(p.with_query(initial_query));
         self.start_files_scan();
-        if filter != SourceFilter::Files
-            && initial_query.trim().chars().count() >= MIN_CONTENT_QUERY_LEN
+        // A leading `/` sigil (regex mode) forces the content walk
+        // regardless of `filter`; the length gate measures the pattern
+        // after the sigil.
+        let oq = parse_omni_query(initial_query);
+        if (oq.regex || filter != SourceFilter::Files)
+            && oq.pattern.trim().chars().count() >= MIN_CONTENT_QUERY_LEN
         {
             self.start_grep_stream();
         }
@@ -693,9 +716,7 @@ impl Editor {
             p.last_grep_query.as_deref() == Some(p.query.as_str())
         };
         let need_content = self.picker.as_ref().is_some_and(|p| {
-            p.filter != SourceFilter::Files
-                && !warm
-                && p.query.trim().chars().count() >= MIN_CONTENT_QUERY_LEN
+            p.content_visible() && !warm && p.content_pattern_len() >= MIN_CONTENT_QUERY_LEN
         });
         if need_content {
             // Starts the walk and rescores (clearing stale hits, resetting
@@ -1206,5 +1227,57 @@ mod tests {
 
         let picker = ed.picker.as_ref().expect("picker should stay open");
         assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn tab_is_noop_in_regex_mode() {
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.query = "/x".to_string();
+        let action = picker_key_action(&mut p, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(
+            matches!(action, PickerAction::None),
+            "Tab must not cycle the filter in regex mode"
+        );
+        assert_eq!(p.filter, SourceFilter::All);
+
+        // Without the sigil, Tab still cycles.
+        p.query = "x".to_string();
+        let action = picker_key_action(&mut p, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(action, PickerAction::CycleFilter));
+    }
+
+    #[test]
+    fn invalid_regex_sets_error_and_empties_results() {
+        let mut ed = Editor::new(Buffer::empty());
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        // Pre-seed a stale hit: the failed rebuild must clear it, not keep it.
+        p.grep_items.push(PickerItem {
+            display: "stale".to_string(),
+            value: PickerValue::GrepHit {
+                path: "stale.rs".into(),
+                line: 1,
+            },
+            haystack: Utf32String::from("stale"),
+        });
+        p.query = "/foo[".to_string();
+        ed.picker = Some(p);
+
+        // An unterminated character class: matcher build fails, nothing
+        // spawns, error set, content list empty.
+        ed.start_grep_stream();
+        {
+            let p = ed.picker.as_ref().expect("picker stays open");
+            assert!(p.grep_error.is_some(), "invalid regex must set the error");
+            assert!(p.matches.is_empty(), "no stale results may survive");
+            assert!(p.grep_items.is_empty());
+            assert!(p.grep_items_complete, "no walk is in flight");
+            assert!(ed.grep_source.is_none(), "no worker spawned");
+        }
+
+        // The next parseable pattern clears the error via the same path.
+        ed.picker.as_mut().unwrap().query = "/foo".to_string();
+        ed.start_grep_stream();
+        assert!(ed.picker.as_ref().unwrap().grep_error.is_none());
+        ed.cancel_picker_sources();
     }
 }

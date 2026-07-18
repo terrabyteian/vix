@@ -11,9 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::picker::{
-    fit_picker_row, layout_grep_row, substring_match_smart, wrap_picker_detail, GrepRowLayout,
-    ItemRef, Picker, PickerItem, PickerKind, PickerLayout, PickerValue, SourceFilter,
-    MIN_CONTENT_QUERY_LEN,
+    fit_picker_row, layout_grep_row, parse_omni_query, substring_match_smart, wrap_picker_detail,
+    GrepRowLayout, ItemRef, Picker, PickerItem, PickerKind, PickerLayout, PickerValue,
+    SourceFilter, MIN_CONTENT_QUERY_LEN,
 };
 use crate::theme::Theme;
 use crate::util::{char_index_in_byte_range, count_chars, pad_or_trunc, take_end};
@@ -625,14 +625,29 @@ fn file_highlight_chars(displayed: &str, query: &str) -> std::collections::HashS
     set
 }
 
-/// The `All · Files · Content` filter indicator: spans with the active label
-/// accented/bold and the others dimmed, plus its total column width.
-fn filter_indicator_spans(filter: SourceFilter, theme: &Theme) -> (Vec<Span<'static>>, usize) {
+/// The omnibox mode indicator: normally the `All · Files · Content` filter
+/// spans with the active label accented/bold and the others dimmed. In regex
+/// mode (leading `/` sigil) the Tab-filter cycle is a no-op, so the tabs are
+/// replaced by a `Regex` badge — plus `· invalid` in `diag_error` red when
+/// the pattern failed to compile. Returns the spans and their column width.
+fn filter_indicator_spans(p: &Picker, theme: &Theme) -> (Vec<Span<'static>>, usize) {
     let active = Style::default()
         .fg(theme.accent_hi)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme.dim);
     let sep = Style::default().fg(theme.border);
+    if p.regex_mode() {
+        let mut spans: Vec<Span> = vec![Span::styled(" ", sep), Span::styled("Regex", active)];
+        let mut width = 1 + count_chars("Regex");
+        if p.grep_error.is_some() {
+            spans.push(Span::styled(" \u{00b7} ", sep));
+            spans.push(Span::styled("invalid", theme.diag_error));
+            width += 3 + count_chars("invalid");
+        }
+        spans.push(Span::styled(" ", sep));
+        width += 1;
+        return (spans, width);
+    }
     let labels = [
         ("All", SourceFilter::All),
         ("Files", SourceFilter::Files),
@@ -645,7 +660,7 @@ fn filter_indicator_spans(filter: SourceFilter, theme: &Theme) -> (Vec<Span<'sta
             spans.push(Span::styled(" \u{00b7} ", sep));
             width += 3;
         }
-        let style = if *f == filter { active } else { dim };
+        let style = if *f == p.filter { active } else { dim };
         spans.push(Span::styled(*label, style));
         width += count_chars(label);
     }
@@ -672,7 +687,7 @@ fn render_omni_body(
     let arrow_style = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let (ind_spans, ind_w) = filter_indicator_spans(p.filter, theme);
+    let (ind_spans, ind_w) = filter_indicator_spans(p, theme);
 
     // --- Input --------------------------------------------------------------
     if let Some(block) = geo.input_block {
@@ -740,6 +755,12 @@ fn render_omni_body(
     set_prompt_cursor(f, geo, 2, &p.query);
 
     // --- Result list --------------------------------------------------------
+    // Highlight lookups use the parsed pattern, sigil stripped. In literal
+    // mode the pattern IS the raw query (parse returns it unchanged), so this
+    // is correct for both modes. A regex pattern with metacharacters simply
+    // misses the literal substring lookup → no highlight (already a handled
+    // case); regex-aware highlighting is a follow-up.
+    let hl_query = parse_omni_query(&p.query).pattern;
     let cwd = std::env::current_dir().unwrap_or_default();
     let list_rows = geo.list.height as usize;
     let list_w = geo.list.width as usize;
@@ -781,7 +802,7 @@ fn render_omni_body(
                     &rel.to_string_lossy(),
                     *line,
                     &item.display,
-                    &p.query,
+                    hl_query,
                     content_w,
                 );
                 spans.push(Span::styled(prefix, row_style.fg(theme.dim)));
@@ -792,10 +813,10 @@ fn render_omni_body(
             }
             _ => {
                 let displayed = fit_picker_row(item, content_w);
-                let hl_chars = if p.query.trim().is_empty() {
+                let hl_chars = if hl_query.trim().is_empty() {
                     std::collections::HashSet::new()
                 } else {
-                    file_highlight_chars(&displayed, &p.query)
+                    file_highlight_chars(&displayed, hl_query)
                 };
                 spans.extend(highlighted_spans(
                     &displayed, &hl_chars, row_style, hi_style,
@@ -838,47 +859,68 @@ fn render_omni_footer(
     let files = p.file_match_count;
     let grep = p.grep_match_count;
     let empty_query = p.query.trim().is_empty();
-    let mut left = if p.showing_recents() {
-        // Empty query, All filter, recents view: count the recents shown
-        // plus the honest total file count (hidden behind the view).
-        format!("{} recent \u{00b7} {files} files", p.recent_items.len())
-    } else {
-        match (empty_query, p.filter) {
-            (true, _) | (false, SourceFilter::Files) => format!("{files} files"),
-            (false, SourceFilter::Content) => format!("{grep} matches"),
-            (false, SourceFilter::All) => format!("{files} files \u{00b7} {grep} matches"),
-        }
-    };
-    // Still streaming? (Files source, or the content source when it's shown.)
-    let scanning =
-        !p.file_items_complete || (!p.grep_items_complete && p.filter != SourceFilter::Files);
-    if scanning {
-        left.push_str(" \u{00b7} scanning\u{2026}");
-    }
-    // 1..MIN content chars with the content source visible: nudge for more.
-    let qn = p.query.trim().chars().count();
-    if p.filter != SourceFilter::Files && (1..MIN_CONTENT_QUERY_LEN).contains(&qn) {
-        left.push_str(&format!(
-            " \u{00b7} type {MIN_CONTENT_QUERY_LEN}+ chars for content"
+    let regex = p.regex_mode();
+    // Left side: an `[invalid regex]` marker (diag_error red) replaces the
+    // counts when the regex pattern failed to compile; otherwise counts —
+    // content-only in regex mode — plus scanning / short-query nudges.
+    let mut left_spans: Vec<Span> = Vec::new();
+    if regex && p.grep_error.is_some() {
+        left_spans.push(Span::styled(" ".to_string(), dim));
+        left_spans.push(Span::styled(
+            "[invalid regex]".to_string(),
+            theme.picker_bg.patch(theme.diag_error),
         ));
+    } else {
+        let mut left = if p.showing_recents() {
+            // Empty query, All filter, recents view: count the recents shown
+            // plus the honest total file count (hidden behind the view).
+            format!("{} recent \u{00b7} {files} files", p.recent_items.len())
+        } else if regex {
+            // Regex mode is content-only: file counts are meaningless.
+            format!("{grep} matches \u{00b7} regex")
+        } else {
+            match (empty_query, p.filter) {
+                (true, _) | (false, SourceFilter::Files) => format!("{files} files"),
+                (false, SourceFilter::Content) => format!("{grep} matches"),
+                (false, SourceFilter::All) => format!("{files} files \u{00b7} {grep} matches"),
+            }
+        };
+        // Still streaming? Regex mode only watches the content source (the
+        // file scan feeds rows it will never show); otherwise the files
+        // source, or the content source when it's shown. An invalid regex
+        // never spins — nothing is running (handled by the branch above).
+        let scanning = if regex {
+            !p.grep_items_complete
+        } else {
+            !p.file_items_complete || (!p.grep_items_complete && p.content_visible())
+        };
+        if scanning {
+            left.push_str(" \u{00b7} scanning\u{2026}");
+        }
+        // 1..MIN content (pattern) chars with the content source visible:
+        // nudge for more. Measured after the `/` sigil, so `/a` still nudges.
+        let qn = p.content_pattern_len();
+        if p.content_visible() && (1..MIN_CONTENT_QUERY_LEN).contains(&qn) {
+            left.push_str(&format!(
+                " \u{00b7} type {MIN_CONTENT_QUERY_LEN}+ chars for content"
+            ));
+        }
+        left_spans.push(Span::styled(format!(" {left}"), dim));
     }
 
-    let right = if quit_on_picker_close {
-        "Tab filter \u{00b7} Esc quit"
-    } else {
-        "Tab filter \u{00b7} Esc close"
+    // Right side: Tab is a no-op in regex mode, so drop its hint there.
+    let right = match (regex, quit_on_picker_close) {
+        (true, true) => "Esc quit",
+        (true, false) => "Esc close",
+        (false, true) => "Tab filter \u{00b7} Esc quit",
+        (false, false) => "Tab filter \u{00b7} Esc close",
     };
-    let left = format!(" {left}");
     let right = format!("{right} ");
-    let pad = w.saturating_sub(count_chars(&left) + count_chars(&right));
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(left, dim),
-            Span::styled(" ".repeat(pad), dim),
-            Span::styled(right, dim),
-        ])),
-        geo.footer,
-    );
+    let left_w: usize = left_spans.iter().map(|s| count_chars(&s.content)).sum();
+    let pad = w.saturating_sub(left_w + count_chars(&right));
+    left_spans.push(Span::styled(" ".repeat(pad), dim));
+    left_spans.push(Span::styled(right, dim));
+    f.render_widget(Paragraph::new(Line::from(left_spans)), geo.footer);
 }
 
 // --- Preview pane ----------------------------------------------------------
@@ -1203,6 +1245,119 @@ mod tests {
             "filter indicator missing: {text}"
         );
         assert!(text.contains("Tab filter"), "footer hints missing: {text}");
+    }
+
+    /// Regex mode (leading `/` sigil): the filter tabs give way to a `Regex`
+    /// badge, the footer counts go content-only (`N matches · regex`), the
+    /// Tab hint disappears (Tab is a no-op in regex mode), and the grep
+    /// snippet still highlights via the stripped pattern.
+    #[test]
+    fn omni_regex_mode_shows_badge_and_content_footer() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.grep_items.push(PickerItem {
+            display: "let beta = 1;".to_string(),
+            value: PickerValue::GrepHit {
+                path: "src/other.rs".into(),
+                line: 12,
+            },
+            haystack: Utf32String::from("src/other.rs:12: let beta = 1;"),
+        });
+        p.query = "/beta".to_string();
+        p.rescore();
+        ed.picker = Some(p);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+        let text = backend_text(term.backend());
+
+        assert!(text.contains("Regex"), "regex badge missing: {text}");
+        assert!(
+            !text.contains("All \u{00b7} Files \u{00b7} Content"),
+            "filter tabs should be hidden in regex mode: {text}"
+        );
+        assert!(
+            !text.contains("invalid"),
+            "no invalid marker for a valid pattern: {text}"
+        );
+        assert!(
+            text.contains("1 matches \u{00b7} regex"),
+            "content-only regex counts missing: {text}"
+        );
+        assert!(
+            !text.contains("Tab filter"),
+            "Tab hint should be hidden in regex mode: {text}"
+        );
+        assert!(text.contains("Esc close"), "Esc hint missing: {text}");
+        assert!(text.contains("let beta = 1;"), "snippet missing: {text}");
+        // The prompt shows the query as typed, sigil included.
+        assert!(text.contains("> /beta"), "raw prompt query missing: {text}");
+    }
+
+    /// An invalid regex pattern: the badge grows a `· invalid` marker, the
+    /// footer swaps its counts for `[invalid regex]`, and the spinner stays
+    /// off even mid-stream flags — nothing is running.
+    #[test]
+    fn omni_regex_invalid_shows_error_marker() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.query = "/[".to_string();
+        p.grep_error = Some("invalid regex".to_string());
+        p.grep_items_complete = false;
+        p.file_items_complete = false;
+        p.rescore();
+        ed.picker = Some(p);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+        let text = backend_text(term.backend());
+
+        assert!(
+            text.contains("Regex \u{00b7} invalid"),
+            "invalid badge missing: {text}"
+        );
+        assert!(
+            text.contains("[invalid regex]"),
+            "footer error marker missing: {text}"
+        );
+        assert!(
+            !text.contains("scanning"),
+            "no spinner while the regex is invalid: {text}"
+        );
+    }
+
+    /// The short-query nudge measures the pattern AFTER the sigil: `/a` (1
+    /// pattern char) shows the "type 2+ chars" hint, `/ab` does not.
+    #[test]
+    fn omni_regex_short_pattern_hint() {
+        let mut ed = Editor::new(Buffer::from_text("placeholder\n"));
+        let mut p = Picker::new(PickerKind::Omni, Vec::new());
+        p.query = "/a".to_string();
+        p.rescore();
+        ed.picker = Some(p);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+        let text = backend_text(term.backend());
+        assert!(
+            text.contains("type 2+ chars"),
+            "short-pattern hint missing for /a: {text}"
+        );
+
+        let p = ed.picker.as_mut().unwrap();
+        p.query = "/ab".to_string();
+        p.rescore();
+        let backend = TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &mut ed)).unwrap();
+        let text = backend_text(term.backend());
+        assert!(
+            !text.contains("type 2+ chars"),
+            "no hint once the pattern reaches 2 chars: {text}"
+        );
     }
 
     /// The launch omnibox (`quit_on_picker_close` true, as set by `app.rs`'s

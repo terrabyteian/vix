@@ -690,6 +690,261 @@ fn launch_select_does_not_quit() {
     );
 }
 
+// --- Regex mode (`/` sigil) & determinism -------------------------------
+//
+// A leading `/` in the omni query switches to regex, content-only search:
+// file-name rows drop out entirely, the stripped pattern runs as a
+// smart-case regex (2-char minimum), and a non-compiling pattern shows an
+// "invalid regex" indicator with an empty list instead of stale hits. A
+// `/` anywhere else in the query stays a literal path character. The
+// settled match list is deterministic: grep rows order by `(path, line)`
+// regardless of the parallel walk's arrival order.
+
+/// A repo with a nested `src/` tree so a query containing a mid-string `/`
+/// can hit a real path (`src/mod.rs`).
+fn setup_tree_repo() -> CwdGuard {
+    let guard = lock_cwd();
+    let dir = tempdir();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/mod.rs"), "pub fn helper() {}\n").unwrap();
+    fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    guard
+}
+
+/// Six files with several `needle` lines spread across five of them —
+/// enough surface for the parallel grep walk to deliver batches in
+/// scrambled order — plus one file NAMED `needle.txt` so a literal query
+/// blends a file-band row above the grep band.
+fn setup_determinism_repo() -> CwdGuard {
+    let guard = lock_cwd();
+    let dir = tempdir();
+    fs::write(
+        dir.join("alpha.txt"),
+        "needle a1\nfiller\nneedle a3\nneedle a4\n",
+    )
+    .unwrap();
+    fs::write(dir.join("bravo.txt"), "needle b1\nneedle b2\nneedle b3\n").unwrap();
+    fs::write(dir.join("charlie.txt"), "needle c1\nplain\nneedle c3\n").unwrap();
+    fs::write(dir.join("delta.txt"), "no hits here\n").unwrap();
+    fs::write(dir.join("echo.txt"), "needle e1\nneedle e2\n").unwrap();
+    fs::write(dir.join("needle.txt"), "needle n1\n").unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    guard
+}
+
+#[test]
+fn slash_query_searches_content_only_as_regex() {
+    let _dir = setup_blend_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>f");
+    // Baseline: the literal query `hello` name-matches hello.txt, proving
+    // the fixture WOULD produce file rows for this text without the sigil.
+    h.keys("hello");
+    h.flush_picker();
+    let (files, _content) = h.editor.picker_counts_for_test();
+    assert!(files >= 1, "literal `hello` should name-match hello.txt");
+    // Now the same idea as a regex: `/hel.o` matches the `hello` content
+    // hit in world.rs, and file-name rows must vanish entirely.
+    h.keys("<C-u>");
+    h.keys("/hel.o");
+    h.flush_picker();
+    let (files, content) = h.editor.picker_counts_for_test();
+    assert_eq!(files, 0, "regex mode must drop file-name rows");
+    assert!(content > 0, "regex `hel.o` should hit world.rs content");
+    assert_eq!(h.editor.picker_selected_source_for_test(), Some("grep"));
+    // Every row is a grep row, resolved to its (path, line, text).
+    assert_eq!(
+        h.editor.picker_match_displays_for_test(),
+        vec!["world.rs:1:fn hello() { /* hi */ }".to_string()]
+    );
+}
+
+#[test]
+fn invalid_regex_shows_indicator_and_no_stale_results() {
+    let _dir = setup_blend_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>f");
+    h.keys("/hello");
+    h.flush_picker();
+    assert_eq!(h.editor.picker_grep_error_for_test(), None);
+    assert!(
+        h.editor.picker_matches_count_for_test() > 0,
+        "valid regex should produce hits before the pattern breaks"
+    );
+    // Append `[` — an unterminated class. The old hits must not linger.
+    h.keys("[");
+    h.flush_picker();
+    assert_eq!(
+        h.editor.picker_matches_count_for_test(),
+        0,
+        "invalid regex must show an empty list, not stale hits"
+    );
+    assert_eq!(
+        h.editor.picker_grep_error_for_test(),
+        Some("invalid regex".into())
+    );
+    // Close the class into a valid pattern: `/hello[(]` matches the
+    // `hello(` in world.rs. Error clears, results return.
+    h.keys("(]");
+    h.flush_picker();
+    assert_eq!(h.picker_query(), Some("/hello[(]"));
+    assert_eq!(h.editor.picker_grep_error_for_test(), None);
+    assert!(
+        h.editor.picker_matches_count_for_test() > 0,
+        "repaired regex should match again"
+    );
+}
+
+#[test]
+fn slash_min_two_pattern_chars_before_search() {
+    let _dir = setup_blend_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>f");
+    // `/a` strips to a 1-char pattern: below the 2-char gate, so no walk
+    // runs even though `a` appears in the fixture's contents — and a short
+    // pattern is not an error.
+    h.keys("/a");
+    h.flush_picker();
+    assert_eq!(h.editor.picker_counts_for_test(), (0, 0));
+    assert_eq!(h.editor.picker_matches_count_for_test(), 0);
+    assert_eq!(h.editor.picker_grep_error_for_test(), None);
+}
+
+#[test]
+fn regex_smart_case_end_to_end() {
+    // setup_repo's contents are lowercase-only ("the quick brown fox").
+    let _dir = setup_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>f");
+    // All-lowercase pattern: smart case searches case-insensitively.
+    h.keys("/qu.ck");
+    h.flush_picker();
+    assert_eq!(
+        h.editor.picker_match_displays_for_test(),
+        vec!["alpha.txt:2:the quick brown fox".to_string()]
+    );
+    // An uppercase letter flips smart case to case-sensitive, so the same
+    // shape no longer matches the lowercase-only content.
+    h.keys("<C-u>");
+    h.keys("/Qu.ck");
+    h.flush_picker();
+    assert_eq!(h.editor.picker_matches_count_for_test(), 0);
+    assert_eq!(h.editor.picker_grep_error_for_test(), None);
+}
+
+#[test]
+fn non_leading_slash_is_still_literal() {
+    let _dir = setup_tree_repo();
+    let mut h = Harness::with_text("scratch\n");
+    h.keys("<Space>f");
+    // `/` mid-query is an ordinary literal character: `src/mod` is a
+    // blended (file-name) search that hits the real path, exactly as
+    // before regex mode existed.
+    h.keys("src/mod");
+    h.flush_picker();
+    let (files, content) = h.editor.picker_counts_for_test();
+    assert_eq!(files, 1, "src/mod should name-match src/mod.rs");
+    assert_eq!(content, 0, "no file contains the literal text src/mod");
+    assert_eq!(h.editor.picker_selected_source_for_test(), Some("file"));
+    assert_eq!(
+        h.editor.picker_match_displays_for_test(),
+        vec!["src/mod.rs".to_string()]
+    );
+    assert_eq!(h.editor.picker_grep_error_for_test(), None);
+}
+
+#[test]
+fn same_settled_query_twice_yields_identical_list() {
+    let _dir = setup_determinism_repo();
+    let mut h = Harness::with_text("scratch\n");
+    // The blended list's settled order for `needle`: the file-band row
+    // (needle.txt name-matches) first, then every grep row in strict
+    // (path A→Z, line ascending) order — independent of the parallel
+    // walk's arrival order.
+    let expected: Vec<String> = [
+        "needle.txt",
+        "alpha.txt:1:needle a1",
+        "alpha.txt:3:needle a3",
+        "alpha.txt:4:needle a4",
+        "bravo.txt:1:needle b1",
+        "bravo.txt:2:needle b2",
+        "bravo.txt:3:needle b3",
+        "charlie.txt:1:needle c1",
+        "charlie.txt:3:needle c3",
+        "echo.txt:1:needle e1",
+        "echo.txt:2:needle e2",
+        "needle.txt:1:needle n1",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    h.keys("<Space>f");
+    h.keys("needle");
+    h.flush_picker();
+    let first = h.editor.picker_match_displays_for_test();
+
+    // Close without picking and rerun the identical query. Recency state
+    // is identical across both snapshots: the harness disables the recent
+    // store, and recents are only ever recorded when a file actually
+    // opens (buffers.rs) — never on Esc.
+    h.keys("<Esc>");
+    assert!(!h.picker_open());
+    h.keys("<Space>f");
+    h.keys("needle");
+    h.flush_picker();
+    let second = h.editor.picker_match_displays_for_test();
+
+    assert_eq!(
+        first, expected,
+        "settled list must match (path, line) order"
+    );
+    assert_eq!(second, expected, "rerun must settle to the identical list");
+}
+
+#[test]
+fn same_settled_regex_query_twice_yields_identical_list() {
+    let _dir = setup_determinism_repo();
+    let mut h = Harness::with_text("scratch\n");
+    // Regex mode is content-only: no needle.txt file-band row, just the
+    // grep rows in strict (path A→Z, line ascending) order.
+    let expected: Vec<String> = [
+        "alpha.txt:1:needle a1",
+        "alpha.txt:3:needle a3",
+        "alpha.txt:4:needle a4",
+        "bravo.txt:1:needle b1",
+        "bravo.txt:2:needle b2",
+        "bravo.txt:3:needle b3",
+        "charlie.txt:1:needle c1",
+        "charlie.txt:3:needle c3",
+        "echo.txt:1:needle e1",
+        "echo.txt:2:needle e2",
+        "needle.txt:1:needle n1",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    h.keys("<Space>f");
+    h.keys("/nee.le");
+    h.flush_picker();
+    let first = h.editor.picker_match_displays_for_test();
+
+    h.keys("<Esc>");
+    assert!(!h.picker_open());
+    h.keys("<Space>f");
+    h.keys("/nee.le");
+    h.flush_picker();
+    let second = h.editor.picker_match_displays_for_test();
+
+    assert_eq!(
+        first, expected,
+        "settled regex list must match (path, line) order"
+    );
+    assert_eq!(second, expected, "rerun must settle to the identical list");
+}
+
 #[test]
 fn in_editor_esc_does_not_quit() {
     let _dir = setup_repo();

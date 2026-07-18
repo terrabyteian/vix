@@ -46,6 +46,11 @@ pub(crate) struct Picker {
     /// cycle tell a warm grep cache from a stale one without re-running the
     /// walk.
     pub(crate) last_grep_query: Option<String>,
+    /// Set when the content pattern failed to build (an invalid/incomplete
+    /// regex mid-typing): the walk didn't run and the content list is
+    /// empty. Cleared by the next query flush whose pattern parses.
+    /// Rendered by the omnibox footer.
+    pub(crate) grep_error: Option<String>,
     /// Recent-files source for the omni empty-query view. Loaded at open
     /// time from the per-project recent store, most-recent-first;
     /// referenced by `ItemRef::Recent`. Drives the empty-query, All-filter
@@ -70,11 +75,13 @@ pub(crate) struct Picker {
     /// (Symbols, Buffers, CodeActions, Jumps). Referenced by
     /// `ItemRef::Item`.
     pub(crate) items: Vec<PickerItem>,
-    /// Scored subset of the picker's sources visible in the current list.
-    /// Each entry is `(source ref, nucleo score)`; omni blends its sources
-    /// with a baked-in i64 ranking and stores `0` here (the order is
-    /// already final), while fuzzy kinds keep the nucleo score.
-    pub(crate) matches: Vec<(ItemRef, u32)>,
+    /// Scored subset of the picker's sources visible in the current list,
+    /// kept sorted at all times. Each entry is `(source ref, score)`: omni
+    /// stores its baked-in i64 band score (see `omni_cmp` — the list order
+    /// is descending score with deterministic tie keys, maintained
+    /// continuously as batches stream in), while fuzzy kinds store the
+    /// nucleo `u32` score widened to i64.
+    pub(crate) matches: Vec<(ItemRef, i64)>,
     pub(crate) selected: usize,
     /// Vertical scroll offset within the match list.
     pub(crate) scroll: usize,
@@ -268,26 +275,111 @@ impl PickerKind {
 
 /// Minimum query length before the omni content (grep) source runs. Below
 /// this, a Content-filtered query shows a hint instead of walking the whole
-/// repo, and the blended view is file-names-only.
+/// repo, and the blended view is file-names-only. In regex mode the gate
+/// measures the pattern *after* the `/` sigil (see [`parse_omni_query`]).
 pub(crate) const MIN_CONTENT_QUERY_LEN: usize = 2;
+
+/// A parsed omni query: search mode plus the pattern the content (grep)
+/// source actually runs.
+pub(crate) struct OmniQuery<'a> {
+    /// True when the query began with the `/` sigil: regex, content-only.
+    pub regex: bool,
+    /// The query with any leading sigil stripped. Untrimmed — mirroring how
+    /// the literal path passes the raw query through; trimming happens only
+    /// at the `MIN_CONTENT_QUERY_LEN` gate.
+    pub pattern: &'a str,
+}
+
+/// Split an omni query into mode + pattern. Regex iff the FIRST char is
+/// `/`: the sigil is stripped and the remainder is a regex, content-only
+/// search. A `/` anywhere else is an ordinary literal character. Compat
+/// break: a leading `/` no longer literal-searches a slash — the escape
+/// hatch is `/\/…`, a regex whose escaped slash matches a literal leading
+/// slash.
+pub(crate) fn parse_omni_query(q: &str) -> OmniQuery<'_> {
+    match q.strip_prefix('/') {
+        Some(rest) => OmniQuery {
+            regex: true,
+            pattern: rest,
+        },
+        None => OmniQuery {
+            regex: false,
+            pattern: q,
+        },
+    }
+}
 
 // --- Omni ranking bands -----------------------------------------------------
 //
 // One i64 score per candidate, higher = earlier. File-name hits live in the
 // FILE_BAND (with a basename bonus, an earlier-offset preference, a shorter-
-// path preference, and a recency bonus); content hits live in the lower
-// GREP_BAND ordered by discovery. The consequence, documented so the blend's
-// feel is intentional: any realistic file hit (path under ~200 chars)
-// outscores every content hit, so the omni list reads as "ranked name hits,
-// then content hits in discovery order".
+// path preference, and a recency bonus); content hits all score exactly
+// GREP_BAND and are ordered by their `(path, line)` tie key (see
+// `OmniTieKey`). The consequence, documented so the blend's feel is
+// intentional: any realistic file hit (path under ~200 chars) outscores
+// every content hit, so the omni list reads as "ranked name hits, then
+// content hits in (path, line) order".
 
 /// Base score for a file-name hit. Above `GREP_BAND` by a wide margin.
 const FILE_BAND: i64 = 2_000_000;
 /// Added when the first query token hits the path's *basename* (segment
 /// after the last `/`) rather than only a parent directory.
 const BASENAME_BONUS: i64 = 1_000_000;
-/// Base score for a content (grep) hit: `GREP_BAND - arrival_index`.
+/// Score for every content (grep) hit — a constant: within the band, the
+/// `(path, line)` tie key alone orders the rows, so the rank is independent
+/// of the grep worker's thread arrival order.
 const GREP_BAND: i64 = 1_000_000;
+
+/// Cap on the visible omni match list. Shared by the full rescore and the
+/// streaming sorted inserts so both agree on which top-K survive: under the
+/// `omni_cmp` total order, the settled top-K is the same whatever order the
+/// candidates arrived in.
+pub(crate) const OMNI_MATCH_CAP: usize = 1000;
+
+/// Deterministic secondary key for omni score ties. Variant order is
+/// load-bearing: at equal score, File sorts before Grep.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum OmniTieKey<'a> {
+    /// Display path, lexicographic.
+    File(&'a str),
+    /// `(path, line)` ascending — the natural grep order.
+    Grep(&'a std::path::Path, u64),
+}
+
+/// Resolve a match ref to its tie key. Only `File`/`Grep` refs ever reach a
+/// scored sort: the recents view early-returns before sorting, and `Item` is
+/// non-omni.
+fn omni_tie_key<'a>(
+    file_items: &'a [PickerItem],
+    grep_items: &'a [PickerItem],
+    r: ItemRef,
+) -> OmniTieKey<'a> {
+    match r {
+        ItemRef::File(i) => OmniTieKey::File(&file_items[i].display),
+        ItemRef::Grep(i) => match &grep_items[i].value {
+            PickerValue::GrepHit { path, line } => OmniTieKey::Grep(path, *line),
+            other => unreachable!("grep item without a GrepHit value: {other:?}"),
+        },
+        ItemRef::Item(_) | ItemRef::Recent(_) => {
+            unreachable!("non-omni ref {r:?} in an omni scored sort")
+        }
+    }
+}
+
+/// The omni match list's total order: descending score, ties broken by
+/// `OmniTieKey` ascending. Total (up to duplicate items), so the sorted list
+/// — and its top-`OMNI_MATCH_CAP` prefix — is the same whatever order the
+/// streaming workers delivered candidates in.
+fn omni_cmp(
+    file_items: &[PickerItem],
+    grep_items: &[PickerItem],
+    a: &(ItemRef, i64),
+    b: &(ItemRef, i64),
+) -> std::cmp::Ordering {
+    b.1.cmp(&a.1).then_with(|| {
+        omni_tie_key(file_items, grep_items, a.0).cmp(&omni_tie_key(file_items, grep_items, b.0))
+    })
+}
 
 #[derive(Clone)]
 pub(crate) struct PickerItem {
@@ -512,6 +604,7 @@ impl Picker {
             grep_items: Vec::new(),
             grep_items_complete: true,
             last_grep_query: None,
+            grep_error: None,
             recent_items: Vec::new(),
             recent_rank: std::collections::HashMap::new(),
             file_match_count: 0,
@@ -601,14 +694,32 @@ impl Picker {
     /// For a non-empty query, file names use space-separated AND smart-case
     /// substring matching (`score_file_display`); every file item is scored
     /// so the counts stay honest, but a `File` ref is pushed only when the
-    /// filter isn't `Content`. Content hits are the grep worker's output in
-    /// discovery order (`GREP_BAND - arrival_index`), pushed only when the
-    /// filter isn't `Files`. A stable descending sort by the i64 band score,
-    /// capped at 1000, produces the final order — realistic file hits
-    /// always precede content hits (see the band constants). Selection /
-    /// scroll are left untouched (callers manage them).
+    /// filter isn't `Content`. Content hits all score `GREP_BAND` and are
+    /// pushed only when the filter isn't `Files`. Sorting by `omni_cmp`
+    /// (descending score, deterministic tie keys — `(path, line)` for grep
+    /// hits, display path for files), capped at `OMNI_MATCH_CAP`, produces
+    /// the final order — realistic file hits always precede content hits
+    /// (see the band constants), and identical inputs always produce the
+    /// identical list. Selection / scroll are left untouched (callers
+    /// manage them).
     fn rescore_omni(&mut self) {
-        const CAP: usize = 1000;
+        // Regex mode (leading `/` sigil): content-only. File rows drop out
+        // entirely — count included — and the raw `/pattern` text is never
+        // tokenized against file names. Every grep hit shows at GREP_BAND,
+        // ordered by its `(path, line)` tie key. (`showing_recents` is
+        // unaffected: a query starting with `/` is non-blank.)
+        if self.regex_mode() {
+            self.file_match_count = 0;
+            self.grep_match_count = self.grep_items.len();
+            let mut scored: Vec<(ItemRef, i64)> = (0..self.grep_items.len())
+                .map(|i| (ItemRef::Grep(i), GREP_BAND))
+                .collect();
+            scored.sort_by(|a, b| omni_cmp(&self.file_items, &self.grep_items, a, b));
+            scored.truncate(OMNI_MATCH_CAP);
+            self.matches = scored;
+            return;
+        }
+
         let tokens: Vec<&str> = self.query.split_whitespace().collect();
 
         if tokens.is_empty() {
@@ -658,15 +769,35 @@ impl Picker {
         self.grep_match_count = self.grep_items.len();
         if self.filter != SourceFilter::Files {
             for i in 0..self.grep_items.len() {
-                scored.push((ItemRef::Grep(i), GREP_BAND - i as i64));
+                scored.push((ItemRef::Grep(i), GREP_BAND));
             }
         }
 
-        // Stable sort by descending score keeps same-band ties in source
-        // order (scan order for files, discovery order for grep).
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
-        scored.truncate(CAP);
-        self.matches = scored.into_iter().map(|(r, _)| (r, 0)).collect();
+        // The deterministic total order: descending score, ties broken by
+        // `OmniTieKey` (display path for files, `(path, line)` for grep).
+        scored.sort_by(|a, b| omni_cmp(&self.file_items, &self.grep_items, a, b));
+        scored.truncate(OMNI_MATCH_CAP);
+        self.matches = scored;
+    }
+
+    /// True when the omni query is in regex mode — its first char is the
+    /// `/` sigil (see [`parse_omni_query`]).
+    pub(crate) fn regex_mode(&self) -> bool {
+        self.query.starts_with('/')
+    }
+
+    /// Whether the content (grep) source contributes rows: the `<Tab>`
+    /// filter allows it, or regex mode forces it. Regex BYPASSES the filter
+    /// without mutating it, so deleting the sigil restores normal blended
+    /// search under whatever filter was active.
+    pub(crate) fn content_visible(&self) -> bool {
+        self.regex_mode() || self.filter != SourceFilter::Files
+    }
+
+    /// Char count of the content pattern — sigil stripped, trimmed. What
+    /// the `MIN_CONTENT_QUERY_LEN` gate measures.
+    pub(crate) fn content_pattern_len(&self) -> usize {
+        parse_omni_query(&self.query).pattern.trim().chars().count()
     }
 
     /// True when the omni empty-query view is showing the recents list
@@ -690,27 +821,79 @@ impl Picker {
         self.scroll = 0;
     }
 
+    /// Insert one scored omni candidate at its `omni_cmp` position, keeping
+    /// `matches` sorted and capped at `OMNI_MATCH_CAP`. A candidate whose
+    /// position falls at or past the cap is dropped — deterministically,
+    /// since the settled top-K under a total order is independent of arrival
+    /// order.
+    ///
+    /// Selection: a highlight the user has *moved* (`selected > 0`) follows
+    /// its item — an insert at or above it bumps `selected` by one so it
+    /// stays on the same entry. The untouched top-row default (`selected ==
+    /// 0`, where `rescore_query_changed` parks it) intentionally does not
+    /// follow: it keeps tracking the best match so far, fzf-style, rather
+    /// than pinning to whichever item happened to stream in first.
+    fn insert_match_sorted(&mut self, r: ItemRef, score: i64) {
+        let entry = (r, score);
+        let pos = self.matches.partition_point(|m| {
+            omni_cmp(&self.file_items, &self.grep_items, m, &entry) == std::cmp::Ordering::Less
+        });
+        if pos >= OMNI_MATCH_CAP {
+            return;
+        }
+        self.matches.insert(pos, entry);
+        if self.matches.len() > OMNI_MATCH_CAP {
+            self.matches.pop();
+        }
+        if self.selected > 0 && pos <= self.selected {
+            self.selected += 1;
+        }
+        if self.selected >= self.matches.len() {
+            self.selected = self.matches.len().saturating_sub(1);
+        }
+    }
+
     /// Incremental match update for a streaming file-scan batch: items from
     /// `from_idx` onward in `file_items` are new; score just those, bump
     /// `file_match_count`, and (unless the Content filter hides file rows)
-    /// append their hits. Never touches `selected`/`scroll`, so results
-    /// filling in under the user can't yank the highlight away. Hits land at
-    /// the end in arrival order; the ranked sort is re-applied once when the
-    /// scan completes — see `rescore_omni_preserving_selection`.
+    /// insert their hits at their ranked positions
+    /// (`insert_match_sorted`), so the list stays sorted at all times
+    /// during streaming. Uses the same scoring rule as `rescore_omni`
+    /// (`score_file_recency` at empty query under the Files filter, else
+    /// `score_file_display`) so a streamed insert lands exactly where the
+    /// completion resort would put it. A user-moved highlight stays on its
+    /// item — inserts above it shift the index, never the identity (see
+    /// `insert_match_sorted` for the top-row default's behavior).
     pub(crate) fn append_file_matches(&mut self, from_idx: usize) {
-        const CAP: usize = 1000;
-        let tokens: Vec<&str> = self.query.split_whitespace().collect();
+        // Regex mode is content-only: no file rows and no count bump,
+        // mirroring the `rescore_omni` regex branch (which zeroes the
+        // count).
+        if self.regex_mode() {
+            return;
+        }
+        // Owned copy: `insert_match_sorted` below needs `&mut self` while
+        // the tokens are alive.
+        let query = self.query.clone();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
         // At empty query, All-filter with recents showing, new file rows
         // must not land under the recents view — only the honest count
-        // updates. `score_file_display` matches everything at empty query
-        // regardless of filter, so the match check below is unaffected.
+        // updates. Both scorers match everything at empty query regardless
+        // of filter, so the match check below is unaffected.
         let want_files = self.filter != SourceFilter::Content && !self.showing_recents();
+        let files_empty_query = tokens.is_empty() && self.filter == SourceFilter::Files;
         for i in from_idx..self.file_items.len() {
-            if score_file_display(&self.file_items[i].display, &tokens, &self.recent_rank).is_some()
-            {
+            let score = if files_empty_query {
+                Some(score_file_recency(
+                    &self.file_items[i].display,
+                    &self.recent_rank,
+                ))
+            } else {
+                score_file_display(&self.file_items[i].display, &tokens, &self.recent_rank)
+            };
+            if let Some(score) = score {
                 self.file_match_count += 1;
-                if want_files && self.matches.len() < CAP {
-                    self.matches.push((ItemRef::File(i), 0));
+                if want_files {
+                    self.insert_match_sorted(ItemRef::File(i), score);
                 }
             }
         }
@@ -718,30 +901,30 @@ impl Picker {
 
     /// Incremental match update for a streaming grep batch: items from
     /// `from_idx` onward in `grep_items` are new. Refresh `grep_match_count`
-    /// and (unless the Files filter hides content rows) append them in
-    /// arrival order. Never touches `selected`/`scroll`.
+    /// and (unless the Files filter hides content rows) insert them at
+    /// their ranked `(path, line)` positions (`insert_match_sorted`), so
+    /// the list stays sorted at all times during streaming and the final
+    /// order is independent of the grep workers' arrival order.
     pub(crate) fn append_grep_matches(&mut self, from_idx: usize) {
-        const CAP: usize = 1000;
         self.grep_match_count = self.grep_items.len();
-        // Files filter hides content rows outright; the empty-query recents
+        // The Files filter hides content rows outright (unless regex mode
+        // bypasses it — see `content_visible`); the empty-query recents
         // view (All filter) also must not have grep rows pushed under it —
         // in practice the grep worker never runs at empty query (gated by
         // `MIN_CONTENT_QUERY_LEN`), so this is belt-and-suspenders.
-        if self.filter == SourceFilter::Files || self.showing_recents() {
+        if !self.content_visible() || self.showing_recents() {
             return;
         }
         for i in from_idx..self.grep_items.len() {
-            if self.matches.len() >= CAP {
-                break;
-            }
-            self.matches.push((ItemRef::Grep(i), 0));
+            self.insert_match_sorted(ItemRef::Grep(i), GREP_BAND);
         }
     }
 
-    /// Ranked re-sort of the omni blend after a source stream completes,
-    /// keeping the highlight on the same *ref* wherever it lands in the new
-    /// order. (During streaming, appended hits sit at the end unranked; this
-    /// is the one-time cleanup pass, run from both source-finish paths.)
+    /// Reconciliation pass after a source stream completes, keeping the
+    /// highlight on the same *ref* wherever it lands. Streaming inserts
+    /// already maintain the sorted order continuously, so this rebuilds the
+    /// identical list by construction — it's kept as an invariant-restoring
+    /// backstop (and it refreshes the honest match counts from scratch).
     pub(crate) fn rescore_omni_preserving_selection(&mut self) {
         let selected_ref = self.matches.get(self.selected).map(|&(r, _)| r);
         self.rescore_omni();
@@ -776,7 +959,7 @@ impl Picker {
             );
             self.matches = out
                 .into_iter()
-                .map(|(i, s)| (ItemRef::Item(i), s))
+                .map(|(i, s)| (ItemRef::Item(i), s as i64))
                 .collect();
         }
         if self.selected >= self.matches.len() {
@@ -975,6 +1158,43 @@ impl Editor {
             .as_ref()
             .and_then(|p| p.matches.first().map(|&(r, _)| p.item(r).display.clone()))
     }
+
+    /// The omni content source's error string (e.g. `"invalid regex"`), or
+    /// `None` when there is no error or no picker. Test introspection.
+    #[doc(hidden)]
+    pub fn picker_grep_error_for_test(&self) -> Option<String> {
+        self.picker.as_ref().and_then(|p| p.grep_error.clone())
+    }
+
+    /// Every match row resolved to an observable string, in list order:
+    /// grep rows as `"{rel_path}:{line}:{snippet}"` (path relative to the
+    /// cwd the walk ran from, snippet as stored — leading whitespace
+    /// trimmed), everything else as its display text. Resolved from the
+    /// underlying items, not the rendered frame, so tests can assert the
+    /// exact settled ordering of the blended list. Test introspection.
+    #[doc(hidden)]
+    pub fn picker_match_displays_for_test(&self) -> Vec<String> {
+        let Some(p) = self.picker.as_ref() else {
+            return Vec::new();
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        p.matches
+            .iter()
+            .map(|&(r, _)| match r {
+                ItemRef::Grep(i) => {
+                    let it = &p.grep_items[i];
+                    match &it.value {
+                        PickerValue::GrepHit { path, line } => {
+                            let rel = path.strip_prefix(&cwd).unwrap_or(path);
+                            format!("{}:{}:{}", rel.display(), line, it.display)
+                        }
+                        other => unreachable!("grep item without a GrepHit value: {other:?}"),
+                    }
+                }
+                _ => p.item(r).display.clone(),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1062,6 +1282,34 @@ mod tests {
             .iter()
             .map(|&(r, _)| p.item(r).display.clone())
             .collect()
+    }
+
+    /// Resolve every match row to a stable identity: `path:line` for grep
+    /// hits, the display path for everything else. Lets tests compare lists
+    /// across pickers whose source-vec indices differ (different arrival
+    /// orders).
+    fn resolved(p: &Picker) -> Vec<String> {
+        p.matches
+            .iter()
+            .map(|&(r, _)| match &p.item(r).value {
+                PickerValue::GrepHit { path, line } => format!("{}:{}", path.display(), line),
+                _ => p.item(r).display.clone(),
+            })
+            .collect()
+    }
+
+    /// Assert the match list is sorted under `omni_cmp` — the invariant the
+    /// streaming inserts maintain continuously.
+    fn assert_matches_sorted(p: &Picker) {
+        for w in p.matches.windows(2) {
+            assert_ne!(
+                omni_cmp(&p.file_items, &p.grep_items, &w[0], &w[1]),
+                std::cmp::Ordering::Greater,
+                "matches out of order at {:?} vs {:?}",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[test]
@@ -1240,10 +1488,11 @@ mod tests {
     }
 
     #[test]
-    fn append_file_matches_never_moves_the_selection() {
+    fn append_file_matches_keeps_selection_on_its_item() {
         let mut p = files_picker(&["aaa.rs", "abb.rs", "abc.rs"]).with_query("a");
         assert_eq!(p.matches.len(), 3);
         p.selected = 2;
+        let followed = p.item(p.matches[p.selected].0).display.clone();
         // A streamed batch arrives: two more matches, one non-match.
         let from = p.file_items.len();
         p.file_items.push(file_item("axe.rs"));
@@ -1252,10 +1501,15 @@ mod tests {
         p.append_file_matches(from);
         assert_eq!(p.matches.len(), 5, "two of three new items match");
         assert_eq!(p.file_match_count, 5);
+        // Sorted inserts may shift the highlighted *row number* (an insert
+        // above it bumps the index by design) — the highlighted *item* must
+        // never change.
         assert_eq!(
-            p.selected, 2,
-            "streaming append must not yank the selection"
+            p.item(p.matches[p.selected].0).display,
+            followed,
+            "streaming insert must keep the highlight on its item"
         );
+        assert_matches_sorted(&p);
     }
 
     #[test]
@@ -1267,6 +1521,12 @@ mod tests {
         p.append_file_matches(0);
         assert_eq!(p.matches.len(), 1000);
         assert_eq!(p.file_match_count, 1100, "counts ignore the visible cap");
+        assert_matches_sorted(&p);
+        // The kept rows are the comparator's top-K, not an arrival-order
+        // prefix: a from-scratch rescore produces the identical list.
+        let streamed = ranked(&p);
+        p.rescore();
+        assert_eq!(ranked(&p), streamed, "streamed cap == rescored top-K");
     }
 
     #[test]
@@ -1306,9 +1566,11 @@ mod tests {
 
     #[test]
     fn completion_resort_keeps_highlight_on_the_same_item() {
-        // Simulate streamed arrival order: a weak match lands first, the
-        // basename hit later. The user parks the highlight on the weak match;
-        // the completion re-sort reorders but must follow that item.
+        // Scrambled streamed arrival: the weak match lands first, the
+        // basename hit later. Sorted insert ranks each hit immediately, so
+        // the strong hit takes row 0 the moment it arrives; the completion
+        // resort then rebuilds the identical list and must keep the
+        // highlight on whichever item it was parked on.
         let mut p = files_picker(&[]).with_query("mod");
         let from = p.file_items.len();
         p.file_items
@@ -1316,12 +1578,222 @@ mod tests {
         p.file_items.push(file_item("src/mod.rs"));
         p.append_file_matches(from);
         assert_eq!(p.matches.len(), 2);
-        p.selected = 0; // highlight the weak match (arrival order)
+        // Already ranked mid-stream: the later arrival sorted to the top.
+        assert_eq!(p.item(p.matches[0].0).display, "src/mod.rs");
+        p.selected = 1; // park the highlight on the weak match
         let followed = p.item(p.matches[p.selected].0).display.clone();
         p.rescore_omni_preserving_selection();
-        // Ranked order now puts src/mod.rs first; the highlight follows the
-        // item it was on, not the row number.
         assert_eq!(p.item(p.matches[0].0).display, "src/mod.rs");
         assert_eq!(p.item(p.matches[p.selected].0).display, followed);
+    }
+
+    #[test]
+    fn grep_rows_rank_by_path_then_line() {
+        // Scrambled arrival order; the (path, line) tie key alone decides
+        // the rank.
+        let mut p = files_picker(&[]).with_query("xx");
+        let from = p.grep_items.len();
+        p.grep_items.push(grep_item("b.rs", 2));
+        p.grep_items.push(grep_item("a.rs", 9));
+        p.grep_items.push(grep_item("a.rs", 1));
+        p.append_grep_matches(from);
+        assert_eq!(resolved(&p), vec!["a.rs:1", "a.rs:9", "b.rs:2"]);
+    }
+
+    #[test]
+    fn streaming_batches_insert_sorted_never_shuffle() {
+        let mut p = files_picker(&["src/mod.rs"]).with_query("mod");
+        // Mixed file/grep batches in scrambled arrival order. After every
+        // batch the list is fully sorted and each pre-existing row keeps its
+        // relative order — the list only ever gains rows, never shuffles.
+        let batches: [&[(&str, Option<u64>)]; 3] = [
+            &[("z/mod.rs", None), ("b.rs", Some(4))],
+            &[("a/mod.rs", None), ("a.rs", Some(7))],
+            &[("a.rs", Some(2)), ("m/mod.rs", None)],
+        ];
+        for batch in batches {
+            let before = resolved(&p);
+            let file_from = p.file_items.len();
+            let grep_from = p.grep_items.len();
+            for &(path, line) in batch {
+                match line {
+                    Some(line) => p.grep_items.push(grep_item(path, line)),
+                    None => p.file_items.push(file_item(path)),
+                }
+            }
+            p.append_file_matches(file_from);
+            p.append_grep_matches(grep_from);
+            assert_matches_sorted(&p);
+            let after = resolved(&p);
+            let survivors: Vec<String> = after
+                .iter()
+                .filter(|id| before.contains(id))
+                .cloned()
+                .collect();
+            assert_eq!(survivors, before, "existing rows must keep relative order");
+        }
+    }
+
+    #[test]
+    fn arrival_order_does_not_change_final_matches() {
+        // Same corpus, different batch permutations and groupings — the
+        // lists must agree both mid-stream (sorted inserts) and after the
+        // completion resort.
+        let files = ["src/mod.rs", "a/mod.rs", "z/mod.rs"];
+        let greps: [(&str, u64); 4] = [("b.rs", 2), ("a.rs", 9), ("a.rs", 1), ("c.rs", 5)];
+        let build = |file_order: &[usize], grep_batches: &[&[usize]]| {
+            let mut p = files_picker(&[]).with_query("mod");
+            let from = p.file_items.len();
+            for &i in file_order {
+                p.file_items.push(file_item(files[i]));
+            }
+            p.append_file_matches(from);
+            for &batch in grep_batches {
+                let from = p.grep_items.len();
+                for &i in batch {
+                    let (path, line) = greps[i];
+                    p.grep_items.push(grep_item(path, line));
+                }
+                p.append_grep_matches(from);
+            }
+            p
+        };
+        let mut a = build(&[0, 1, 2], &[&[0, 1], &[2, 3]]);
+        let mut b = build(&[2, 0, 1], &[&[3], &[1, 0, 2]]);
+        assert_eq!(resolved(&a), resolved(&b), "mid-stream lists must agree");
+        a.rescore_omni_preserving_selection();
+        b.rescore_omni_preserving_selection();
+        assert_eq!(resolved(&a), resolved(&b), "post-resort lists must agree");
+    }
+
+    #[test]
+    fn cap_truncation_is_deterministic() {
+        // 1100 grep hits — 100 over the cap — arriving in two different
+        // scrambled orders (stride walks; 7 and 13 are coprime with 1100,
+        // so each visits every index once). Both pickers must keep the
+        // (path, line)-first 1000.
+        let hits: Vec<String> = (0..1100).map(|i| format!("p{i:04}.rs")).collect();
+        let build = |order: &dyn Fn(usize) -> usize| {
+            let mut p = files_picker(&[]).with_query("xx");
+            let from = p.grep_items.len();
+            for i in 0..hits.len() {
+                p.grep_items.push(grep_item(&hits[order(i)], 1));
+            }
+            p.append_grep_matches(from);
+            p
+        };
+        let a = build(&|i| (i * 7) % 1100);
+        let b = build(&|i| (i * 13) % 1100);
+        assert_eq!(a.matches.len(), 1000);
+        let expect: Vec<String> = (0..1000).map(|i| format!("p{i:04}.rs:1")).collect();
+        assert_eq!(
+            resolved(&a),
+            expect,
+            "kept rows are the (path,line)-first 1000"
+        );
+        assert_eq!(resolved(&a), resolved(&b));
+    }
+
+    #[test]
+    fn file_score_ties_break_lexicographically() {
+        // Identical band scores (same length, offset, and basename hit):
+        // the display-path tie key decides, so the order is alphabetical —
+        // and, crucially, independent of scan order.
+        let p = files_picker(&["b/mod.rs", "a/mod.rs"]).with_query("mod");
+        assert_eq!(
+            ranked(&p),
+            vec!["a/mod.rs".to_string(), "b/mod.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn sorted_insert_keeps_selection_on_item() {
+        // The user parks the highlight below the top row; a batch that sorts
+        // entirely above it streams in.
+        let mut p = files_picker(&["mm/mod.rs", "zz/mod.rs"]).with_query("mod");
+        p.selected = 1;
+        let followed = p.item(p.matches[p.selected].0).display.clone();
+        let from = p.file_items.len();
+        p.file_items.push(file_item("aa/mod.rs"));
+        p.file_items.push(file_item("bb/mod.rs"));
+        p.append_file_matches(from);
+        assert_eq!(p.matches.len(), 4);
+        assert_eq!(p.selected, 3, "index shifted by the two inserts above");
+        assert_eq!(
+            p.item(p.matches[p.selected].0).display,
+            followed,
+            "the highlight follows its item, not its row number"
+        );
+        assert_matches_sorted(&p);
+    }
+
+    #[test]
+    fn sorted_insert_leaves_the_default_top_row_selection_alone() {
+        // An untouched selection (row 0, where every query change parks it)
+        // must keep tracking the best match so far as rows stream in above,
+        // fzf-style — not pin to whichever item happened to arrive first.
+        let mut p = files_picker(&["zz/mod.rs"]).with_query("mod");
+        assert_eq!(p.selected, 0);
+        let from = p.file_items.len();
+        p.file_items.push(file_item("aa/mod.rs"));
+        p.file_items.push(file_item("bb/mod.rs"));
+        p.append_file_matches(from);
+        assert_eq!(p.selected, 0, "default selection stays on the top row");
+        assert_eq!(p.item(p.matches[0].0).display, "aa/mod.rs");
+    }
+
+    #[test]
+    fn parse_omni_query_strips_leading_slash_only() {
+        let q = parse_omni_query("/foo");
+        assert!(q.regex);
+        assert_eq!(q.pattern, "foo");
+
+        let q = parse_omni_query("foo");
+        assert!(!q.regex);
+        assert_eq!(q.pattern, "foo");
+
+        // A slash anywhere but first is an ordinary character.
+        let q = parse_omni_query("a/b");
+        assert!(!q.regex);
+        assert_eq!(q.pattern, "a/b");
+
+        // Bare sigil: regex mode with an empty pattern (below the gate).
+        let q = parse_omni_query("/");
+        assert!(q.regex);
+        assert_eq!(q.pattern, "");
+
+        // Only the FIRST char counts — a leading space stays literal, and
+        // the pattern is untrimmed.
+        let q = parse_omni_query(" /foo");
+        assert!(!q.regex);
+        assert_eq!(q.pattern, " /foo");
+    }
+
+    #[test]
+    fn regex_query_drops_file_rows() {
+        // File names that would match "hello" plus grep hits in scrambled
+        // arrival order: under a `/hello` query only Grep refs survive,
+        // ordered by their (path, line) tie key, and the file count zeroes.
+        let mut p = files_picker(&["hello.txt", "other.rs"]);
+        p.grep_items.push(grep_item("b.rs", 2));
+        p.grep_items.push(grep_item("a.rs", 9));
+        p.grep_items.push(grep_item("a.rs", 1));
+        let p = p.with_query("/hello");
+        assert_eq!(p.file_match_count, 0);
+        assert!(p
+            .matches
+            .iter()
+            .all(|&(r, _)| matches!(r, ItemRef::Grep(_))));
+        assert_eq!(resolved(&p), vec!["a.rs:1", "a.rs:9", "b.rs:2"]);
+    }
+
+    #[test]
+    fn regex_append_file_matches_is_a_noop() {
+        let mut p = files_picker(&[]).with_query("/hello");
+        let from = p.file_items.len();
+        p.file_items.push(file_item("hello.txt"));
+        p.append_file_matches(from);
+        assert!(p.matches.is_empty(), "no file rows in regex mode");
+        assert_eq!(p.file_match_count, 0, "no count bump either");
     }
 }

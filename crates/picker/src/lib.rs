@@ -121,43 +121,62 @@ pub fn scan_files_streaming(
     }
 }
 
-/// Build a literal smart-case substring matcher for `pattern`: no regex
-/// metacharacters are special (`.`, `*`, `(`, etc. all match themselves),
-/// and case sensitivity follows the query — all-lowercase matches
-/// case-insensitively, any uppercase char makes it case-sensitive. Shared by
-/// every grep entry point so their matching semantics never drift apart.
-fn literal_matcher(pattern: &str) -> anyhow::Result<RegexMatcher> {
+/// How a grep pattern is interpreted: as a verbatim substring or as a regex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternKind {
+    Literal,
+    Regex,
+}
+
+/// Build a smart-case matcher for `pattern`. Both kinds follow vix's
+/// editor-search convention: any uppercase char in the pattern makes
+/// matching case-sensitive, otherwise it's case-insensitive. `Literal`
+/// escapes nothing — `fixed_strings` already matches metacharacters
+/// (`.`, `*`, `(`, etc.) verbatim. `Regex` interprets them as regex
+/// syntax and errors on invalid patterns. Shared by every grep entry
+/// point so their matching semantics never drift apart.
+pub fn build_matcher(pattern: &str, kind: PatternKind) -> anyhow::Result<RegexMatcher> {
     Ok(RegexMatcherBuilder::new()
-        .fixed_strings(true)
+        .fixed_strings(matches!(kind, PatternKind::Literal))
         .case_smart(true)
         .build(pattern)?)
 }
 
 /// Recursively grep `root` for `pattern` as a literal smart-case substring
-/// (not a regex — see [`literal_matcher`]). Returns per-line matches.
+/// (not a regex — see [`build_matcher`]). Returns per-line matches sorted
+/// by `(path, line)` ascending.
 ///
 /// Uses `WalkParallel` and one `Searcher` per worker thread, the same
 /// pattern ripgrep itself uses. Worker threads send hits over an mpsc
 /// channel; the calling thread drains it once the walk completes.
 pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
-    grep_cancellable(root, pattern, &Arc::new(AtomicU64::new(0)), 0)
+    grep_cancellable(
+        root,
+        pattern,
+        PatternKind::Literal,
+        &Arc::new(AtomicU64::new(0)),
+        0,
+    )
 }
 
 /// Streaming variant of [`grep_cancellable`]: hits are delivered to
 /// `on_batch` in chunks (every `GREP_BATCH` hits or `GREP_FLUSH_MS` ms)
 /// while the parallel walk is still running, instead of one Vec at the
-/// end. `on_batch` returns `false` to stop early; generation cancellation
+/// end. Takes a prebuilt matcher (see [`build_matcher`]) so pattern
+/// errors surface at build time, before any worker spawns. Batches arrive
+/// in nondeterministic order by design — the parallel walk delivers hits
+/// as workers find them; imposing an order is the consumer's job.
+/// `on_batch` returns `false` to stop early; generation cancellation
 /// works exactly as in [`grep_cancellable`].
 pub fn grep_streaming(
     root: &Path,
-    pattern: &str,
+    matcher: Arc<RegexMatcher>,
     current: &Arc<AtomicU64>,
     target_gen: u64,
     mut on_batch: impl FnMut(Vec<GrepItem>) -> bool,
-) -> anyhow::Result<()> {
+) {
     const GREP_BATCH: usize = 200;
     const GREP_FLUSH_MS: u64 = 30;
-    let matcher = Arc::new(literal_matcher(pattern)?);
     let root: Arc<Path> = Arc::from(root.to_path_buf().into_boxed_path());
     let (tx, rx) = mpsc::channel::<GrepItem>();
 
@@ -250,14 +269,15 @@ pub fn grep_streaming(
             }
         }
     });
-    Ok(())
 }
 
-/// Cancellable variant of [`grep`]. The walker checks `current` against
+/// Cancellable variant of [`grep`], with the pattern interpreted per
+/// `kind` (see [`build_matcher`]). The walker checks `current` against
 /// `target_gen` between files and between matched lines; when they
 /// diverge the walk quits early and returns whatever's been collected so
-/// far. Used by the picker so a fresh keystroke can supersede an
-/// in-flight grep without waiting for the old one to finish.
+/// far, sorted by `(path, line)` ascending. Used by the picker so a fresh
+/// keystroke can supersede an in-flight grep without waiting for the old
+/// one to finish.
 ///
 /// `current` is shared across grep generations: the caller bumps it
 /// whenever a newer query comes in. A worker holds the value its request
@@ -266,10 +286,11 @@ pub fn grep_streaming(
 pub fn grep_cancellable(
     root: &Path,
     pattern: &str,
+    kind: PatternKind,
     current: &Arc<AtomicU64>,
     target_gen: u64,
 ) -> anyhow::Result<Vec<GrepItem>> {
-    let matcher = Arc::new(literal_matcher(pattern)?);
+    let matcher = Arc::new(build_matcher(pattern, kind)?);
     let root: Arc<Path> = Arc::from(root.to_path_buf().into_boxed_path());
     let (tx, rx) = mpsc::channel::<GrepItem>();
 
@@ -337,7 +358,11 @@ pub fn grep_cancellable(
     });
 
     drop(tx);
-    Ok(rx.iter().collect())
+    // Workers race, so arrival order is nondeterministic; sort so callers
+    // get the same order ripgrep-style output would have.
+    let mut hits: Vec<GrepItem> = rx.iter().collect();
+    hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    Ok(hits)
 }
 
 /// Persistent nucleo scorer: owns a `Matcher` (its scratch buffers) and
@@ -409,7 +434,7 @@ impl Scorer {
                 out.push((i, s));
             }
         }
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|&(_, s)| std::cmp::Reverse(s));
         out.truncate(limit);
     }
 
@@ -499,15 +524,16 @@ mod tests {
         let hits = grep(&dir, "NEEDLE").unwrap();
         let _ = fs::remove_dir_all(&dir);
 
-        assert_eq!(
-            hits.len(),
-            3,
-            "expected 3 hits across 2 files; got {hits:?}"
-        );
-        let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
-        assert!(texts.contains(&"beta NEEDLE here"));
-        assert!(texts.contains(&"first NEEDLE"));
-        assert!(texts.contains(&"second NEEDLE"));
+        let got: Vec<(PathBuf, u64, &str)> = hits
+            .iter()
+            .map(|h| (h.path.clone(), h.line, h.text.as_str()))
+            .collect();
+        let expected = vec![
+            (dir.join("a.txt"), 2, "beta NEEDLE here"),
+            (dir.join("sub/c.txt"), 1, "first NEEDLE"),
+            (dir.join("sub/c.txt"), 2, "second NEEDLE"),
+        ];
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -578,21 +604,25 @@ mod tests {
         fs::write(dir.join("a.txt"), "alpha\nbeta NEEDLE here\ngamma\n").unwrap();
         fs::write(dir.join("sub/c.txt"), "first NEEDLE\nsecond NEEDLE\n").unwrap();
 
-        let mut full: Vec<String> = grep(&dir, "NEEDLE")
+        let full: Vec<(PathBuf, u64, String)> = grep(&dir, "NEEDLE")
             .unwrap()
             .into_iter()
-            .map(|h| h.text)
+            .map(|h| (h.path, h.line, h.text))
             .collect();
         let gen = Arc::new(AtomicU64::new(3));
-        let mut streamed: Vec<String> = Vec::new();
-        grep_streaming(&dir, "NEEDLE", &gen, 3, |batch| {
-            streamed.extend(batch.into_iter().map(|h| h.text));
+        let matcher = Arc::new(build_matcher("NEEDLE", PatternKind::Literal).unwrap());
+        let mut streamed: Vec<(PathBuf, u64, String)> = Vec::new();
+        grep_streaming(&dir, matcher, &gen, 3, |batch| {
+            streamed.extend(batch.into_iter().map(|h| (h.path, h.line, h.text)));
             true
-        })
-        .unwrap();
+        });
         let _ = fs::remove_dir_all(&dir);
 
-        full.sort();
+        // `grep` promises (path, line)-sorted output; only the streamed side
+        // arrives in nondeterministic order (by design) and needs sorting.
+        let mut expected = full.clone();
+        expected.sort();
+        assert_eq!(full, expected, "grep output must be (path, line)-sorted");
         streamed.sort();
         assert_eq!(full, streamed);
     }
@@ -655,6 +685,103 @@ mod tests {
         assert!(
             hits.is_empty(),
             "uppercase-containing query must not match lowercase-only text; got {hits:?}"
+        );
+    }
+
+    /// Companion to [`grep_matches_pattern_literally_not_as_regex`]: the same
+    /// pattern `a.b` under `PatternKind::Regex` treats `.` as "any char" and
+    /// hits both lines; under `Literal` it still hits only the literal one.
+    #[test]
+    fn regex_matcher_matches_metacharacters() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-grep-rx-meta-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("dot.txt"), "has a.b in it\n").unwrap();
+        fs::write(dir.join("nodot.txt"), "has axb in it\n").unwrap();
+
+        let gen = Arc::new(AtomicU64::new(0));
+        let as_regex = grep_cancellable(&dir, "a.b", PatternKind::Regex, &gen, 0).unwrap();
+        let as_literal = grep_cancellable(&dir, "a.b", PatternKind::Literal, &gen, 0).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            as_regex.len(),
+            2,
+            "regex `.` should match both a.b and axb; got {as_regex:?}"
+        );
+        assert_eq!(
+            as_literal.len(),
+            1,
+            "literal a.b should match only the literal line; got {as_literal:?}"
+        );
+        assert!(as_literal[0].text.contains("a.b"));
+    }
+
+    /// Regex patterns are smart-case too: all-lowercase matches
+    /// case-insensitively, any uppercase char makes it case-sensitive.
+    #[test]
+    fn regex_matcher_smart_case() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-grep-rx-case-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("upper.txt"), "found NEEDLE here\n").unwrap();
+        fs::write(dir.join("lower.txt"), "found needle here\n").unwrap();
+
+        let gen = Arc::new(AtomicU64::new(0));
+        let lo = grep_cancellable(&dir, "need.e", PatternKind::Regex, &gen, 0).unwrap();
+        let hi = grep_cancellable(&dir, "Need.e", PatternKind::Regex, &gen, 0).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            lo.len(),
+            2,
+            "lowercase regex should match both cases; got {lo:?}"
+        );
+        assert!(
+            hi.is_empty(),
+            "uppercase-containing regex must be case-sensitive; got {hi:?}"
+        );
+    }
+
+    /// Invalid regex syntax errors under `Regex` but is a perfectly good
+    /// literal under `Literal` (fixed_strings never parses it as regex).
+    #[test]
+    fn build_matcher_invalid_regex_errors() {
+        assert!(build_matcher("[", PatternKind::Regex).is_err());
+        assert!(build_matcher("[", PatternKind::Literal).is_ok());
+    }
+
+    /// `grep` promises (path, line)-ascending output regardless of the
+    /// nondeterministic order the parallel workers deliver hits in. Run it
+    /// twice: both runs must produce the same, explicitly ordered result.
+    #[test]
+    fn grep_output_is_sorted_by_path_then_line() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("vix-grep-sorted-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("b.txt"), "NEEDLE one\nfiller\nNEEDLE two\n").unwrap();
+        fs::write(dir.join("a.txt"), "NEEDLE three\n").unwrap();
+        fs::write(dir.join("sub/c.txt"), "NEEDLE four\nNEEDLE five\n").unwrap();
+
+        let first = grep(&dir, "NEEDLE").unwrap();
+        let second = grep(&dir, "NEEDLE").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        let keys = |hits: &[GrepItem]| -> Vec<(PathBuf, u64)> {
+            hits.iter().map(|h| (h.path.clone(), h.line)).collect()
+        };
+        let expected = vec![
+            (dir.join("a.txt"), 1),
+            (dir.join("b.txt"), 1),
+            (dir.join("b.txt"), 3),
+            (dir.join("sub/c.txt"), 1),
+            (dir.join("sub/c.txt"), 2),
+        ];
+        assert_eq!(keys(&first), expected);
+        assert_eq!(
+            keys(&first),
+            keys(&second),
+            "grep output must be deterministic across runs"
         );
     }
 }
