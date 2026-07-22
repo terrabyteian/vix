@@ -13,6 +13,23 @@ impl Editor {
     /// Handle a single key event for the current mode.
     pub fn handle_key(&mut self, k: KeyEvent) {
         self.msg.clear();
+
+        // Global: three bare Escs in a row force-quit, from any state, like
+        // `:qa!` (no dirty-buffer check). Falls through on 1st/2nd press so
+        // Esc still does its normal job (closing picker, exiting insert, …).
+        if k.code == KeyCode::Esc && k.modifiers.is_empty() {
+            self.esc_streak += 1;
+            if self.esc_streak >= 3 {
+                self.quit = true;
+                return;
+            }
+            if self.esc_streak == 2 {
+                self.msg = "Press Esc again to quit without saving".into();
+            }
+        } else {
+            self.esc_streak = 0;
+        }
+
         // Any keypress closes the hover popup (except when the picker is up).
         if self.picker.is_none() {
             self.hover_popup = None;
@@ -452,6 +469,8 @@ impl Editor {
     /// ScrollUp/Down events — caller may ignore them since the
     /// `ensure_cursor_visible` pass keeps the view aligned with the cursor).
     pub fn handle_mouse(&mut self, me: MouseEvent) {
+        // A mouse event between Escs breaks the triple-Esc force-quit streak.
+        self.esc_streak = 0;
         // Picker overlay owns the mouse while up: scroll cycles the
         // selection, left-click activates an entry.
         if self.picker.is_some() {

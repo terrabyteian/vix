@@ -192,6 +192,9 @@ pub struct Editor {
     /// Set true after `<Space>` is pressed in Normal mode. The next key
     /// resolves the leader sequence. Cleared on Esc / mode changes / Ctrl-C.
     pub(crate) pending_leader: bool,
+    /// Consecutive bare-Esc count, for the triple-Esc force-quit escape
+    /// hatch. Reset to 0 by any other key or mouse event.
+    pub(crate) esc_streak: u8,
     /// One-shot flag used at launch: when the user opens vix without a file
     /// (or with a directory), we boot with an empty placeholder buffer and
     /// pop the file picker. The first buffer they pick should *replace*
@@ -295,6 +298,7 @@ impl Editor {
             last_picker_scroll: 0,
             last_picker_list_rows: 0,
             pending_leader: false,
+            esc_streak: 0,
             discard_active_on_swap: false,
             quit_on_picker_close: false,
             active_bid: 0,

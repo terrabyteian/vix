@@ -31,6 +31,46 @@ fn force_quit_dirty_buffer() {
 }
 
 #[test]
+fn triple_esc_force_quits_dirty_buffer() {
+    let mut h = Harness::with_text("hello\n");
+    h.keys("dw");
+    h.keys("<Esc><Esc><Esc>");
+    assert!(h.quit_requested());
+}
+
+#[test]
+fn double_esc_does_not_quit() {
+    let mut h = Harness::with_text("hello\n");
+    h.keys("dw");
+    h.keys("<Esc><Esc>");
+    assert!(!h.quit_requested());
+}
+
+#[test]
+fn esc_streak_interrupted_by_another_key_does_not_quit() {
+    let mut h = Harness::with_text("hello\n");
+    h.keys("dw");
+    h.keys("<Esc>x<Esc><Esc>");
+    assert!(!h.quit_requested());
+}
+
+#[test]
+fn triple_esc_from_insert_mode_quits() {
+    let mut h = Harness::with_text("hello\n");
+    h.keys("i");
+    h.keys("<Esc><Esc><Esc>");
+    assert!(h.quit_requested());
+}
+
+#[test]
+fn double_esc_shows_quit_warning_message() {
+    let mut h = Harness::with_text("hello\n");
+    h.keys("dw");
+    h.keys("<Esc><Esc>");
+    assert!(h.msg().contains("Press Esc again"));
+}
+
+#[test]
 fn write_persists_changes_to_disk() {
     let dir = tempdir();
     let path = dir.join("write_test.txt");
