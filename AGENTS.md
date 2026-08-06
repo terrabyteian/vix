@@ -48,3 +48,20 @@ archive names are load-bearing: `install.sh` reconstructs
   not have on PATH; the script exports it itself.
 - Git identity is repo-local on this machine (global is unset); commits in
   fresh clones will need `git config user.name/user.email` first.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub issues in `terrabyteian/vix`, driven by the `gh` CLI.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, used verbatim as label strings. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: a root `CONTEXT.md` plus `docs/adr/`. See
+`docs/agents/domain.md`.
