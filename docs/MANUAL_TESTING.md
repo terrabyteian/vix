@@ -36,6 +36,7 @@ BIN=./target/release/vix
 Fixtures live at `tests/fixtures/`:
 
 - `sample.rs` / `sample.py` / `sample.ts` / `sample.md` / `sample.json`
+- `rich.md` — showcase markdown doc for the rendered markdown view (§3)
 - `project/` — a tiny multi-file Rust workspace for picker + LSP testing
 
 For LSP checks you need `rust-analyzer`, `pyright`, `typescript-language-server`,
@@ -94,7 +95,56 @@ for i in $(seq 1 5000); do cat tests/fixtures/sample.rs; done > /tmp/big.rs
 $BIN /tmp/big.rs
 ```
 
-## 3. Pickers
+## 3. Rendered markdown view
+
+```sh
+$BIN tests/fixtures/rich.md
+```
+
+- [ ] Opens directly in the rendered view (no raw source visible) — the
+      statusline shows a `PREVIEW` chip in place of `NORMAL`.
+- [ ] Every element in the fixture renders styled: h1–h6 at distinct
+      weights/sizes, bold/italic/strikethrough/inline code, the fenced
+      `rust` block syntax-highlighted, the indented block and the
+      unknown-language (`wat`) fence both rendered as plain code, 3-level
+      nested bullets, the ordered list, the task list (checked box visually
+      distinct from unchecked), the nested blockquote, the named link and
+      the autolink, the image reference (as alt text or a placeholder — vix
+      doesn't fetch images), the 3-column table with its per-column
+      alignment respected, both horizontal rules, the footnote marker +
+      definition, and the hard break landing the next sentence on its own
+      line.
+- [ ] A table too wide for the pane shrinks its wide columns and word-wraps
+      cell text within them (multi-line rows) rather than showing `…`; a
+      pane too narrow even for that still truncates with `…` as before.
+- [ ] The Diagrams section's mermaid flowchart and sequence diagram render
+      as Unicode box-drawing diagrams — boxes and arrows are visible, edge
+      labels (`yes`/`no`) and message labels are legible; an unsupported
+      diagram type falls back to a plain gutter code block instead of a
+      diagram.
+- [ ] `Space m` switches to raw — the exact markdown source is visible, and
+      the cursor lands on the source line that was at the top of the
+      rendered view. `Space m` again re-renders.
+- [ ] `:raw` / `:preview` (or `:pv`) do the same as `Space m`; `:preview`
+      while already rendered — and `:raw` while already raw — show a
+      message and leave the view alone.
+- [ ] `j`/`k`/arrows scroll one display line; `Ctrl-D`/`Ctrl-U` half a page;
+      `Ctrl-F`/`Ctrl-B`/`PageUp`/`PageDown` a full page; `gg`/`G` jump to
+      top/bottom; mouse wheel scrolls 3 lines at a time.
+- [ ] Pressing an edit key (`i`, `x`, `dd`, …) while rendered drops to raw —
+      `i` lands you in Insert at the mapped position; the rest land in
+      Normal with a "-- raw markdown; Space m to re-render --" message.
+- [ ] Resize the terminal while rendered — the layout reflows to the new
+      width (tables/code blocks rewrap), no panic, no stale rows.
+- [ ] Open a `.md` file over 2 MB (e.g. `cat rich.md` repeated until it
+      crosses 2 MB) — it opens raw, and `Space m` / `:preview` refuses with
+      a "markdown preview disabled" message instead of rendering.
+- [ ] Left-click and drag across the 3-column table in the rendered view —
+      the dragged text highlights as you go; releasing the button shows a
+      "copied N chars" message. Paste elsewhere (`"+p` or another app) to
+      confirm the selected text actually made it to the clipboard.
+
+## 4. Pickers
 
 ```sh
 $BIN tests/fixtures/project/src/main.rs
@@ -128,7 +178,7 @@ $BIN tests/fixtures/project/src/main.rs
 - [ ] Omnibox honours `.gitignore` (drop a `node_modules/` or `target/` and
       verify they're skipped) for both the file-name and content sources.
 
-## 4. LSP — rust-analyzer
+## 5. LSP — rust-analyzer
 
 ```sh
 $BIN tests/fixtures/project/src/main.rs
@@ -153,7 +203,7 @@ Wait a few seconds for indexing.
 - [ ] Kill rust-analyzer externally (`pkill rust-analyzer`) — vix detects it,
       shows a status message, and auto-restarts on the next edit.
 
-## 5. LSP — other servers
+## 6. LSP — other servers
 
 Repeat the relevant subset of (4) for:
 
@@ -163,7 +213,7 @@ Repeat the relevant subset of (4) for:
 
 For each: diagnostics, hover, goto-definition, completion, format-on-save.
 
-## 6. Dot-repeat across LSP edits
+## 7. Dot-repeat across LSP edits
 
 The integration suite verifies LSP edits don't pollute `.`. Sanity-check live:
 
@@ -172,7 +222,7 @@ The integration suite verifies LSP edits don't pollute `.`. Sanity-check live:
       replays the last manual change, not the LSP edit.
 - [ ] `u` undoes the LSP edit cleanly.
 
-## 7. OSC 52 clipboard
+## 8. OSC 52 clipboard
 
 OSC 52 cannot be observed by the harness because it's a terminal escape
 sequence. Test in a real terminal:
@@ -188,7 +238,7 @@ sequence. Test in a real terminal:
 - [ ] Plain `yy` does **not** touch the system clipboard, only the unnamed
       register.
 
-## 8. File I/O & disk side effects
+## 9. File I/O & disk side effects
 
 ```sh
 cp tests/fixtures/sample.rs /tmp/scratch.rs
@@ -207,7 +257,7 @@ $BIN /tmp/scratch.rs
 - [ ] Open a path that doesn't exist; the buffer opens empty with the path
       attached; `:w` creates the file.
 
-## 9. Multi-buffer flow
+## 10. Multi-buffer flow
 
 - [ ] `vix a b c` opens with `a` active and `b`, `c` parked.
 - [ ] `:ls` lists all three with the active one marked.
@@ -218,7 +268,7 @@ $BIN /tmp/scratch.rs
 - [ ] Edits in a parked buffer survive a switch-away and switch-back (vix's
       `hidden` semantics — parked buffers can be dirty).
 
-## 10. Search UX
+## 11. Search UX
 
 - [ ] `/foo` highlights all matches as you type (live).
 - [ ] `<CR>` jumps to the next match; `<Esc>` cancels and leaves cursor put.
@@ -227,7 +277,7 @@ $BIN /tmp/scratch.rs
 - [ ] `:noh` clears highlight without changing cursor.
 - [ ] `:%s/foo/bar/g` substitutes across the file; `c` flag prompts per match.
 
-## 11. Crash & recovery
+## 12. Crash & recovery
 
 - [ ] `kill -9 $(pgrep vix)` while editing — restarting on the same file does
       not lose work if you previously `:w`'d. (Vix has no swap file; this is
@@ -237,7 +287,7 @@ $BIN /tmp/scratch.rs
 - [ ] Open a file with mixed line endings — display is sane, `:w` round-trips
       without converting silently.
 
-## 12. Release-binary smoke
+## 13. Release-binary smoke
 
 For every release tarball:
 

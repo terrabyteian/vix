@@ -9,11 +9,18 @@ use crate::Editor;
 
 pub(crate) fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
     let (line, col) = ed.buffer.char_to_line_col(ed.sel.head);
-    let mode_style = match ed.mode {
-        Mode::Normal => ed.theme.mode_normal,
-        Mode::Insert => ed.theme.mode_insert,
-        Mode::Visual | Mode::VisualLine => ed.theme.mode_visual,
-        Mode::Command => ed.theme.mode_command,
+    // The rendered-markdown view isn't a `Mode` — it overrides the chip so
+    // the user can tell why their editing keys aren't editing.
+    let rendered = ed.view_mode == crate::ViewMode::Rendered && ed.mode == Mode::Normal;
+    let mode_style = if rendered {
+        ed.theme.mode_preview
+    } else {
+        match ed.mode {
+            Mode::Normal => ed.theme.mode_normal,
+            Mode::Insert => ed.theme.mode_insert,
+            Mode::Visual | Mode::VisualLine => ed.theme.mode_visual,
+            Mode::Command => ed.theme.mode_command,
+        }
     };
     let path = ed
         .buffer
@@ -38,8 +45,18 @@ pub(crate) fn render_statusline(f: &mut ratatui::Frame, area: Rect, ed: &Editor)
         String::new()
     };
     let diag_info = diag_summary(ed);
-    let right = format!(" {}{}{}:{} ", buf_info, diag_info, line + 1, col + 1);
-    let left_mode = format!(" {} ", ed.mode.label());
+    // Line:col reads from the raw cursor, which is hidden while rendered —
+    // suppress it there instead of showing a stale position.
+    let right = if rendered {
+        format!(" {}{}", buf_info, diag_info)
+    } else {
+        format!(" {}{}{}:{} ", buf_info, diag_info, line + 1, col + 1)
+    };
+    let left_mode = if rendered {
+        " PREVIEW ".to_string()
+    } else {
+        format!(" {} ", ed.mode.label())
+    };
     let middle_pad = (area.width as usize)
         .saturating_sub(left_mode.len() + path.len() + dirty.len() + right.len() + 1);
     let middle = format!(" {}{}{}", path, dirty, " ".repeat(middle_pad));

@@ -213,6 +213,16 @@ impl Harness {
         });
     }
 
+    /// Simulate a left-button mouse-up (release) at absolute terminal coords.
+    pub fn mouse_up(&mut self, col: u16, row: u16) {
+        self.editor.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
     pub fn scroll_up(&mut self) {
         self.editor.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,

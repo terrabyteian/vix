@@ -17,6 +17,7 @@ use crate::buffers::BufferSave;
 use crate::completion::CompletionPopup;
 use crate::help;
 use crate::lsp::{LspDocState, PendingRequest};
+use crate::markdown::{layout_markdown, MdContext, MdLayout, ViewMode};
 use crate::picker::{PendingSource, Picker, PICKER_REFRESH_DEBOUNCE_MS};
 use crate::theme::Theme;
 
@@ -124,6 +125,23 @@ pub struct Editor {
     /// edits rebuild it; navigation reuses it byte-for-byte.
     pub(crate) syntax_src: String,
     pub(crate) syntax_src_key: Option<(u64, u64)>,
+    /// Raw text vs rendered markdown for the active buffer (per-buffer:
+    /// swapped through `BufferSave`).
+    pub(crate) view_mode: ViewMode,
+    /// Scroll offset of the rendered-markdown view, in *display* lines
+    /// (per-buffer: swapped through `BufferSave`).
+    pub(crate) md_scroll: usize,
+    /// Cached rendered-markdown layout for the active buffer. Not parked:
+    /// dropped on buffer switches and rebuilt lazily (relayout is cheap and
+    /// buffer versions restart at 0, which would defeat the version compare).
+    pub(crate) md_layout: Option<MdLayout>,
+    /// Pending `g` in the rendered view (for the `gg` go-to-top chord).
+    pub(crate) md_pending_g: bool,
+    /// Mouse drag selection in the rendered view: `(anchor, head)`, each an
+    /// absolute `(display_line, column)` into `md_layout.lines` — absolute so
+    /// wheel-scrolling mid-drag doesn't shift the selection. Transient: never
+    /// parked, cleared on relayout/view toggles/any rendered-view key.
+    pub(crate) md_select: Option<((usize, usize), (usize, usize))>,
     /// Active picker overlay (omni file/content search, buffers, symbols, …).
     /// Intercepts input while set.
     pub(crate) picker: Option<Picker>,
@@ -252,6 +270,7 @@ impl Editor {
             .path()
             .and_then(Language::from_path)
             .and_then(|lang| SyntaxState::new(lang).ok());
+        let view_mode = Self::default_view_mode(&buffer);
         Self {
             buffer,
             sel: Selection::at(0),
@@ -276,6 +295,11 @@ impl Editor {
             syntax_window: None,
             syntax_src: String::new(),
             syntax_src_key: None,
+            view_mode,
+            md_scroll: 0,
+            md_layout: None,
+            md_pending_g: false,
+            md_select: None,
             picker: None,
             lsp_clients: HashMap::new(),
             lsp_docs: HashMap::new(),
@@ -343,6 +367,18 @@ impl Editor {
     pub fn active_language(&self) -> Option<vix_syntax::Language> {
         self.syntax.as_ref().map(|s| s.language())
     }
+    pub fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+    /// Rendered-view mouse selection `(anchor, head)` in absolute
+    /// `(display_line, column)` coords, if a drag is active/lingering.
+    pub fn md_selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.md_select
+    }
+    /// Test accessor: current rendered-view display-line scroll.
+    pub fn md_scroll_for_test(&self) -> usize {
+        self.md_scroll
+    }
     pub fn symbol_names(&self) -> Vec<String> {
         let Some(s) = self.syntax.as_ref() else {
             return Vec::new();
@@ -397,9 +433,8 @@ impl Editor {
     /// view, refresh the syntax cache after edits, and push pending buffer
     /// changes to the LSP server. `content_rows` is the editor pane height
     /// (terminal height minus statusline + cmdline).
-    pub(crate) fn update(&mut self, content_rows: usize) {
+    pub(crate) fn update(&mut self, content_rows: usize, content_cols: u16) {
         let rows = content_rows.max(1);
-        self.ensure_cursor_visible(rows);
         // A fullscreen picker covers the editor pane entirely — skip the
         // highlight refresh while it's up; the first frame after it closes
         // pays it instead.
@@ -407,10 +442,142 @@ impl Editor {
             .picker
             .as_ref()
             .is_some_and(|p| matches!(p.kind.spec().layout, crate::picker::PickerLayout::Full));
-        if !covered {
-            self.refresh_syntax_cache_for_viewport(self.view_top, rows);
+        if self.view_mode == ViewMode::Rendered {
+            // Rendered view has no editable cursor and no tree-sitter needs;
+            // it maintains its own layout cache + display-line scroll instead.
+            if !covered {
+                self.refresh_md_layout(content_cols);
+            }
+            self.clamp_md_scroll(rows);
+        } else {
+            self.ensure_cursor_visible(rows);
+            if !covered {
+                self.refresh_syntax_cache_for_viewport(self.view_top, rows);
+            }
         }
         self.sync_lsp_changes();
+    }
+
+    /// Files above this size open in the raw view (a rendered layout is
+    /// rebuilt whole; keep the ceiling low enough that it stays instant).
+    pub(crate) const MD_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+    /// Default view for a buffer at open time: rendered for markdown files
+    /// under the size cap, raw otherwise.
+    pub(crate) fn default_view_mode(buffer: &Buffer) -> ViewMode {
+        let is_md = buffer.path().and_then(Language::from_path) == Some(Language::Markdown);
+        if is_md && buffer.rope().len_bytes() <= Self::MD_MAX_BYTES {
+            ViewMode::Rendered
+        } else {
+            ViewMode::Raw
+        }
+    }
+
+    /// Rebuild the rendered-markdown layout if the buffer changed or the
+    /// content width differs from what the cache was computed at.
+    pub(crate) fn refresh_md_layout(&mut self, width: u16) {
+        let width = width.max(10);
+        let fresh = self
+            .md_layout
+            .as_ref()
+            .is_some_and(|l| l.version == self.buffer.version() && l.width == width);
+        if fresh {
+            return;
+        }
+        let src = self.buffer.rope().to_string();
+        let version = self.buffer.version();
+        // The highlight closure needs `&mut` access to the per-language
+        // syntax cache while the theme is borrowed — take the map out for
+        // the duration (same pattern as the picker preview render).
+        let mut preview_syntax = std::mem::take(&mut self.preview_syntax);
+        let theme = self.theme.clone();
+        let mut highlight = |token: &str, code: &str| -> Vec<HlSpan> {
+            let Some(lang) = Language::from_fence_token(token) else {
+                return Vec::new();
+            };
+            if let std::collections::hash_map::Entry::Vacant(e) = preview_syntax.entry(lang) {
+                if let Ok(s) = SyntaxState::new(lang) {
+                    e.insert(s);
+                }
+            }
+            preview_syntax
+                .get_mut(&lang)
+                .and_then(|s| s.highlight(code.as_bytes()).ok())
+                .unwrap_or_default()
+        };
+        let mut ctx = MdContext {
+            theme: &theme,
+            highlight_code: &mut highlight,
+        };
+        self.md_layout = Some(layout_markdown(&src, width, version, &mut ctx));
+        // The selection indexes the old layout's display lines — stale now.
+        self.md_select = None;
+        self.preview_syntax = preview_syntax;
+        self.request_redraw();
+    }
+
+    /// Keep the rendered-view scroll inside the laid-out document.
+    pub(crate) fn clamp_md_scroll(&mut self, viewport_rows: usize) {
+        let total = self.md_layout.as_ref().map_or(0, |l| l.lines.len());
+        self.md_scroll = self
+            .md_scroll
+            .min(total.saturating_sub(viewport_rows.max(1)));
+    }
+
+    /// `Space m` / `:preview` / `:raw` — flip the active buffer between the
+    /// rendered-markdown view and raw text.
+    pub(crate) fn toggle_markdown_view(&mut self) {
+        match self.view_mode {
+            ViewMode::Rendered => self.switch_to_raw_view(),
+            ViewMode::Raw => {
+                if self.active_language() != Some(Language::Markdown) {
+                    self.msg = "not a markdown buffer".into();
+                    return;
+                }
+                if self.buffer.rope().len_bytes() > Self::MD_MAX_BYTES {
+                    self.msg = "markdown preview disabled (file > 2 MB)".into();
+                    return;
+                }
+                // Only reachable from Normal/Command mode via keybinds, but
+                // stay safe if a future path calls this from Insert.
+                if self.mode == Mode::Insert {
+                    self.leave_insert();
+                    self.mode = Mode::Normal;
+                }
+                self.view_mode = ViewMode::Rendered;
+                self.md_pending_g = false;
+                // Seed the display scroll so the view opens on the content
+                // the cursor was on. Needs a layout now (update() would only
+                // build it pre-draw); use the last known content width.
+                let width = self.last_content_rect.map_or(80, |r| r.width);
+                self.refresh_md_layout(width);
+                if let Some(l) = &self.md_layout {
+                    let cursor_line = self.cursor_line();
+                    self.md_scroll = l.source_lines.partition_point(|&s| s < cursor_line);
+                }
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Leave the rendered view for raw text, landing the cursor on the
+    /// source line of the top visible display line.
+    pub(crate) fn switch_to_raw_view(&mut self) {
+        if self.view_mode != ViewMode::Rendered {
+            return;
+        }
+        if let Some(l) = &self.md_layout {
+            if !l.source_lines.is_empty() {
+                let idx = self.md_scroll.min(l.source_lines.len() - 1);
+                let line = l.source_lines[idx].min(self.buffer.len_lines().saturating_sub(1));
+                self.sel = Selection::at(self.buffer.line_to_char(line)).clamped(&self.buffer);
+                self.view_top = line;
+            }
+        }
+        self.view_mode = ViewMode::Raw;
+        self.md_pending_g = false;
+        self.md_select = None;
+        self.request_redraw();
     }
 
     /// Clear an expired yank flash. Returns via `request_redraw` so the

@@ -52,6 +52,34 @@ Inside the editor, `:help` opens the in-binary help index; `:help <topic>` jumps
 | Visual-line | `V` | Linewise selection. |
 | Command | `:` | Ex command line at the bottom. |
 
+## Markdown rendered view
+
+`.md` files (and `:help` buffers) open in a richly-rendered view by
+default — headings, bold/italic/strikethrough, syntax-highlighted code
+fences, lists (including task lists), blockquotes, tables, links, images,
+and footnotes are laid out and styled instead of shown as raw source.
+Fenced ```mermaid blocks render as Unicode box-drawing diagrams (flowcharts,
+sequence diagrams, and more, via `mermaid-text`); unsupported diagram types
+fall back to a plain code block. Files over 2 MB always open raw instead
+(rendering that much on every keystroke isn't worth it).
+
+| Key | Action |
+|---|---|
+| `Space m` | Toggle between rendered and raw for the active buffer |
+| `:preview` / `:pv` | Switch to rendered |
+| `:raw` | Switch to raw |
+| `j` `k` `↓` `↑` | Scroll one display line (rendered view) |
+| `Ctrl-D` / `Ctrl-U` | Scroll half a page (rendered view) |
+| `Ctrl-F` / `Ctrl-B`, `PageUp` / `PageDown` | Scroll a full page (rendered view) |
+| `gg` / `G` | Jump to top / bottom (rendered view) |
+| Mouse drag | Select text; copied to the clipboard on release (OSC 52) |
+
+The rendered view has no editable cursor: `i I a A o O` drop to raw and
+land you in Insert at the mapped position; other editing keys (`x d c s p
+u . ~ > < r J v V` etc.) drop to raw and leave you in Normal mode. View
+mode is per-buffer and survives `<Tab>` cycling. `:help markdown` has the
+full rundown.
+
 ## Motions, operators, text objects
 
 | Category | Bindings |
@@ -137,6 +165,8 @@ vix uses Vim's `hidden` semantics — parked buffers can be dirty.
 | `:Grep [pat]` | Omnibox, Content filter, optionally pre-filled |
 | `:Symbols` | Symbol picker for the current buffer |
 | `:jumps` | Jump list picker |
+| `:preview` / `:pv` | Switch the active buffer to the rendered markdown view |
+| `:raw` | Switch the active buffer to raw text |
 | `:%s/pat/rep/[g][i]` | Substitute over the whole file |
 | `:s/pat/rep/[g][i]` | Substitute on the current line |
 | `:noh` / `:nohlsearch` | Clear search highlight |

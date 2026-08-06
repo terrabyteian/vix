@@ -62,8 +62,9 @@ pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
             if ed.needs_redraw {
                 // Pre-draw maintenance runs outside the draw closure; the
                 // content pane is the terminal minus statusline + cmdline.
-                let rows = term.size()?.height.saturating_sub(2) as usize;
-                ed.update(rows);
+                let size = term.size()?;
+                let rows = size.height.saturating_sub(2) as usize;
+                ed.update(rows, size.width);
                 term.draw(|f| render(f, &mut ed))?;
                 ed.needs_redraw = false;
                 last_draw = Instant::now();

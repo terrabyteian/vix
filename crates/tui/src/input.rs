@@ -54,6 +54,16 @@ impl Editor {
             return;
         }
 
+        // Rendered-markdown view: a self-contained scroll/auto-edit handler
+        // owns most keys while it's up. Keys it declines (leader, Tab cycle,
+        // Ctrl-chords, `:`, Esc) fall through to the normal pipeline below.
+        if self.view_mode == crate::ViewMode::Rendered
+            && self.mode == Mode::Normal
+            && self.handle_rendered_key(k)
+        {
+            return;
+        }
+
         // Ctrl-R in Normal mode = redo.
         if self.mode == Mode::Normal
             && k.modifiers.contains(KeyModifiers::CONTROL)
@@ -204,6 +214,10 @@ impl Editor {
                                 }
                                 'b' => {
                                     self.open_buffers_picker();
+                                    return;
+                                }
+                                'm' => {
+                                    self.toggle_markdown_view();
                                     return;
                                 }
                                 _ => return,
@@ -480,6 +494,12 @@ impl Editor {
         if self.completion_popup.is_some() {
             return;
         }
+        // Rendered-markdown view: wheel scrolls the display lines; drag
+        // selects display text, copied to the clipboard on release.
+        if self.view_mode == crate::ViewMode::Rendered {
+            self.handle_rendered_mouse(me);
+            return;
+        }
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(ch) = self.click_to_char(me.column, me.row) {
@@ -522,6 +542,187 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    /// Mouse in the rendered-markdown view. There is no cursor to position;
+    /// instead a left drag selects a run of *display* text (`md_select`,
+    /// absolute display-line coords so wheel scrolling doesn't shift it) and
+    /// the release copies it via OSC 52 + the unnamed register. Clicks
+    /// outside the content (statusline, tilde rows) clear the selection.
+    fn handle_rendered_mouse(&mut self, me: MouseEvent) {
+        let rows = self
+            .last_content_rect
+            .map_or(24, |r| r.height as usize)
+            .max(1);
+        match me.kind {
+            MouseEventKind::ScrollUp => {
+                self.md_scroll = self.md_scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.md_scroll += 3;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.md_select = self.md_point(me.column, me.row).map(|p| (p, p));
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(rect) = self.last_content_rect else {
+                    return;
+                };
+                let total = self.md_layout.as_ref().map_or(0, |l| l.lines.len());
+                if total == 0 {
+                    return;
+                }
+                // Dragging past the pane edge auto-scrolls so selections
+                // longer than a screen are possible.
+                if me.row < rect.y {
+                    self.md_scroll = self.md_scroll.saturating_sub(1);
+                } else if me.row >= rect.y.saturating_add(rect.height) {
+                    self.md_scroll += 1;
+                    self.clamp_md_scroll(rows);
+                }
+                let row = me.row.clamp(rect.y, rect.y + rect.height.saturating_sub(1));
+                let col = me
+                    .column
+                    .clamp(rect.x, rect.x + rect.width.saturating_sub(1))
+                    - rect.x;
+                let line = (self.md_scroll + (row - rect.y) as usize).min(total - 1);
+                let p = (line, col as usize);
+                match &mut self.md_select {
+                    Some((_, head)) => *head = p,
+                    // Drag with no prior Down (event-stream oddity): seed.
+                    None => self.md_select = Some((p, p)),
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let (Some((a, b)), Some(l)) = (self.md_select, self.md_layout.as_ref()) {
+                    if a != b {
+                        let text = crate::markdown::selection_text(&l.lines, a, b);
+                        if !text.is_empty() {
+                            crate::util::osc52_copy(&text);
+                            self.msg = format!("copied {} chars", text.chars().count());
+                            self.register = crate::Register {
+                                text,
+                                linewise: false,
+                            };
+                        }
+                    }
+                }
+            }
+            _ => return,
+        }
+        self.clamp_md_scroll(rows);
+        self.request_redraw();
+    }
+
+    /// Translate absolute terminal coords into an absolute
+    /// `(display_line, column)` point in the rendered layout. `None` when
+    /// outside the content rect or past the end of the laid-out document.
+    fn md_point(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+        let rect = self.last_content_rect?;
+        if row < rect.y || row >= rect.y + rect.height || column < rect.x {
+            return None;
+        }
+        if column >= rect.x + rect.width {
+            return None;
+        }
+        let line = self.md_scroll + (row - rect.y) as usize;
+        let total = self.md_layout.as_ref().map_or(0, |l| l.lines.len());
+        if line >= total {
+            return None;
+        }
+        Some((line, (column - rect.x) as usize))
+    }
+
+    /// Keys while the rendered-markdown view is up (Normal mode only).
+    /// Returns true if the key was consumed. Scrolling moves `md_scroll`
+    /// over *display* lines; editing keys drop back to the raw view (insert
+    /// entries are replayed so `i` lands directly in Insert). Keys that
+    /// should keep their global meaning (leader, Tab cycle, Ctrl-chords,
+    /// `:`, Esc) are declined so the normal pipeline handles them.
+    fn handle_rendered_key(&mut self, k: KeyEvent) -> bool {
+        // Any keypress dismisses a lingering mouse selection highlight.
+        if self.md_select.is_some() {
+            self.md_select = None;
+            self.request_redraw();
+        }
+        // A pending leader owns the next key (`Space m` toggles from here).
+        if self.pending_leader {
+            return false;
+        }
+        let rows = self
+            .last_content_rect
+            .map_or(24, |r| r.height as usize)
+            .max(1);
+        let pending_g = std::mem::take(&mut self.md_pending_g);
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            match k.code {
+                KeyCode::Char('d') => self.md_scroll += rows / 2,
+                KeyCode::Char('u') => self.md_scroll = self.md_scroll.saturating_sub(rows / 2),
+                KeyCode::Char('f') => self.md_scroll += rows,
+                KeyCode::Char('b') => self.md_scroll = self.md_scroll.saturating_sub(rows),
+                // Redo is an edit: drop to raw like `u` instead of mutating
+                // the buffer invisibly behind the rendered view.
+                KeyCode::Char('r') => {
+                    self.switch_to_raw_view();
+                    self.msg = "-- raw markdown; Space m to re-render --".into();
+                    return true;
+                }
+                // Ctrl-P / Ctrl-O / Ctrl-I keep their global meaning.
+                _ => return false,
+            }
+            self.clamp_md_scroll(rows);
+            self.request_redraw();
+            return true;
+        }
+        match k.code {
+            // Buffer cycling keeps its global meaning.
+            KeyCode::Tab | KeyCode::BackTab => return false,
+            KeyCode::Down => self.md_scroll += 1,
+            KeyCode::Up => self.md_scroll = self.md_scroll.saturating_sub(1),
+            KeyCode::PageDown => self.md_scroll += rows,
+            KeyCode::PageUp => self.md_scroll = self.md_scroll.saturating_sub(rows),
+            // Horizontal arrows are meaningless here; swallow them so they
+            // don't move the invisible raw cursor.
+            KeyCode::Left | KeyCode::Right => {}
+            KeyCode::Char(c) => match c {
+                ' ' | ':' => return false,
+                'j' => self.md_scroll += 1,
+                'k' => self.md_scroll = self.md_scroll.saturating_sub(1),
+                'g' => {
+                    if pending_g {
+                        self.md_scroll = 0;
+                    } else {
+                        self.md_pending_g = true;
+                    }
+                }
+                'G' => self.md_scroll = usize::MAX, // clamped below
+                'i' | 'I' | 'a' | 'A' | 'o' | 'O' => {
+                    // Edit intent: drop to raw and replay so the user lands
+                    // directly in Insert at the mapped position.
+                    self.switch_to_raw_view();
+                    let action = handle_normal_char(&mut self.keys, c);
+                    self.dispatch(action);
+                    return true;
+                }
+                'x' | 'X' | 'd' | 'c' | 's' | 'p' | 'P' | 'u' | '.' | '~' | '>' | '<' | 'r'
+                | 'J' | 'v' | 'V' => {
+                    self.switch_to_raw_view();
+                    self.msg = "-- raw markdown; Space m to re-render --".into();
+                    return true;
+                }
+                '/' | '?' => {
+                    self.msg = "search works in the raw view — Space m".into();
+                    return true;
+                }
+                // Everything else is inert in the rendered view.
+                _ => {}
+            },
+            KeyCode::Esc => return false,
+            _ => {}
+        }
+        self.clamp_md_scroll(rows);
+        self.request_redraw();
+        true
     }
 
     /// Translate absolute terminal (col, row) to a buffer char offset, or

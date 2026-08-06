@@ -559,3 +559,149 @@ Full pre-release gauntlet run (fmt/clippy/tests): everything green except the
   on-PATH-but-probe-fails (`false`, the shim scenario) → false; `true` → true.
 - `cargo test --workspace` fully green on this machine (smoke test now skips
   itself against the dead shim); clippy `-D warnings` + fmt clean.
+
+## Markdown rendered view — COMPLETE ✓ (2026-07-22)
+
+`.md` files now open in a richly-rendered view by default; `Space m`
+toggles rendered ↔ raw; `:preview`/`:pv`/`:raw` are the ex-command
+equivalents. Implementation landed in an earlier session; this pass adds
+the test/fixture/docs package around it.
+
+### Feature recap (`crates/tui/src/markdown.rs`, `editor.rs`, `input.rs`)
+- `markdown.rs` is a pure layout engine: `pulldown_cmark` events (with byte
+  ranges, so display lines map back to source lines) → a `Node` tree →
+  `MdLayout { lines: Vec<Line>, source_lines: Vec<usize>, width, version }`
+  of ratatui `Line`s. `pub enum ViewMode { Raw, Rendered }`, re-exported as
+  `vix_tui::ViewMode`.
+- `Editor::default_view_mode(&Buffer)` — `Rendered` iff the path resolves to
+  `Language::Markdown` *and* the buffer is ≤ `MD_MAX_BYTES` (2 MB); applies
+  at `Editor::new` and to `:help` buffers (synthetic `[help:*].md` path
+  routes through the same `Language::from_path` check).
+- `toggle_markdown_view` / `switch_to_raw_view` (`Space m`, `:preview`/`:pv`,
+  `:raw`) — per-buffer `view_mode`/`md_scroll` fields, parked/restored via
+  `BufferSave` so they survive `<Tab>` cycling. Switching to raw lands the
+  cursor on the source line of the top visible rendered line
+  (`source_lines.partition_point`). Switching to rendered (re-)builds the
+  layout on the spot — doesn't wait for the next `update()` — which is what
+  makes toggling exercisable headlessly in the test harness (harness never
+  calls `update()`, so a buffer that *opens* Rendered has no layout until
+  the first raw→rendered round-trip forces one).
+- `input.rs::handle_rendered_key` — self-contained key owner while
+  `view_mode == Rendered && mode == Normal`: scroll keys move `md_scroll`
+  (display lines) only; `i I a A o O` drop to raw and replay so the user
+  lands in Insert; the rest of the edit alphabet drops to raw with a
+  "-- raw markdown; Space m to re-render --" message; `/`/`?` hint that
+  search needs the raw view; leader/Tab/Ctrl-chords/`:`/`Esc` are declined
+  so the normal pipeline still owns them.
+- Statusline PREVIEW chip is render-path only (not exercised by the
+  harness-based suite — noted, not tested).
+
+### This pass's deliverables
+- **`tests/fixtures/rich.md`** — showcase doc exercising the full element
+  set the layout engine understands: YAML frontmatter, h1–h6, bold/italic/
+  strikethrough/inline code, a fenced ```rust block, an indented (unfenced)
+  block, an unknown-language fence (`wat`), 3-level nested bullets, an
+  ordered list, a task list, a nested blockquote, a named link + bare
+  autolink, an image reference, a 3-column table with mixed alignment,
+  two horizontal rules, a footnote reference + definition, and a backslash
+  hard break. Doubles as a demo document and as `docs/MANUAL_TESTING.md`'s
+  rendered-view fixture.
+- **`crates/tui/tests/markdown_view.rs`** (14 tests) — default view mode by
+  path (`.md` → Rendered, `.rs`/pathless → Raw) and by size (>2 MB → Raw,
+  built cheaply as one long repeated line so the test stays fast); `Space
+  m` and `:raw`/`:preview`/`:pv` round-trip and their idempotent-message
+  cases (`:preview` already-rendered, `:preview` on a non-markdown buffer);
+  `i` drops to raw + Insert and typing works; `x` drops to raw + Normal
+  without touching the buffer; `j`/`k` in rendered touch neither cursor nor
+  text; view mode survives `<Tab>` cycling per-buffer (a parked `.md` buffer
+  stays Rendered, a parked `.rs` buffer stays Raw); a scroll-then-toggle
+  round-trip lands the raw cursor past line 0; `:help` opens Rendered.
+  Confirms via `h.editor.view_mode()` (the harness's `editor` field is
+  already public — no harness changes needed).
+- **`crates/tui/src/help.rs`** — new `markdown` topic (alphabetically first,
+  ahead of `testing`) documenting the toggle triggers, rendered-view scroll
+  keys, the edit-drops-to-raw behavior, the PREVIEW statusline chip, and the
+  2 MB cap, in the same hand-written-markdown-`&str` style as the existing
+  topic.
+- **README.md** — new "Markdown rendered view" section (keys table +
+  behavior summary) between Pickers-adjacent content and Motions; `:preview`
+  / `:raw` added to the Ex commands table.
+- **`docs/MANUAL_TESTING.md`** — new §3 "Rendered markdown view" (existing
+  §3–§12 renumbered §4–§13): open `rich.md`, check each element renders
+  styled, `Space m` round-trip, scroll keys, resize, and the PREVIEW chip.
+
+### Verification
+- `cargo test --workspace`: all green, including the 14 new
+  `markdown_view` tests and the pre-existing `help`/`syntax` suites
+  (unaffected by the new help topic / fixture).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- No `crates/tui/src/` changes outside `help.rs` — the feature itself was
+  pre-existing and untouched; no bugs surfaced by the new suite.
+
+### Mermaid diagram rendering follow-up (2026-07-22)
+- Fenced ```mermaid blocks in the rendered view now draw as Unicode
+  box-drawing diagrams via the `mermaid-text` 0.57 crate
+  (`crates/tui/src/markdown.rs::render_mermaid`, case-insensitive `mermaid`
+  fence-language match). Genuine parse failures — e.g. an unrecognized
+  diagram header — fall back to the plain gutter code block, the same path
+  any other fenced code takes.
+- Workspace `rust-version` bumped 1.77 → 1.92 to satisfy `mermaid-text`'s
+  MSRV.
+- `tests/fixtures/rich.md` gained a "Diagrams" section (a flowchart and a
+  sequence diagram, themed around vix opening a file) demonstrating the
+  feature; `crates/tui/src/help.rs`'s `markdown` topic, README's "Markdown
+  rendered view" section, and `docs/MANUAL_TESTING.md` §3 all note the new
+  rendering + fallback behavior.
+- Release binary grew to **~9.6 MiB** with the new dependency.
+- Follow-up fix: labels written for mermaid.js are HTML, and `mermaid-text`
+  parses the source literally — a `&lt;` entity inside a node label
+  shattered its lexer into bogus extra nodes (seen on a real-world README),
+  and `["..."]` label quotes rendered verbatim. `preprocess_mermaid`
+  (markdown.rs) now decodes the common entities (`&amp;` last) and unwraps
+  label quotes when the label contains neither `"` nor its own closing
+  bracket; `<br/>` is passed through (the crate supports it natively as a
+  label line break). Regression-tested in the markdown unit suite.
+- Table renderer follow-up: overwide tables (real-world tables with
+  paragraph-length cells were losing almost everything to a `…`
+  truncation) now shrink wide columns via a fair-share allocation
+  (`alloc_col_widths`) and word-wrap each cell into its allocated width
+  (`wrap_cell`/`render_wrapped_row`) instead of truncating — narrow
+  columns like a lone emoji keep their natural width while paragraph
+  columns wrap across multiple display lines, right/center alignment is
+  preserved per wrapped line, and an over-long single word hard-splits.
+  Extreme-narrow panes (too small to give every column even
+  `MIN_TABLE_COL = 5`) still fall back to the original truncate-with-`…`
+  path unchanged.
+
+### Mouse drag-select + copy follow-up (2026-07-22)
+- Left-mouse drag in the rendered view now selects display text. Anchor and
+  head are absolute `(display_line, column)` points into `md_layout.lines`
+  (`Editor::md_select`, `Editor::md_selection()` accessor), so the selection
+  stays put across wheel scrolling; dragging past the top/bottom pane edge
+  auto-scrolls `md_scroll` by 1 per event. Mouse-down outside the content
+  rect (or on a tilde row past the doc end) clears the selection.
+- On release, if anchor != head, the covered text (`markdown::selection_text`
+  / `slice_cols` / `line_text` — inclusive-cell extraction, trimmed per line,
+  joined with `\n`) is copied to the terminal clipboard via OSC 52 *and*
+  stashed in the unnamed register (charwise); the status message reports
+  `copied N chars`.
+- The selection highlights via `theme.selection` while it's live
+  (`render/markdown.rs`) and is cleared on relayout (resize/edit forces a new
+  `md_layout`, which stales out the old display-line coordinates), on any
+  keypress in the rendered view, and on buffer switch/park.
+- Test package: 10 new unit tests for `slice_cols`/`selection_text` in
+  `crates/tui/src/markdown.rs` (ASCII slicing, inclusive endpoints, wide
+  (2-cell) CJK chars kept when only one cell is touched, multi-span
+  boundary-crossing, trailing-whitespace trim, multi-line join with
+  reversed-endpoint order, empty-input and out-of-range-column edge cases —
+  no panics); 6 new integration tests in `crates/tui/tests/markdown_view.rs`
+  driving the headless `Harness`'s `click`/`drag`/`mouse_up`/`scroll_down`
+  against `rich.md` (drag-then-release copies and sets the register; a bare
+  click with no drag copies nothing; a keypress clears a live selection;
+  clicking outside the content rect clears it; dragging past the bottom
+  edge advances `md_scroll`; a wheel scroll after selecting leaves the
+  selection's absolute coordinates untouched). No implementation bugs
+  surfaced. Docs: `help.rs`'s `markdown` topic, README's "Markdown rendered
+  view" table, and `docs/MANUAL_TESTING.md` §3 all note the new drag/copy
+  behavior.

@@ -45,6 +45,20 @@ impl Editor {
             "noh" | "nohl" | "nohlsearch" => {
                 self.hl_search = false;
             }
+            "preview" | "pv" => {
+                if self.view_mode == crate::ViewMode::Rendered {
+                    self.msg = "already in the rendered view".into();
+                } else {
+                    self.toggle_markdown_view();
+                }
+            }
+            "raw" => {
+                if self.view_mode == crate::ViewMode::Rendered {
+                    self.switch_to_raw_view();
+                } else {
+                    self.msg = "already in the raw view".into();
+                }
+            }
             "Files" => {
                 self.open_files_picker();
             }

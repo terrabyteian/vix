@@ -5,6 +5,7 @@
 use vix_core::{Buffer, History, RepeatAction, Selection};
 use vix_syntax::{HlSpan, Language, SyntaxState};
 
+use crate::markdown::ViewMode;
 use crate::{Editor, PendingInsert};
 
 /// Snapshot of everything per-buffer: used to park inactive buffers while
@@ -21,6 +22,10 @@ pub(crate) struct BufferSave {
     pub(crate) syntax_window: Option<std::ops::Range<usize>>,
     pub(crate) pending_insert: Option<PendingInsert>,
     pub(crate) last_change: Option<RepeatAction>,
+    /// Raw vs rendered markdown, plus the rendered view's display-line
+    /// scroll. The layout cache itself is not parked — it's rebuilt lazily.
+    pub(crate) view_mode: ViewMode,
+    pub(crate) md_scroll: usize,
     /// Stable creation-order id. Survives swaps; used to render a steady
     /// position counter in the statusline as the user cycles buffers.
     pub(crate) bid: u64,
@@ -134,6 +139,11 @@ impl Editor {
         self.syntax_version = None;
         self.syntax_cache.clear();
         self.syntax_window = None;
+        // The markdown layout keys on (version, width), but a freshly-loaded
+        // buffer restarts its version counter at 0 — drop the layout outright
+        // whenever the buffer underneath was swapped or reloaded.
+        self.md_layout = None;
+        self.md_select = None;
     }
 
     /// Snapshot the currently-active buffer for parking. Leaves placeholder
@@ -151,6 +161,8 @@ impl Editor {
             syntax_window: self.syntax_window.take(),
             pending_insert: self.pending_insert.take(),
             last_change: self.last_change.take(),
+            view_mode: std::mem::replace(&mut self.view_mode, ViewMode::Raw),
+            md_scroll: std::mem::take(&mut self.md_scroll),
             bid: self.active_bid,
         }
     }
@@ -168,6 +180,11 @@ impl Editor {
         self.syntax_window = save.syntax_window;
         self.pending_insert = save.pending_insert;
         self.last_change = save.last_change;
+        self.view_mode = save.view_mode;
+        self.md_scroll = save.md_scroll;
+        self.md_layout = None;
+        self.md_pending_g = false;
+        self.md_select = None;
         self.active_bid = save.bid;
     }
 
@@ -209,6 +226,10 @@ impl Editor {
         self.view_top = 0;
         self.pending_insert = None;
         self.last_change = None;
+        self.view_mode = Self::default_view_mode(&self.buffer);
+        self.md_scroll = 0;
+        self.md_pending_g = false;
+        self.md_select = None;
         self.assign_new_active_bid();
         self.syntax = self
             .buffer
@@ -282,6 +303,7 @@ impl Editor {
         };
         let bid = self.next_bid;
         self.next_bid = self.next_bid.wrapping_add(1).max(1);
+        let view_mode = Self::default_view_mode(&buf);
         self.other_buffers.push(BufferSave {
             buffer: buf,
             sel,
@@ -293,6 +315,8 @@ impl Editor {
             syntax_window: None,
             pending_insert: None,
             last_change: None,
+            view_mode,
+            md_scroll: 0,
             bid,
         });
     }

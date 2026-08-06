@@ -93,6 +93,30 @@ impl Language {
         }
     }
 
+    /// Map a fenced-code-block info token (e.g. "rust", "py", "shell") to a
+    /// language, for syntax-highlighting code blocks in rendered markdown.
+    /// Only the first whitespace-separated word matters, matched ASCII
+    /// case-insensitively.
+    pub fn from_fence_token(token: &str) -> Option<Language> {
+        let word = token.split_whitespace().next()?.to_ascii_lowercase();
+        match word.as_str() {
+            "rust" | "rs" => Some(Language::Rust),
+            "python" | "py" => Some(Language::Python),
+            "javascript" | "js" | "jsx" => Some(Language::JavaScript),
+            "typescript" | "ts" => Some(Language::TypeScript),
+            "tsx" => Some(Language::Tsx),
+            "go" | "golang" => Some(Language::Go),
+            "json" => Some(Language::Json),
+            "toml" => Some(Language::Toml),
+            "html" => Some(Language::Html),
+            "css" => Some(Language::Css),
+            "sh" | "bash" | "shell" | "zsh" => Some(Language::Bash),
+            "hcl" | "terraform" | "tf" => Some(Language::Hcl),
+            "md" | "markdown" => Some(Language::Markdown),
+            _ => None,
+        }
+    }
+
     /// Single-line comment prefix for this language, or `None` for languages
     /// where line comments aren't a fit (HTML/Markdown use block syntax;
     /// JSON has no comments).
@@ -798,6 +822,49 @@ mod tests {
         ];
         for (p, want) in cases {
             assert_eq!(Language::from_path(Path::new(p)), Some(want), "path {p}");
+        }
+    }
+
+    #[test]
+    fn language_from_fence_token() {
+        let cases = [
+            ("rust", Some(Language::Rust)),
+            ("rs", Some(Language::Rust)),
+            ("python", Some(Language::Python)),
+            ("py", Some(Language::Python)),
+            ("javascript", Some(Language::JavaScript)),
+            ("js", Some(Language::JavaScript)),
+            ("jsx", Some(Language::JavaScript)),
+            ("typescript", Some(Language::TypeScript)),
+            ("ts", Some(Language::TypeScript)),
+            ("tsx", Some(Language::Tsx)),
+            ("go", Some(Language::Go)),
+            ("golang", Some(Language::Go)),
+            ("json", Some(Language::Json)),
+            ("toml", Some(Language::Toml)),
+            ("html", Some(Language::Html)),
+            ("css", Some(Language::Css)),
+            ("sh", Some(Language::Bash)),
+            ("bash", Some(Language::Bash)),
+            ("shell", Some(Language::Bash)),
+            ("zsh", Some(Language::Bash)),
+            ("hcl", Some(Language::Hcl)),
+            ("terraform", Some(Language::Hcl)),
+            ("tf", Some(Language::Hcl)),
+            ("md", Some(Language::Markdown)),
+            ("markdown", Some(Language::Markdown)),
+            // Case-insensitive.
+            ("RuSt", Some(Language::Rust)),
+            ("PYTHON", Some(Language::Python)),
+            // Only the first whitespace-separated word matters.
+            ("rust ignore", Some(Language::Rust)),
+            ("sh title=\"example\"", Some(Language::Bash)),
+            // Unknown or empty tokens map to nothing.
+            ("brainfuck", None),
+            ("", None),
+        ];
+        for (token, want) in cases {
+            assert_eq!(Language::from_fence_token(token), want, "token {token:?}");
         }
     }
 

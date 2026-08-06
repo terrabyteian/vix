@@ -5,10 +5,12 @@ use crate::picker::PickerLayout;
 use crate::Editor;
 
 pub(crate) mod content;
+pub(crate) mod markdown;
 pub(crate) mod popups;
 pub(crate) mod statusline;
 
 use content::render_content;
+use markdown::render_markdown;
 use popups::{render_completion_popup, render_hover};
 use statusline::{render_cmdline, render_statusline};
 
@@ -50,11 +52,16 @@ pub(crate) fn render(f: &mut ratatui::Frame, ed: &mut Editor) {
     let statusline_area = chunks[1];
     let cmdline_area = chunks[2];
 
-    // Take the highlight cache out of `ed` so we can pass `&mut ed` and the
-    // borrowed cache through render_content side by side. Restored after.
-    let hl_cache = std::mem::take(&mut ed.syntax_cache);
-    render_content(f, content_area, ed, &hl_cache);
-    ed.syntax_cache = hl_cache;
+    if ed.view_mode == crate::ViewMode::Rendered {
+        render_markdown(f, content_area, ed);
+    } else {
+        // Take the highlight cache out of `ed` so we can pass `&mut ed` and
+        // the borrowed cache through render_content side by side. Restored
+        // after.
+        let hl_cache = std::mem::take(&mut ed.syntax_cache);
+        render_content(f, content_area, ed, &hl_cache);
+        ed.syntax_cache = hl_cache;
+    }
     render_statusline(f, statusline_area, ed);
     render_cmdline(f, cmdline_area, ed);
 

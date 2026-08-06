@@ -32,6 +32,8 @@ pub(crate) struct Theme {
     /// Shared by `Visual` and `VisualLine` — both render identically today.
     pub mode_visual: Style,
     pub mode_command: Style,
+    /// Statusline mode chip for the rendered-markdown preview view.
+    pub mode_preview: Style,
 
     // --- buffer overlays ------------------------------------------------------
     pub selection: Style,
@@ -82,6 +84,125 @@ pub(crate) struct Theme {
     /// LUT indexed by position in `vix_syntax::HIGHLIGHT_NAMES`. `None` means
     /// "unstyled" (default foreground).
     pub scope_styles: Vec<Option<Style>>,
+
+    // --- markdown view ------------------------------------------------------
+    pub md: MdStyles,
+}
+
+/// Styles for the rendered-markdown view.
+#[derive(Clone)]
+pub(crate) struct MdStyles {
+    pub h1: Style,
+    pub h2: Style,
+    pub h3: Style,
+    pub h4: Style,
+    /// Inline `` `code` `` spans.
+    pub code_inline: Style,
+    /// The `│ ` bar left of fenced code blocks.
+    pub code_gutter: Style,
+    /// Quoted text.
+    pub blockquote: Style,
+    /// The `▌ ` bar left of blockquotes.
+    pub blockquote_bar: Style,
+    /// List bullets & ordered-list numbers.
+    pub bullet: Style,
+    /// `☑` task-list item.
+    pub task_done: Style,
+    /// `☐` task-list item.
+    pub task_todo: Style,
+    /// Link text.
+    pub link: Style,
+    /// Dim appended `(url)`.
+    pub link_url: Style,
+    /// Horizontal rule `─`.
+    pub rule: Style,
+    pub table_border: Style,
+    pub table_header: Style,
+    /// Dim YAML frontmatter block.
+    pub frontmatter: Style,
+}
+
+impl MdStyles {
+    fn rgb_dark() -> Self {
+        use rgb::*;
+        Self {
+            h1: Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+            h2: Style::default().fg(BLUE).add_modifier(Modifier::BOLD),
+            h3: Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+            h4: Style::default().fg(SKY).add_modifier(Modifier::BOLD),
+            code_inline: Style::default().fg(PEACH).bg(SURFACE0),
+            code_gutter: Style::default().fg(OVERLAY),
+            blockquote: Style::default().fg(SUBTEXT).add_modifier(Modifier::ITALIC),
+            blockquote_bar: Style::default().fg(GREEN),
+            bullet: Style::default().fg(BLUE),
+            task_done: Style::default().fg(GREEN),
+            task_todo: Style::default().fg(OVERLAY),
+            link: Style::default()
+                .fg(SAPPHIRE)
+                .add_modifier(Modifier::UNDERLINED),
+            link_url: Style::default().fg(OVERLAY),
+            rule: Style::default().fg(SURFACE1),
+            table_border: Style::default().fg(SURFACE1),
+            table_header: Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            frontmatter: Style::default().fg(OVERLAY),
+        }
+    }
+
+    fn ansi() -> Self {
+        Self {
+            h1: Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+            h2: Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            h3: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            h4: Style::default().fg(Color::Cyan),
+            code_inline: Style::default().fg(Color::Yellow),
+            code_gutter: Style::default().fg(Color::DarkGray),
+            blockquote: Style::default().add_modifier(Modifier::ITALIC),
+            blockquote_bar: Style::default().fg(Color::Green),
+            bullet: Style::default().fg(Color::Blue),
+            task_done: Style::default().fg(Color::Green),
+            task_todo: Style::default().fg(Color::DarkGray),
+            link: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
+            link_url: Style::default().fg(Color::DarkGray),
+            rule: Style::default().fg(Color::DarkGray),
+            table_border: Style::default().fg(Color::DarkGray),
+            table_header: Style::default().add_modifier(Modifier::BOLD),
+            frontmatter: Style::default().fg(Color::DarkGray),
+        }
+    }
+
+    fn monochrome() -> Self {
+        let plain = Style::new();
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let underlined = Style::default().add_modifier(Modifier::UNDERLINED);
+        Self {
+            h1: bold.add_modifier(Modifier::UNDERLINED),
+            h2: bold,
+            h3: bold,
+            h4: bold.add_modifier(Modifier::DIM),
+            code_inline: dim,
+            code_gutter: dim,
+            blockquote: dim.add_modifier(Modifier::ITALIC),
+            blockquote_bar: dim,
+            bullet: plain,
+            task_done: plain,
+            task_todo: dim,
+            link: underlined,
+            link_url: dim,
+            rule: dim,
+            table_border: dim,
+            table_header: bold,
+            frontmatter: dim,
+        }
+    }
 }
 
 /// Which palette [`Theme::detect`] picked. Split out as a pure function of
@@ -186,6 +307,7 @@ impl Theme {
             mode_insert: mode(GREEN),
             mode_visual: mode(MAUVE),
             mode_command: mode(PEACH),
+            mode_preview: mode(TEAL),
 
             selection: Style::default().bg(SURFACE1),
             search_hl: Style::default().bg(YELLOW).fg(BASE),
@@ -231,6 +353,7 @@ impl Theme {
                 .iter()
                 .map(|name| rgb_scope_style_for(name))
                 .collect(),
+            md: MdStyles::rgb_dark(),
         }
     }
 
@@ -256,6 +379,10 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             mode_command: Style::default()
                 .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            mode_preview: Style::default()
+                .bg(Color::Cyan)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
 
@@ -307,6 +434,7 @@ impl Theme {
                 .iter()
                 .map(|name| ansi_scope_style_for(name))
                 .collect(),
+            md: MdStyles::ansi(),
         }
     }
 
@@ -329,6 +457,7 @@ impl Theme {
             mode_insert: rev_bold,
             mode_visual: rev_bold,
             mode_command: rev_bold,
+            mode_preview: rev_bold,
 
             selection: rev,
             search_hl: Style::default().add_modifier(Modifier::UNDERLINED),
@@ -366,6 +495,7 @@ impl Theme {
                     _ => None,
                 })
                 .collect(),
+            md: MdStyles::monochrome(),
         }
     }
 }
@@ -484,5 +614,65 @@ mod tests {
         ] {
             assert_eq!(theme.scope_styles.len(), HIGHLIGHT_NAMES.len());
         }
+    }
+
+    #[test]
+    fn all_variants_construct_markdown_styles() {
+        for theme in [
+            Theme::rgb_dark(),
+            Theme::default_dark(),
+            Theme::monochrome(),
+        ] {
+            // Touch every field so a rename/removal doesn't silently drop
+            // one of them from construction.
+            let md = &theme.md;
+            let _ = (
+                md.h1,
+                md.h2,
+                md.h3,
+                md.h4,
+                md.code_inline,
+                md.code_gutter,
+                md.blockquote,
+                md.blockquote_bar,
+                md.bullet,
+                md.task_done,
+                md.task_todo,
+                md.link,
+                md.link_url,
+                md.rule,
+                md.table_border,
+                md.table_header,
+                md.frontmatter,
+            );
+            let _ = theme.mode_preview;
+        }
+
+        // Monochrome carries no color at all, including in the new
+        // markdown styles.
+        let mono = Theme::monochrome();
+        for style in [
+            mono.md.h1,
+            mono.md.h2,
+            mono.md.h3,
+            mono.md.h4,
+            mono.md.code_inline,
+            mono.md.code_gutter,
+            mono.md.blockquote,
+            mono.md.blockquote_bar,
+            mono.md.bullet,
+            mono.md.task_done,
+            mono.md.task_todo,
+            mono.md.link,
+            mono.md.link_url,
+            mono.md.rule,
+            mono.md.table_border,
+            mono.md.table_header,
+            mono.md.frontmatter,
+        ] {
+            assert_eq!(style.fg, None);
+            assert_eq!(style.bg, None);
+        }
+        assert_eq!(mono.mode_preview.fg, None);
     }
 }

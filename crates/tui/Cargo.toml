@@ -15,3 +15,6 @@ crossterm.workspace = true
 regex.workspace = true
 anyhow.workspace = true
 ropey.workspace = true
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
+mermaid-text.workspace = true

@@ -5,7 +5,7 @@ members = ["crates/core", "crates/syntax", "crates/picker", "crates/lsp", "crate
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.92"
 license = "MIT"
 repository = "https://github.com/terrabyteian/vix"
 
@@ -38,6 +38,9 @@ nucleo-matcher = "0.3"
 ignore = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+mermaid-text = "0.57"
 
 [profile.release]
 lto = true
