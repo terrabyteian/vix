@@ -5,9 +5,13 @@ vix is a modal (vim-flavored) terminal editor. Cargo workspace: `crates/core`
 (tree-sitter highlighting), `crates/picker`, `crates/lsp`, `crates/app`
 (the `vix` binary).
 
-- `PROGRESS.md` is the single source of truth for implementation state —
-  append a section at the end of each work pass (see existing sections for
-  the format: what shipped, file-level notes, verification).
+- `CONTEXT.md` (repo root) holds the project's vocabulary, its architectural
+  commitments, and its deliberate non-goals. Read it before proposing a
+  design; update it when a term or constraint actually changes. It is not a
+  work log — what shipped when lives in git history.
+- `docs/agents/standards.md` documents this repo's coding standards — test
+  placement, the `Harness` contract, error layering, visibility defaults,
+  dependency policy. `/code-review` reviews against it.
 - Keep `README.md` in sync with user-visible behavior changes.
 - Before any release: `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -25,8 +29,9 @@ archive names are load-bearing: `install.sh` reconstructs
 
 1. **Bump the version** in the workspace `Cargo.toml` (single `version`
    field; crates inherit it), then `cargo update --workspace` so
-   `Cargo.lock` follows. Add the release's `PROGRESS.md` section. Commit
-   (e.g. `Bump to 0.8.0; PROGRESS notes for <pass>`), push `main`.
+   `Cargo.lock` follows. Commit (e.g. `Bump to 0.8.0`), push `main`. The
+   release notes are generated from commit history by
+   `gh release --generate-notes`, so write commit messages accordingly.
 2. **Run `scripts/release.sh`**. It parses the version from `Cargo.toml`,
    refuses to run off `main` or with a dirty tree, builds
    aarch64-apple-darwin natively plus both Linux targets via
