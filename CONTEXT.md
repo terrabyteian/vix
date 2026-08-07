@@ -52,6 +52,12 @@ two streamed sources (file names and file contents) into a single ranked list,
 content-only search. "Omnibox" names this picker's kind and its UI; it is not a
 separate subsystem from the picker.
 
+**Project view** — the omnibox's empty-query state: this project's recent
+files above a path-ordered listing of every file in the project. Reached at
+launch (`vix` with no path, or with a directory) and any time the omnibox is
+open with nothing typed. Named for its job — seeing the project — as against
+the recents-only view it replaces.
+
 **View mode** — per-buffer `Raw` or `Rendered` (`tui::markdown::ViewMode`).
 Markdown opens `Rendered` by default; `Space m` toggles. The mode is parked and
 restored with the buffer.
@@ -87,6 +93,9 @@ proposing them without new information.
 - Multi-cursor
 - Bundled LSP binaries
 - Splits/windows — use `:Buffers`, `:bn`/`:bp`, and terminal multiplexer panes
+- A persistent file-tree pane or sidebar — the Project view covers seeing
+  project structure; a docked tree is the splits/windows non-goal wearing a
+  different hat
 - Visual block mode — `:%s` and multi-line insert cover the real cases
 - Macros (`q`/`@`) — `.` repeat covers the common uses
 - Marks (`m`/`'`) and the change list (`g;`/`g,`) — the jump list subsumes both
