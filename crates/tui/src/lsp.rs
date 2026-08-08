@@ -62,8 +62,7 @@ impl Editor {
             return;
         }
         if !self.lsp_clients.contains_key(&cmd) {
-            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            match LspClient::start(config, &root) {
+            match LspClient::start(config, &self.root) {
                 Ok(c) => {
                     self.lsp_clients.insert(cmd.clone(), c);
                 }

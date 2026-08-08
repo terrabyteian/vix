@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use std::path::Path;
 
 use crate::picker::{
     fit_picker_row, layout_grep_row, omni_key_path, parse_omni_query, substring_match_smart,
@@ -223,6 +224,11 @@ pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
     // renderer only reads `p.previews`.
 
     let theme = ed.theme.clone();
+    // Copied out before the `&mut ed.picker` borrow below. Row paths are
+    // stored relative to this root (or absolute under it), so it's what the
+    // breadcrumb, the preview header, and the preview cache key resolve
+    // against.
+    let root = ed.root.clone();
     // Drives the omni footer's Esc hint: "quit" when this is the launch
     // omnibox with nothing open yet, "close" otherwise.
     let quit_on_picker_close = ed.quit_on_picker_close;
@@ -257,9 +263,9 @@ pub(crate) fn render_picker(f: &mut ratatui::Frame, area: Rect, ed: &mut Editor)
 
         match geo.layout_tag {
             PickerLayout::Omni => {
-                render_omni_body(f, &geo, p, &theme, scroll, quit_on_picker_close)
+                render_omni_body(f, &geo, p, &theme, scroll, quit_on_picker_close, &root)
             }
-            PickerLayout::Full => render_full_body(f, &geo, p, &theme, scroll),
+            PickerLayout::Full => render_full_body(f, &geo, p, &theme, scroll, &root),
             PickerLayout::Compact => render_compact_body(f, &geo, p, &theme, scroll),
         }
     }
@@ -378,6 +384,7 @@ fn render_full_body(
     p: &mut Picker,
     theme: &Theme,
     scroll: usize,
+    root: &Path,
 ) {
     let w = geo.outer.width as usize;
     let is_buffers = p.kind.spec().buffer_actions;
@@ -386,17 +393,14 @@ fn render_full_body(
     // --- Row 0: title + breadcrumb + counts ----------------------------------
     // Only Buffers renders through the fullscreen split now (Omni is compact);
     // the tab strip is a single title.
-    let cwd_str = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let cwd_disp = if count_chars(&cwd_str) > 36 {
-        format!("…{}", take_end(&cwd_str, 35))
+    let root_str = root.display().to_string();
+    let root_disp = if count_chars(&root_str) > 36 {
+        format!("…{}", take_end(&root_str, 35))
     } else {
-        cwd_str
+        root_str
     };
     let counts = format!(" {} / {} ", p.matches.len(), p.candidate_count());
-    let bread = format!(" {}  ", cwd_disp);
+    let bread = format!(" {}  ", root_disp);
     let active_style = Style::default()
         .fg(theme.accent_hi)
         .add_modifier(Modifier::BOLD);
@@ -539,7 +543,7 @@ fn render_full_body(
             Paragraph::new(sep_col_lines),
             Rect::new(geo.list.x + geo.list.width, geo.list.y, 1, geo.list.height),
         );
-        render_picker_preview_pane(f, preview_rect, p, theme, None);
+        render_picker_preview_pane(f, preview_rect, p, theme, None, root);
     }
 
     // --- Footer hints --------------------------------------------------------
@@ -683,6 +687,7 @@ fn render_omni_body(
     theme: &Theme,
     scroll: usize,
     quit_on_picker_close: bool,
+    root: &Path,
 ) {
     let w = geo.outer.width as usize;
     let bg = theme.picker_bg;
@@ -764,7 +769,6 @@ fn render_omni_body(
     // misses the literal substring lookup → no highlight (already a handled
     // case); regex-aware highlighting is a follow-up.
     let hl_query = parse_omni_query(&p.query).pattern;
-    let cwd = std::env::current_dir().unwrap_or_default();
     let list_rows = geo.list.height as usize;
     let list_w = geo.list.width as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(list_rows);
@@ -796,7 +800,7 @@ fn render_omni_body(
 
         match &item.value {
             PickerValue::GrepHit { path, line } => {
-                let rel = path.strip_prefix(&cwd).unwrap_or(path);
+                let rel = path.strip_prefix(root).unwrap_or(path);
                 let GrepRowLayout {
                     prefix,
                     snippet,
@@ -851,7 +855,7 @@ fn render_omni_body(
             .map(|&(r, _)| p.item(r))
             .and_then(|item| match &item.value {
                 PickerValue::GrepHit { path, line } => {
-                    let key = PreviewKey::Path(omni_key_path(path));
+                    let key = PreviewKey::Path(omni_key_path(root, path));
                     p.previews
                         .first()
                         .filter(|c| c.key == key)
@@ -859,7 +863,7 @@ fn render_omni_body(
                 }
                 _ => None,
             });
-        render_picker_preview_pane(f, preview_rect, p, theme, focus_line);
+        render_picker_preview_pane(f, preview_rect, p, theme, focus_line, root);
     }
 
     // --- Footer -------------------------------------------------------------
@@ -966,6 +970,7 @@ pub(crate) fn render_picker_preview_pane(
     p: &Picker,
     theme: &Theme,
     focus_line: Option<usize>,
+    root: &Path,
 ) {
     let w = area.width as usize;
     let h = area.height as usize;
@@ -986,11 +991,10 @@ pub(crate) fn render_picker_preview_pane(
         return;
     };
 
-    // Pane header: the cwd-relative path (falling back to the cache path as
+    // Pane header: the root-relative path (falling back to the cache path as
     // stored — omni keys are already relative; `[No Name]` passes through),
     // with a thin bottom rule. The full path keeps same-basename files apart.
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let header_path = cache.path.strip_prefix(&cwd).unwrap_or(&cache.path);
+    let header_path = cache.path.strip_prefix(root).unwrap_or(&cache.path);
     let header_text = pad_or_trunc(&format!(" {} ", header_path.to_string_lossy()), w);
     let header_line = Line::from(Span::styled(
         header_text,
@@ -1605,7 +1609,7 @@ mod tests {
         // y = 23 + (49 - 42) = 30 — the pane's vertical middle.
         let bottom = region_text(term.backend(), 21);
         let buf = term.backend().buffer();
-        // Header shows the cwd-relative path, not just the basename, so
+        // Header shows the root-relative path, not just the basename, so
         // same-named files in different directories stay distinguishable.
         let header_row: String = (0..120u16).map(|x| buf[(x, 21)].symbol()).collect();
         assert!(
@@ -1756,6 +1760,11 @@ mod tests {
             .expect("theme scope table defines \"string\"")
     }
 
+    /// Project root for the preview-pane tests. Their cache paths are
+    /// already root-relative, so the pane's header strip is a no-op and any
+    /// root that isn't a prefix of them will do.
+    const TEST_ROOT: &str = "/projects/demo";
+
     /// A one-row Omni picker (a File row) with `cache` as its sole preview,
     /// ready to hand straight to `render_picker_preview_pane`.
     fn preview_picker(path: &str, cache: crate::picker::PreviewCache) -> Picker {
@@ -1815,7 +1824,14 @@ mod tests {
         let backend = TestBackend::new(20, 10);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| {
-            render_picker_preview_pane(f, Rect::new(0, 0, 20, 10), &p, &theme, Some(15));
+            render_picker_preview_pane(
+                f,
+                Rect::new(0, 0, 20, 10),
+                &p,
+                &theme,
+                Some(15),
+                Path::new(TEST_ROOT),
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -1897,7 +1913,14 @@ mod tests {
         let backend = TestBackend::new(20, 10);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| {
-            render_picker_preview_pane(f, Rect::new(0, 0, 20, 10), &p, &theme, Some(1));
+            render_picker_preview_pane(
+                f,
+                Rect::new(0, 0, 20, 10),
+                &p,
+                &theme,
+                Some(1),
+                Path::new(TEST_ROOT),
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();

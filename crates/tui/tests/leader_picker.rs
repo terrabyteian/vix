@@ -12,54 +12,52 @@
 
 use ratatui::layout::Rect;
 use std::fs;
+use std::path::{Path, PathBuf};
 use vix_tui::testing::Harness;
 
-/// Process-wide lock serializing these tests. The current directory is
-/// global process state, and every test `chdir`s into its own fixture then
-/// spawns a streaming file scan that captures the cwd — so two tests running
-/// in parallel would scan each other's directories. Each `setup_*` returns
-/// the held guard (bound as `_dir`), which keeps the lock for the test's
-/// whole body.
-static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// A held `CWD_LOCK` guard. Kept alive by the test's `let _dir = …` binding
-/// so the next test can't chdir until this one returns.
-type CwdGuard = std::sync::MutexGuard<'static, ()>;
-
-fn lock_cwd() -> CwdGuard {
-    // Recover from a poisoned lock: a panicking test still leaves the cwd
-    // invariant we care about (we always chdir before doing anything).
-    CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// Build a harness rooted at `root`: its file scan, content walk, recents,
+/// and relative-path opens all resolve against that directory. Tests set a
+/// root rather than `chdir`ing, so nothing here touches process-global
+/// state and the file can run with the default test threads.
+fn harness_in(root: &Path, text: &str) -> Harness {
+    let mut h = Harness::with_text(text);
+    h.set_root(root);
+    h
 }
 
-/// Build a temp dir with a few files and chdir into it under the cwd lock.
-/// (Tempdirs leak in /tmp; only the returned guard matters to the caller.)
-fn setup_repo() -> CwdGuard {
-    let guard = lock_cwd();
+/// Build a temp dir with a few files. (Tempdirs leak in /tmp; the returned
+/// path is what the caller roots a harness at.)
+fn setup_repo() -> PathBuf {
     let dir = tempdir();
     fs::write(dir.join("alpha.txt"), "hello world\nthe quick brown fox\n").unwrap();
     fs::write(dir.join("beta.txt"), "lorem ipsum dolor\n").unwrap();
     fs::write(dir.join("gamma.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
-    std::env::set_current_dir(&dir).unwrap();
-    guard
+    dir
 }
 
 /// A repo where one file is NAMED `hello.txt` and another (`world.rs`)
 /// CONTAINS the word `hello`. Lets the blend tests assert a file-name row
 /// ranks above a content hit for the same query.
-fn setup_blend_repo() -> CwdGuard {
-    let guard = lock_cwd();
+fn setup_blend_repo() -> PathBuf {
     let dir = tempdir();
     fs::write(dir.join("hello.txt"), "unrelated contents\n").unwrap();
     fs::write(dir.join("world.rs"), "fn hello() { /* hi */ }\n").unwrap();
-    std::env::set_current_dir(&dir).unwrap();
-    guard
+    dir
 }
 
-fn tempdir() -> std::path::PathBuf {
+/// A scratch fixture directory, unique per call. The timestamp keeps runs
+/// apart (these dirs leak in /tmp, and pids get reused, so a stale fixture
+/// could otherwise be adopted by a later run); the counter keeps *calls*
+/// apart, which matters now that these tests run concurrently — two threads
+/// can read the same wall-clock nanosecond and would silently share one
+/// fixture. Mirrors the counter in `picker::preview`'s and `recent`'s
+/// `test_dir`.
+fn tempdir() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "vix-leader-{}-{}",
+        "vix-leader-{}-{}-{n}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -72,8 +70,8 @@ fn tempdir() -> std::path::PathBuf {
 
 #[test]
 fn space_f_opens_omni_picker_all_filter() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     assert!(!h.picker_open());
     h.keys("<Space>f");
     h.pump_picker();
@@ -85,8 +83,8 @@ fn space_f_opens_omni_picker_all_filter() {
 
 #[test]
 fn space_g_opens_omni_content_filter() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>g");
     h.pump_picker();
     assert!(h.picker_open());
@@ -96,8 +94,8 @@ fn space_g_opens_omni_content_filter() {
 
 #[test]
 fn ctrl_p_opens_omni_picker() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     assert!(!h.picker_open());
     h.keys("<C-p>");
     h.pump_picker();
@@ -108,16 +106,16 @@ fn ctrl_p_opens_omni_picker() {
 
 #[test]
 fn space_followed_by_unknown_does_nothing() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>x");
     assert!(!h.picker_open());
 }
 
 #[test]
 fn esc_clears_pending_leader() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     // Press Space to arm the leader, then Esc — should NOT open a picker
     // when followed by 'f'. Instead 'f' is interpreted as the find-char
     // motion (which is pending — needs a target — but the picker stays
@@ -128,8 +126,8 @@ fn esc_clears_pending_leader() {
 
 #[test]
 fn tab_cycles_filter_preserving_query() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>fhe");
     assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
     assert_eq!(h.picker_query(), Some("he"));
@@ -147,8 +145,8 @@ fn tab_cycles_filter_preserving_query() {
 
 #[test]
 fn omni_blends_names_first_then_contents() {
-    let _dir = setup_blend_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_blend_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>f");
     h.keys("hello");
     h.flush_picker();
@@ -168,8 +166,8 @@ fn omni_blends_names_first_then_contents() {
 
 #[test]
 fn files_filter_hides_content_rows() {
-    let _dir = setup_blend_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_blend_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>f"); // All
     h.keys("hello");
     h.flush_picker();
@@ -189,8 +187,8 @@ fn files_filter_hides_content_rows() {
 
 #[test]
 fn content_filter_hides_file_rows() {
-    let _dir = setup_blend_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_blend_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>g"); // Content
     h.keys("hello");
     h.flush_picker();
@@ -202,8 +200,8 @@ fn content_filter_hides_file_rows() {
 
 #[test]
 fn esc_closes_immediately() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     h.keys("abc");
@@ -216,8 +214,8 @@ fn esc_closes_immediately() {
 
 #[test]
 fn ctrl_c_closes_immediately() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
@@ -227,8 +225,8 @@ fn ctrl_c_closes_immediately() {
 
 #[test]
 fn enter_opens_selected_row() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
@@ -238,8 +236,8 @@ fn enter_opens_selected_row() {
 
 #[test]
 fn ctrl_jk_and_arrows_move_selection() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     let before = h.editor.picker_selected_for_test();
@@ -255,8 +253,8 @@ fn ctrl_jk_and_arrows_move_selection() {
 
 #[test]
 fn typing_filters_matches() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     let before = h.editor.picker_matches_count_for_test();
@@ -272,8 +270,8 @@ fn typing_filters_matches() {
 
 #[test]
 fn ctrl_u_clears_query() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>fgamma");
     assert_eq!(h.picker_query(), Some("gamma"));
     h.keys("<C-u>");
@@ -285,8 +283,8 @@ fn ctrl_u_clears_query() {
 
 #[test]
 fn ctrl_w_deletes_trailing_word() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     h.keys("foo bar");
@@ -299,8 +297,8 @@ fn ctrl_w_deletes_trailing_word() {
 
 #[test]
 fn pagedown_moves_selection_forward_and_pageup_back() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert_eq!(h.editor.picker_selected_for_test(), 0);
@@ -313,8 +311,8 @@ fn pagedown_moves_selection_forward_and_pageup_back() {
 
 #[test]
 fn ex_files_command_opens_omni_picker() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.cmd("Files");
     assert_eq!(h.picker_kind(), Some("omni"));
     assert_eq!(h.editor.picker_filter_for_test(), Some("all"));
@@ -324,8 +322,8 @@ fn ex_files_command_opens_omni_picker() {
 
 #[test]
 fn scroll_down_advances_picker_selection() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
@@ -337,8 +335,8 @@ fn scroll_down_advances_picker_selection() {
 
 #[test]
 fn scroll_up_after_scroll_down_returns_selection() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     h.scroll_down();
@@ -350,8 +348,8 @@ fn scroll_up_after_scroll_down_returns_selection() {
 
 #[test]
 fn first_click_focuses_second_click_activates() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
@@ -376,8 +374,8 @@ fn first_click_focuses_second_click_activates() {
 
 #[test]
 fn click_on_already_selected_row_activates_immediately() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     h.set_picker_geometry(Rect::new(0, 3, 40, 9), 0);
@@ -391,8 +389,8 @@ fn click_on_already_selected_row_activates_immediately() {
 
 #[test]
 fn click_outside_picker_is_ignored() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     h.set_picker_geometry(Rect::new(10, 5, 40, 12), 0);
@@ -406,8 +404,8 @@ fn click_outside_picker_is_ignored() {
 
 #[test]
 fn ex_grep_command_prefills_query() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.cmd("Grep hello");
     assert_eq!(h.picker_kind(), Some("omni"));
     assert_eq!(h.editor.picker_filter_for_test(), Some("content"));
@@ -419,8 +417,8 @@ fn content_short_query_has_no_matches() {
     // The omni content source requires 2+ chars before it walks; below that,
     // a Content-filtered query has no content rows (the hint is render-only,
     // so we assert the model state: zero content matches).
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>g");
     h.pump_picker();
     assert!(h.picker_open());
@@ -437,8 +435,8 @@ fn content_short_query_has_no_matches() {
 
 #[test]
 fn end_jumps_to_last_match() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert_eq!(h.editor.picker_selected_for_test(), 0);
@@ -452,8 +450,8 @@ fn end_jumps_to_last_match() {
 
 #[test]
 fn home_jumps_to_first_match() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     h.keys("<End>");
@@ -464,8 +462,8 @@ fn home_jumps_to_first_match() {
 
 #[test]
 fn ctrl_space_marks_and_advances_alt_c_clears() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert_eq!(h.editor.picker_marked_count_for_test(), 0);
@@ -492,8 +490,8 @@ fn ctrl_space_marks_and_advances_alt_c_clears() {
 
 #[test]
 fn enter_with_marked_opens_all_marked_files() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     // Each `<Nul>` marks the current row and auto-advances, so three in a
@@ -509,8 +507,8 @@ fn enter_with_marked_opens_all_marked_files() {
 
 #[test]
 fn marks_survive_a_full_filter_cycle() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     // Mark two file rows.
@@ -525,8 +523,8 @@ fn marks_survive_a_full_filter_cycle() {
 
 #[test]
 fn space_types_into_query() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     // Plain space has no modifier, so it's a printable char like any other:
     // it appends to the query rather than marking a row.
     h.keys("<Space>f");
@@ -538,8 +536,8 @@ fn space_types_into_query() {
 
 #[test]
 fn picker_opens_instantly_and_streams_items_in() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     // The picker is open and interactive before any scan results exist.
     h.keys("<Space>f");
     assert!(h.picker_open());
@@ -550,8 +548,8 @@ fn picker_opens_instantly_and_streams_items_in() {
 
 #[test]
 fn grep_enter_acts_on_whats_on_screen() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.cmd("Grep hello");
     h.pump_picker();
     let settled = h.editor.picker_matches_count_for_test();
@@ -570,8 +568,8 @@ fn grep_enter_acts_on_whats_on_screen() {
 
 #[test]
 fn empty_query_omnibox_shows_last_opened_file_on_top() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "scratch\n");
     // Point the harness at a real (temp) recent-files store — the default
     // harness disables persistence, so this opts back in deliberately.
     h.set_recent_data_file(tempdir().join("recent-store"));
@@ -614,8 +612,8 @@ fn empty_query_omnibox_shows_last_opened_file_on_top() {
 
 #[test]
 fn closing_picker_cancels_streaming_sources() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     // Close immediately — the scan worker is likely still running.
     h.keys("<Esc>");
@@ -640,8 +638,9 @@ fn closing_picker_cancels_streaming_sources() {
 
 #[test]
 fn launch_esc_quits() {
-    let _dir = setup_repo();
+    let root = setup_repo();
     let mut h = Harness::new();
+    h.set_root(&root);
     h.open_launch_picker();
     h.pump_picker();
     assert!(h.picker_open());
@@ -652,8 +651,9 @@ fn launch_esc_quits() {
 
 #[test]
 fn launch_ctrl_c_quits() {
-    let _dir = setup_repo();
+    let root = setup_repo();
     let mut h = Harness::new();
+    h.set_root(&root);
     h.open_launch_picker();
     h.pump_picker();
     assert!(h.picker_open());
@@ -664,8 +664,9 @@ fn launch_ctrl_c_quits() {
 
 #[test]
 fn launch_select_does_not_quit() {
-    let _dir = setup_repo();
+    let root = setup_repo();
     let mut h = Harness::new();
+    h.set_root(&root);
     h.open_launch_picker();
     h.pump_picker();
     h.keys("alpha");
@@ -703,22 +704,19 @@ fn launch_select_does_not_quit() {
 
 /// A repo with a nested `src/` tree so a query containing a mid-string `/`
 /// can hit a real path (`src/mod.rs`).
-fn setup_tree_repo() -> CwdGuard {
-    let guard = lock_cwd();
+fn setup_tree_repo() -> PathBuf {
     let dir = tempdir();
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::write(dir.join("src/mod.rs"), "pub fn helper() {}\n").unwrap();
     fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
-    std::env::set_current_dir(&dir).unwrap();
-    guard
+    dir
 }
 
 /// Six files with several `needle` lines spread across five of them —
 /// enough surface for the parallel grep walk to deliver batches in
 /// scrambled order — plus one file NAMED `needle.txt` so a literal query
 /// blends a file-band row above the grep band.
-fn setup_determinism_repo() -> CwdGuard {
-    let guard = lock_cwd();
+fn setup_determinism_repo() -> PathBuf {
     let dir = tempdir();
     fs::write(
         dir.join("alpha.txt"),
@@ -730,14 +728,13 @@ fn setup_determinism_repo() -> CwdGuard {
     fs::write(dir.join("delta.txt"), "no hits here\n").unwrap();
     fs::write(dir.join("echo.txt"), "needle e1\nneedle e2\n").unwrap();
     fs::write(dir.join("needle.txt"), "needle n1\n").unwrap();
-    std::env::set_current_dir(&dir).unwrap();
-    guard
+    dir
 }
 
 #[test]
 fn slash_query_searches_content_only_as_regex() {
-    let _dir = setup_blend_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_blend_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>f");
     // Baseline: the literal query `hello` name-matches hello.txt, proving
     // the fixture WOULD produce file rows for this text without the sigil.
@@ -763,8 +760,8 @@ fn slash_query_searches_content_only_as_regex() {
 
 #[test]
 fn invalid_regex_shows_indicator_and_no_stale_results() {
-    let _dir = setup_blend_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_blend_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>f");
     h.keys("/hello");
     h.flush_picker();
@@ -799,8 +796,8 @@ fn invalid_regex_shows_indicator_and_no_stale_results() {
 
 #[test]
 fn slash_min_two_pattern_chars_before_search() {
-    let _dir = setup_blend_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_blend_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>f");
     // `/a` strips to a 1-char pattern: below the 2-char gate, so no walk
     // runs even though `a` appears in the fixture's contents — and a short
@@ -815,8 +812,8 @@ fn slash_min_two_pattern_chars_before_search() {
 #[test]
 fn regex_smart_case_end_to_end() {
     // setup_repo's contents are lowercase-only ("the quick brown fox").
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>f");
     // All-lowercase pattern: smart case searches case-insensitively.
     h.keys("/qu.ck");
@@ -836,8 +833,8 @@ fn regex_smart_case_end_to_end() {
 
 #[test]
 fn non_leading_slash_is_still_literal() {
-    let _dir = setup_tree_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_tree_repo();
+    let mut h = harness_in(&root, "scratch\n");
     h.keys("<Space>f");
     // `/` mid-query is an ordinary literal character: `src/mod` is a
     // blended (file-name) search that hits the real path, exactly as
@@ -857,8 +854,8 @@ fn non_leading_slash_is_still_literal() {
 
 #[test]
 fn same_settled_query_twice_yields_identical_list() {
-    let _dir = setup_determinism_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_determinism_repo();
+    let mut h = harness_in(&root, "scratch\n");
     // The blended list's settled order for `needle`: the file-band row
     // (needle.txt name-matches) first, then every grep row in strict
     // (path A→Z, line ascending) order — independent of the parallel
@@ -906,8 +903,8 @@ fn same_settled_query_twice_yields_identical_list() {
 
 #[test]
 fn same_settled_regex_query_twice_yields_identical_list() {
-    let _dir = setup_determinism_repo();
-    let mut h = Harness::with_text("scratch\n");
+    let root = setup_determinism_repo();
+    let mut h = harness_in(&root, "scratch\n");
     // Regex mode is content-only: no needle.txt file-band row, just the
     // grep rows in strict (path A→Z, line ascending) order.
     let expected: Vec<String> = [
@@ -948,8 +945,8 @@ fn same_settled_regex_query_twice_yields_identical_list() {
 
 #[test]
 fn in_editor_esc_does_not_quit() {
-    let _dir = setup_repo();
-    let mut h = Harness::with_text("hello\n");
+    let root = setup_repo();
+    let mut h = harness_in(&root, "hello\n");
     h.keys("<Space>f");
     h.pump_picker();
     assert!(h.picker_open());
@@ -958,5 +955,48 @@ fn in_editor_esc_does_not_quit() {
     assert!(
         !h.quit_requested(),
         "Esc on an in-editor omnibox must never quit"
+    );
+}
+
+/// The root is per-editor state, not process state: two harnesses pointed
+/// at different fixture repos scan, grep, and open only their own. This is
+/// what lets the suite run with the default (parallel) test threads —
+/// nothing here touches the process cwd.
+#[test]
+fn each_harness_scans_only_its_own_root() {
+    let a = tempdir();
+    fs::write(a.join("only_in_a.txt"), "shared needle\n").unwrap();
+    let b = tempdir();
+    fs::write(b.join("only_in_b.txt"), "shared needle\n").unwrap();
+
+    let mut ha = harness_in(&a, "scratch\n");
+    let mut hb = harness_in(&b, "scratch\n");
+    ha.keys("<Space>f");
+    hb.keys("<Space>f");
+    ha.keys("only_in");
+    hb.keys("only_in");
+    ha.flush_picker();
+    hb.flush_picker();
+
+    assert_eq!(
+        ha.editor.picker_match_displays_for_test(),
+        vec!["only_in_a.txt".to_string()]
+    );
+    assert_eq!(
+        hb.editor.picker_match_displays_for_test(),
+        vec!["only_in_b.txt".to_string()]
+    );
+
+    // Picking resolves against the same root, so each harness opens its own
+    // file even though the two rows have the same relative shape.
+    ha.keys("<CR>");
+    hb.keys("<CR>");
+    assert_eq!(
+        ha.editor.buffer.path().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("only_in_a.txt"))
+    );
+    assert_eq!(
+        hb.editor.buffer.path().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("only_in_b.txt"))
     );
 }

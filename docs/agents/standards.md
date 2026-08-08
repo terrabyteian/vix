@@ -45,6 +45,14 @@ the recent-files store). Anything new that touches user data or the network at
 `Editor::new` must be neutralized there too — tests never write to a real
 user's data.
 
+**Tests never touch process-global state.** The process cwd is the one that
+keeps coming up: a test that `chdir`s serializes the whole binary and makes
+`cargo test --workspace` intermittently wrong for anyone who doesn't know to
+pass `--test-threads=1`. A test that needs a fixture repo builds a temp dir and
+calls `Harness::set_root` — the project root is `Editor` state (see
+`CONTEXT.md`), not process state. If new code needs ambient context, thread it
+through the editor the same way rather than reading it back out of the process.
+
 **Render-path behavior is not harness-testable.** The suite asserts on state,
 not drawn cells. Statusline chips, highlight colors, and cursor placement need
 either a unit test on the layout function or a `docs/MANUAL_TESTING.md` entry —

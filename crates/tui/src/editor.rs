@@ -1,6 +1,6 @@
 use ratatui::layout::Rect;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -250,6 +250,15 @@ pub struct Editor {
     /// `picker.file_items` batch by batch — the picker opens instantly and
     /// the list grows under it.
     pub(crate) files_source: Option<PendingSource>,
+    /// Project root: the directory the omnibox scans and greps, the base for
+    /// project-relative paths (picker rows, `:e src/foo.rs`), the recents
+    /// store's project key, and the LSP workspace root. Captured from the
+    /// process cwd once, in `new` — `main` has already chdir'd into a
+    /// directory argument by then. Everything downstream reads *this*, never
+    /// `env::current_dir()`, so an editor's notion of "the project" is its
+    /// own state: tests point a harness at a fixture directory and run in
+    /// parallel instead of serializing on the process-global cwd.
+    pub(crate) root: PathBuf,
     /// Recent-files store location, resolved once at startup (see
     /// `crate::recent::default_data_file`). `None` disables persistence —
     /// tests force this off via `Harness` so they never touch the real
@@ -262,6 +271,17 @@ pub struct Editor {
     /// picker batches, debounce flushes, resize, and yank-flash decay;
     /// cleared after each draw. Starts true so the first frame paints.
     pub(crate) needs_redraw: bool,
+}
+
+/// Normalize a project root so paths derived from it compare equal to
+/// `Path::canonicalize`d file paths. Matters on macOS, where
+/// `env::temp_dir()` hands back `/var/...` while canonicalizing resolves to
+/// `/private/var/...`: the recents store keys on the root *string*, and
+/// `record_recent` canonicalizes before stripping the root off. Falls back
+/// to the path as given when it can't be resolved (a root that doesn't
+/// exist yet is not worth refusing to start over).
+fn canonical_root(root: PathBuf) -> PathBuf {
+    root.canonicalize().unwrap_or(root)
 }
 
 impl Editor {
@@ -332,9 +352,28 @@ impl Editor {
             files_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grep_source: None,
             files_source: None,
+            root: canonical_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
             recent_data_file: crate::recent::default_data_file(),
             theme: Theme::default_dark(),
             needs_redraw: true,
+        }
+    }
+
+    /// Repoint the editor at a different project root. Only the test harness
+    /// calls this; in the binary the root is whatever `new` captured.
+    pub(crate) fn set_root(&mut self, root: PathBuf) {
+        self.root = canonical_root(root);
+    }
+
+    /// Absolutize a project-relative path — a picker row, a `:e` argument —
+    /// against [`Editor::root`]. Absolute paths pass through untouched.
+    /// Every path that reaches the filesystem goes through here, so a
+    /// relative path means the same file no matter what the process cwd is.
+    pub(crate) fn resolve_in_root(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
         }
     }
 

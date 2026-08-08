@@ -46,10 +46,19 @@ impl Harness {
     }
 
     /// Strip real-world side effects an `Editor` picks up at construction
-    /// time so tests never touch the user's actual data. Currently just the
-    /// recent-files store; extend here as more such state appears.
+    /// time so tests never touch the user's actual data: the recent-files
+    /// store, and the project root. Extend here as more such state appears.
+    ///
+    /// The root matters because `Editor::new` captures the process cwd — for
+    /// a test binary, the developer's own checkout. A picker test that forgot
+    /// `set_root` would otherwise scan and grep the whole vix tree and assert
+    /// against whatever files happen to be in it. Defaulting to a per-harness
+    /// directory that doesn't exist makes that mistake read as an empty
+    /// project instead of a machine-dependent one; a test with a fixture repo
+    /// calls `set_root` and gets a real root.
     fn hermetic(mut editor: Editor) -> Editor {
         editor.recent_data_file = None;
+        editor.set_root(empty_root());
         editor
     }
 
@@ -57,6 +66,15 @@ impl Harness {
     /// tests that want to exercise that path deliberately.
     pub fn set_recent_data_file(&mut self, p: PathBuf) {
         self.editor.recent_data_file = Some(p);
+    }
+
+    /// Point the harness's editor at `root` as its project root: the omnibox
+    /// scans and greps there, picker rows and `:e` arguments resolve there,
+    /// and recents are keyed there. This is how a test gives the editor a
+    /// fixture repo — never `std::env::set_current_dir`, which is
+    /// process-global and would make parallel tests clobber each other.
+    pub fn set_root(&mut self, root: impl Into<PathBuf>) {
+        self.editor.set_root(root.into());
     }
 
     /// Send a vim-style key sequence: plain chars become `Char` events;
@@ -257,6 +275,16 @@ impl Harness {
     pub fn assert_mode(&self, mode: Mode) {
         assert_eq!(self.mode(), mode, "mode mismatch");
     }
+}
+
+/// A project root for a harness that hasn't been given one: unique per
+/// harness, and deliberately never created on disk. A scan of it yields
+/// nothing and a relative open under it fails — both loud, both the same on
+/// every machine, unlike the developer's checkout.
+fn empty_root() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("vix-harness-no-root-{}-{n}", std::process::id()))
 }
 
 fn key(code: KeyCode) -> KeyEvent {

@@ -84,6 +84,11 @@ impl Editor {
     }
 
     pub(crate) fn open_path(&mut self, path: &std::path::Path) {
+        // Picker rows and `:e` arguments are project-relative. Absolutize
+        // against the project root up front so path-keyed buffer dedup, the
+        // load, and the recents record all see the same absolute path —
+        // independent of the process cwd.
+        let path = &self.resolve_in_root(path);
         // Record departure on any switch / load — but not when the target is
         // already the active buffer.
         let same_as_active = self.buffer.path().map(|p| p == path).unwrap_or(false);
@@ -114,22 +119,21 @@ impl Editor {
 
     /// Best-effort recent-files bookkeeping for `open_path`. No-op if
     /// persistence is disabled (`recent_data_file` is `None`, e.g. in
-    /// tests) or `path` isn't under the current working directory — the
-    /// store only tracks project-relative paths.
+    /// tests) or `path` isn't under the project root — the store only
+    /// tracks project-relative paths. `root` is already canonicalized, so
+    /// canonicalizing `path` puts both sides on the same footing before the
+    /// prefix strip.
     fn record_recent(&self, path: &std::path::Path) {
         let Some(file) = self.recent_data_file.as_deref() else {
-            return;
-        };
-        let Ok(cwd) = std::env::current_dir() else {
             return;
         };
         let Ok(canonical) = path.canonicalize() else {
             return;
         };
-        let Ok(rel) = canonical.strip_prefix(&cwd) else {
+        let Ok(rel) = canonical.strip_prefix(&self.root) else {
             return;
         };
-        crate::recent::record_recent_in(file, &cwd, rel);
+        crate::recent::record_recent_in(file, &self.root, rel);
     }
 
     /// Invalidate the syntax cache. Call this after swapping the buffer so
@@ -283,6 +287,9 @@ impl Editor {
     /// `didOpen` round trips. `initial_line` (1-based) seeds the cursor for
     /// grep-hit batch opens; pass `None` to leave it at offset 0.
     pub(crate) fn load_into_park(&mut self, path: &std::path::Path, initial_line: Option<u64>) {
+        // Same project-relative → absolute resolution as `open_path`, so a
+        // batch open dedups against buffers opened either way.
+        let path = &self.resolve_in_root(path);
         if self.buffer_index_by_path(path).is_some() {
             return;
         }

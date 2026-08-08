@@ -52,6 +52,21 @@ two streamed sources (file names and file contents) into a single ranked list,
 content-only search. "Omnibox" names this picker's kind and its UI; it is not a
 separate subsystem from the picker.
 
+**Project root** — the directory an `Editor` treats as the project
+(`Editor::root`). Captured from the process cwd once, in `Editor::new` (`main`
+has already chdir'd into a directory argument by then), canonicalized, and
+never re-read from the process. It is what the omnibox scans and greps, the
+base `resolve_in_root` absolutizes project-relative paths against (picker rows,
+`:e src/foo.rs`), the recents store's project key, and the LSP workspace root.
+No code in `crates/tui` calls `env::current_dir()` outside `Editor::new` — the
+root is editor state, so tests point a `Harness` at a fixture directory
+(`Harness::set_root`) instead of `chdir`ing, and the suite runs in parallel.
+The cwd is not gone from the process: `main` chdirs into a directory argument,
+and `core::Buffer::load` still absolutizes a *relative* path against the cwd —
+correct for a path typed at the shell, wrong for anything originating inside
+the editor. Every `tui` route into `Buffer::load` therefore hands it an already
+absolute path (`resolve_in_root`); a new caller must do the same.
+
 **Project view** — the omnibox's empty-query state: this project's recent
 files above a path-ordered listing of every file in the project. Reached at
 launch (`vix` with no path, or with a directory) and any time the omnibox is

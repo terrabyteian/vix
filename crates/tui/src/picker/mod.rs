@@ -138,11 +138,12 @@ pub(crate) enum PreviewKey {
     Buffer { idx: usize, version: u64 },
 }
 
-/// Cache-key path for an omni row: cwd-relative when possible, so a File
-/// row and a GrepHit row for the same file share one preview cache entry.
-pub(crate) fn omni_key_path(path: &Path) -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    path.strip_prefix(&cwd).unwrap_or(path).to_path_buf()
+/// Cache-key path for an omni row: relative to the project root when
+/// possible, so a File row (already root-relative) and a GrepHit row (an
+/// absolute path from the walk) for the same file share one preview cache
+/// entry.
+pub(crate) fn omni_key_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
 /// Cached file/buffer preview data. Built lazily for a selected row and kept
@@ -1176,8 +1177,8 @@ impl Editor {
 
     /// Every match row resolved to an observable string, in list order:
     /// grep rows as `"{rel_path}:{line}:{snippet}"` (path relative to the
-    /// cwd the walk ran from, snippet as stored — leading whitespace
-    /// trimmed), everything else as its display text. Resolved from the
+    /// project root the walk ran from, snippet as stored — leading
+    /// whitespace trimmed), everything else as its display text. Resolved from the
     /// underlying items, not the rendered frame, so tests can assert the
     /// exact settled ordering of the blended list. Test introspection.
     #[doc(hidden)]
@@ -1185,7 +1186,6 @@ impl Editor {
         let Some(p) = self.picker.as_ref() else {
             return Vec::new();
         };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         p.matches
             .iter()
             .map(|&(r, _)| match r {
@@ -1193,7 +1193,7 @@ impl Editor {
                     let it = &p.grep_items[i];
                     match &it.value {
                         PickerValue::GrepHit { path, line } => {
-                            let rel = path.strip_prefix(&cwd).unwrap_or(path);
+                            let rel = path.strip_prefix(&self.root).unwrap_or(path);
                             format!("{}:{}:{}", rel.display(), line, it.display)
                         }
                         other => unreachable!("grep item without a GrepHit value: {other:?}"),

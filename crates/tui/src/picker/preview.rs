@@ -165,7 +165,7 @@ pub(crate) fn refresh_preview(ed: &mut Editor) {
 
     let cache = match &target {
         // Omni rows: read the file from disk. The key path is already
-        // normalized (cwd-relative when possible) by `omni_key_path`.
+        // normalized (root-relative when possible) by `omni_key_path`.
         PreviewKey::Path(path) => {
             let mut c = build_preview_for_path(ed, path);
             c.key = target.clone();
@@ -223,7 +223,7 @@ fn current_preview_key(ed: &Editor, kind: &PickerKind) -> Option<PreviewKey> {
         // render-time concern.
         PickerKind::Omni => match &p.item(r).value {
             PickerValue::File(path) | PickerValue::GrepHit { path, .. } => {
-                Some(PreviewKey::Path(omni_key_path(path)))
+                Some(PreviewKey::Path(omni_key_path(&ed.root, path)))
             }
             _ => None,
         },
@@ -280,15 +280,18 @@ pub(crate) fn build_preview_for_buffer_idx(ed: &mut Editor, idx: usize) -> Previ
 /// after, lossy-UTF-8. Whole-file highlight — `highlight_range` is the
 /// follow-up if preview parses ever show up as jank.
 ///
-/// `path` is the normalized (possibly cwd-relative) key path; a relative
-/// path resolves against the cwd, which is the omni scan root.
+/// `path` is the normalized (possibly root-relative) key path and stays as
+/// given in the returned cache — it is what the pane header and the MRU key
+/// display. The *read* goes through `resolve_in_root`, so a relative key
+/// resolves against the omni scan root rather than the process cwd.
 fn build_preview_for_path(ed: &mut Editor, path: &Path) -> PreviewCache {
-    if let Ok(meta) = fs::metadata(path) {
+    let abs = ed.resolve_in_root(path);
+    if let Ok(meta) = fs::metadata(&abs) {
         if meta.len() > PREVIEW_MAX_BYTES as u64 {
             return PreviewCache::placeholder(path, "(file too large to preview)");
         }
     }
-    let bytes = match fs::read(path) {
+    let bytes = match fs::read(&abs) {
         Ok(b) => b,
         Err(_) => return PreviewCache::placeholder(path, "(unable to read file)"),
     };
@@ -307,18 +310,6 @@ mod tests {
     use crate::picker::{ItemRef, Picker, PickerItem};
     use crate::testing::Harness;
     use vix_picker::Utf32String;
-
-    /// Serializes the tests that read or change the process-global cwd:
-    /// `omni_key_path` resolves against it, and the harness test chdirs
-    /// into a scratch repo before spawning a file scan. Mirrors the cwd
-    /// lock in `tests/leader_picker.rs`.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
-        // Recover from a poisoned lock: a panicking test leaves nothing
-        // half-done that later tests care about.
-        CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     /// Unique scratch dir per test so parallel test runs (same pid) never
     /// collide, mirroring `recent.rs`'s temp-dir tests.
@@ -356,25 +347,30 @@ mod tests {
 
     #[test]
     fn omni_key_path_normalizes_absolute_to_relative() {
-        let _cwd = lock_cwd();
-        let cwd = std::env::current_dir().unwrap();
+        let root = Path::new("/projects/demo");
         let rel = Path::new("src/foo.rs");
-        assert_eq!(omni_key_path(&cwd.join(rel)), omni_key_path(rel));
-        assert_eq!(omni_key_path(rel), rel);
+        assert_eq!(
+            omni_key_path(root, &root.join(rel)),
+            omni_key_path(root, rel)
+        );
+        assert_eq!(omni_key_path(root, rel), rel);
     }
 
     #[test]
     fn omni_file_and_grep_rows_share_a_preview_key() {
-        let _cwd = lock_cwd();
-        let cwd = std::env::current_dir().unwrap();
+        let root = test_dir("shared-key");
         let mut ed = Editor::new(Buffer::empty());
+        ed.set_root(root.clone());
+        // Canonicalized on the way in (macOS temp dirs are symlinked), so
+        // absolute grep paths have to be built from the stored root.
+        let root = ed.root.clone();
         // A File row with a relative path plus two GrepHit rows for the SAME
         // file at an absolute path and different lines: all three selections
         // must resolve to one cache key.
         let mut p = Picker::new(PickerKind::Omni, Vec::new());
         p.file_items.push(file_item(Path::new("src/foo.rs")));
-        p.grep_items.push(grep_item(&cwd.join("src/foo.rs"), 3));
-        p.grep_items.push(grep_item(&cwd.join("src/foo.rs"), 9));
+        p.grep_items.push(grep_item(&root.join("src/foo.rs"), 3));
+        p.grep_items.push(grep_item(&root.join("src/foo.rs"), 9));
         p.matches = vec![
             (ItemRef::File(0), 0),
             (ItemRef::Grep(0), 0),
@@ -450,11 +446,10 @@ mod tests {
         // End-to-end: open the omnibox over a scratch repo, land the
         // selection on the file row, and refresh. The MRU is empty, so the
         // first build skips the debounce and the pane fills immediately.
-        let _cwd = lock_cwd();
         let dir = test_dir("omni-e2e");
         fs::write(dir.join("alpha.rs"), "fn alpha() {}\n").unwrap();
-        std::env::set_current_dir(&dir).unwrap();
         let mut h = Harness::new();
+        h.set_root(&dir);
         h.editor.open_files_picker();
         h.pump_picker();
         refresh_preview(&mut h.editor);

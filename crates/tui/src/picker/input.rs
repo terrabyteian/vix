@@ -326,7 +326,7 @@ impl Editor {
         };
         p.file_items.clear();
         p.file_items_complete = false;
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let root = self.root.clone();
         let target_gen = self
             .files_gen
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -334,7 +334,7 @@ impl Editor {
         let gen_arc = Arc::clone(&self.files_gen);
         let (tx, rx) = std::sync::mpsc::channel::<Vec<PickerItem>>();
         std::thread::spawn(move || {
-            scan_files_streaming(&cwd, &gen_arc, target_gen, |batch| {
+            scan_files_streaming(&root, &gen_arc, target_gen, |batch| {
                 tx.send(batch.into_iter().map(file_item_to_picker_item).collect())
                     .is_ok()
             });
@@ -403,15 +403,15 @@ impl Editor {
             return;
         };
         let matcher = Arc::new(matcher);
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let root = self.root.clone();
         let gen_arc = Arc::clone(&self.grep_gen);
         let (tx, rx) = std::sync::mpsc::channel::<Vec<PickerItem>>();
         std::thread::spawn(move || {
-            grep_streaming(&cwd, matcher, &gen_arc, target_gen, |batch| {
+            grep_streaming(&root, matcher, &gen_arc, target_gen, |batch| {
                 tx.send(
                     batch
                         .into_iter()
-                        .map(|g| grep_hit_to_picker_item(&cwd, g))
+                        .map(|g| grep_hit_to_picker_item(&root, g))
                         .collect(),
                 )
                 .is_ok()
@@ -668,22 +668,22 @@ impl Editor {
     }
 
     /// Populate an omni picker's recent-files source + ranking map from the
-    /// per-project recent store. Best-effort: no store, no cwd, or an empty
-    /// store just leaves the fields empty. `recent_rank` covers every
-    /// recorded rel-path (so the ranking bonus is live for file-scan rows);
+    /// per-project recent store. Best-effort: no store or an empty store
+    /// just leaves the fields empty. `recent_rank` covers every recorded
+    /// rel-path (so the ranking bonus is live for file-scan rows);
     /// `recent_items` is filtered to entries that still exist on disk.
     fn load_recents_into(&self, p: &mut Picker) {
-        let (Some(file), Ok(cwd)) = (self.recent_data_file.as_ref(), std::env::current_dir())
-        else {
+        let Some(file) = self.recent_data_file.as_ref() else {
             return;
         };
-        for (rank, rel) in crate::recent::load_recent_from(file, &cwd)
+        let root = &self.root;
+        for (rank, rel) in crate::recent::load_recent_from(file, root)
             .into_iter()
             .enumerate()
         {
             let disp = rel.to_string_lossy().into_owned();
             p.recent_rank.insert(disp.clone(), rank);
-            if cwd.join(&rel).is_file() {
+            if root.join(&rel).is_file() {
                 let haystack = Utf32String::from(disp.as_str());
                 p.recent_items.push(PickerItem {
                     display: disp,
