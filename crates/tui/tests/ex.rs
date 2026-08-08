@@ -206,10 +206,17 @@ fn wq_blocks_when_no_path() {
     assert!(h.dirty());
 }
 
+/// A scratch directory, unique per call. The timestamp keeps runs apart
+/// (these dirs leak in /tmp and pids get reused, so a stale one could
+/// otherwise be adopted by a later run); the atomic counter keeps *calls*
+/// apart, since two tests can enter this function in the same wall-clock
+/// nanosecond and would then race on one shared directory.
 fn tempdir() -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "vix-test-{}-{}",
+        "vix-test-{}-{}-{n}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -67,10 +67,16 @@ edition = "2021"
     );
 }
 
+/// A scratch directory, unique per call: pid and timestamp separate runs,
+/// the atomic counter separates calls within one run. Nanosecond stamps are
+/// not unique across threads — two callers in the same instant would get one
+/// shared directory and race on it.
 fn tempdir() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base = std::env::temp_dir();
     let name = format!(
-        "vix-lsp-test-{}-{}",
+        "vix-lsp-test-{}-{}-{n}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
