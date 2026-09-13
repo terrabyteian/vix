@@ -1,21 +1,30 @@
 #!/usr/bin/env sh
-# vix installer
+# Installer. Downloads the release archive for this machine's OS/arch from
+# GitHub Releases and places the binary in ~/.local/bin.
 #
 # Default (latest release):
 #   curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | sh
 #
 # Specific version:
-#   curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.5.0 sh
+#   curl -fsSL https://raw.githubusercontent.com/terrabyteian/vix/main/install.sh | VIX_VERSION=v0.9.0 sh
 #
-# Installs to ~/.local/bin by default; override the location with VIX_INSTALL_DIR.
-set -e
+# Override the install location with VIX_INSTALL_DIR.
+#
+# This script is shared verbatim between the rug and vix repos apart from
+# the config block below. Keep it that way: fix a bug here, copy it there.
+set -eu
 
+# --- Project config (the only lines that differ between repos) --------------
 REPO="terrabyteian/vix"
 BINARY="vix"
-INSTALL_DIR="${VIX_INSTALL_DIR:-$HOME/.local/bin}"
+ENV_PREFIX="VIX"   # honours ${ENV_PREFIX}_VERSION and ${ENV_PREFIX}_INSTALL_DIR
+# ---------------------------------------------------------------------------
+
+eval "VERSION=\"\${${ENV_PREFIX}_VERSION:-}\""
+eval "INSTALL_DIR=\"\${${ENV_PREFIX}_INSTALL_DIR:-\$HOME/.local/bin}\""
 
 # ---------------------------------------------------------------------------
-# Detect OS
+# Detect OS / architecture
 # ---------------------------------------------------------------------------
 OS="$(uname -s)"
 case "$OS" in
@@ -27,9 +36,6 @@ case "$OS" in
     ;;
 esac
 
-# ---------------------------------------------------------------------------
-# Detect architecture
-# ---------------------------------------------------------------------------
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64)           ARCH="x86_64" ;;
@@ -51,27 +57,28 @@ fi
 # ---------------------------------------------------------------------------
 # Resolve version (env override or latest from GitHub API)
 # ---------------------------------------------------------------------------
-if [ -z "${VIX_VERSION:-}" ]; then
+if [ -z "$VERSION" ]; then
   printf "==> Fetching latest release... "
-  VIX_VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
     | grep '"tag_name"' \
     | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-  echo "$VIX_VERSION"
+  echo "$VERSION"
 fi
+[ -n "$VERSION" ] || { echo "error: could not determine latest release" >&2; exit 1; }
 
 # Normalise: ensure leading 'v'.
-case "$VIX_VERSION" in
+case "$VERSION" in
   v*) ;;
-  *)  VIX_VERSION="v${VIX_VERSION}" ;;
+  *)  VERSION="v${VERSION}" ;;
 esac
 
-echo "==> Installing ${BINARY} ${VIX_VERSION} (${OS}-${ARCH})"
+echo "==> Installing ${BINARY} ${VERSION} (${OS}-${ARCH})"
 
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
-ARCHIVE="${BINARY}-${VIX_VERSION}-${OS}-${ARCH}.tar.gz"
-URL="https://github.com/${REPO}/releases/download/${VIX_VERSION}/${ARCHIVE}"
+ARCHIVE="${BINARY}-${VERSION}-${OS}-${ARCH}.tar.gz"
+URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -83,9 +90,7 @@ tar -xzf "${TMP}/${ARCHIVE}" -C "$TMP"
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-if [ ! -d "$INSTALL_DIR" ]; then
-  mkdir -p "$INSTALL_DIR"
-fi
+mkdir -p "$INSTALL_DIR" 2>/dev/null || sudo mkdir -p "$INSTALL_DIR"
 
 if [ -w "$INSTALL_DIR" ]; then
   SUDO=""

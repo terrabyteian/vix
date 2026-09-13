@@ -1,177 +1,204 @@
 #!/usr/bin/env bash
+# Release driver. Full docs: scripts/README.md
+#
+#   scripts/release.sh X.Y.Z                  bump, check, build, commit, tag, push, GitHub release
+#   scripts/release.sh --dry-run [X.Y.Z]      checks + builds + archives only; no git/gh writes
+#   scripts/release.sh --assets-only vX.Y.Z   rebuild + re-upload archives to an existing release
+#   --skip-checks                             skip fmt/clippy/test (any mode)
+#
+# This script is shared verbatim between the rug and vix repos apart from
+# the config block below. Keep it that way: fix a bug here, copy it there.
 set -euo pipefail
+
+# --- Project config (the only lines that differ between repos) --------------
+BINARY="vix"
+DEFAULT_BRANCH="main"
+# ---------------------------------------------------------------------------
 
 # cargo-installed tools (cargo-zigbuild) live here; login shells have it on
 # PATH but non-interactive invocations may not.
 export PATH="$HOME/.cargo/bin:$PATH"
+cd "$(git rev-parse --show-toplevel)"
 
+DIST="dist"
+TARGETS=(aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
+
+# Archive names are load-bearing: install.sh reconstructs
+# <BINARY>-<tag>-<os>-<arch>.tar.gz to build its download URL.
+archive_suffix() {
+  case "$1" in
+    aarch64-apple-darwin)      echo "darwin-arm64" ;;
+    x86_64-unknown-linux-gnu)  echo "linux-x86_64" ;;
+    aarch64-unknown-linux-gnu) echo "linux-arm64" ;;
+    *) echo "ERROR: unknown target $1" >&2; exit 1 ;;
+  esac
+}
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+step() { echo "==> $*"; }
+
+# ---------------------------------------------------------------------------
+# 1. Arguments
+# ---------------------------------------------------------------------------
 DRY_RUN=false
 ASSETS_ONLY=false
+SKIP_CHECKS=false
+NEW_VERSION=""
 TAG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run)
-      DRY_RUN=true
-      shift
-      ;;
+    --dry-run)     DRY_RUN=true; shift ;;
+    --skip-checks) SKIP_CHECKS=true; shift ;;
     --assets-only)
       ASSETS_ONLY=true
       TAG="${2:-}"
-      if [[ -z "$TAG" ]]; then
-        echo "ERROR: --assets-only requires a tag argument, e.g. --assets-only v0.8.0" >&2
-        exit 1
-      fi
-      shift 2
-      ;;
+      [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--assets-only needs a tag like v0.8.0"
+      shift 2 ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    -*) die "unknown flag '$1'" ;;
     *)
-      echo "ERROR: unknown argument '$1'" >&2
-      exit 1
-      ;;
+      [[ -z "$NEW_VERSION" ]] || die "unexpected argument '$1'"
+      [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must look like X.Y.Z (got '$1')"
+      NEW_VERSION="$1"; shift ;;
   esac
 done
 
-if $DRY_RUN; then
-  echo "==> Dry-run mode: builds will run but no tag/push/release will happen"
-fi
+current_version() { grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/'; }
 
-# ---------------------------------------------------------------------------
-# 1. Determine version/tag
-# ---------------------------------------------------------------------------
 if $ASSETS_ONLY; then
-  echo "==> Assets-only mode: rebuilding archives for existing tag ${TAG}"
+  [[ -z "$NEW_VERSION" ]] || die "--assets-only takes a tag, not a new version"
+  step "Assets-only mode: rebuilding archives for existing release ${TAG}"
+elif [[ -n "$NEW_VERSION" ]]; then
+  TAG="v${NEW_VERSION}"
+  step "Releasing ${BINARY} $(current_version) -> ${NEW_VERSION} (tag ${TAG})"
 else
-  VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-  TAG="v${VERSION}"
-  echo "==> Version: ${VERSION}  Tag: ${TAG}"
+  $DRY_RUN || die "a new version is required, e.g. scripts/release.sh 0.9.0 (or --dry-run to build the current version)"
+  TAG="v$(current_version)"
+  step "Dry run at current version $(current_version)"
 fi
+$DRY_RUN && step "Dry-run mode: no commit/tag/push/release will happen"
 
 # ---------------------------------------------------------------------------
-# 2. Guard
+# 2. Guards
 # ---------------------------------------------------------------------------
-if $ASSETS_ONLY; then
-  # Re-publishing assets only applies to a release that already exists.
-  if ! git rev-parse "$TAG" &>/dev/null; then
-    echo "ERROR: tag ${TAG} does not exist — --assets-only requires an existing tag" >&2
-    exit 1
-  fi
-
-  if ! gh release view "$TAG" &>/dev/null; then
-    echo "ERROR: no GitHub release found for tag ${TAG}" >&2
-    exit 1
-  fi
-else
-  # Guard: must be on main with a clean tree
-  BRANCH=$(git rev-parse --abbrev-ref HEAD)
-  if [[ "$BRANCH" != "main" ]]; then
-    echo "ERROR: must be on main branch (currently on '${BRANCH}')" >&2
-    exit 1
-  fi
-
-  if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "ERROR: working tree is not clean — commit or stash changes first" >&2
-    exit 1
-  fi
-
-  if ! $DRY_RUN && git rev-parse "$TAG" &>/dev/null; then
-    echo "ERROR: tag ${TAG} already exists" >&2
-    exit 1
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 3. Check prerequisites
-#    zig + cargo-zigbuild handle the linux cross-builds (the tree-sitter C
-#    grammars compile fine under zig cc — v0.7.0/v0.8.0 shipped this way).
-# ---------------------------------------------------------------------------
-for cmd in cargo zig gh; do
-  if ! command -v "$cmd" &>/dev/null; then
-    echo "ERROR: '${cmd}' not found on PATH" >&2
-    echo "  Run: brew install zig  (for zig)" >&2
-    echo "       cargo install cargo-zigbuild  (for zigbuild)" >&2
-    echo "       brew install gh  (for GitHub CLI)" >&2
-    exit 1
-  fi
+for cmd in cargo cargo-zigbuild zig gh git; do
+  command -v "$cmd" >/dev/null 2>&1 || die "'${cmd}' not found on PATH — see scripts/README.md prerequisites"
 done
 
-if ! command -v cargo-zigbuild &>/dev/null; then
-  echo "ERROR: cargo-zigbuild not installed — run: cargo install cargo-zigbuild" >&2
-  exit 1
+if $ASSETS_ONLY; then
+  git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null || die "tag ${TAG} does not exist locally"
+  gh release view "$TAG" >/dev/null 2>&1 || die "no GitHub release found for ${TAG}"
+else
+  BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  [[ "$BRANCH" == "$DEFAULT_BRANCH" ]] || die "must be on ${DEFAULT_BRANCH} (currently on '${BRANCH}')"
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git status --short >&2
+    die "working tree is not clean — commit, stash, or remove the above first"
+  fi
+
+  if ! $DRY_RUN; then
+    git fetch -q origin "$DEFAULT_BRANCH"
+    git merge-base --is-ancestor "origin/${DEFAULT_BRANCH}" HEAD \
+      || die "local ${DEFAULT_BRANCH} is behind origin/${DEFAULT_BRANCH} — pull first"
+    git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null && die "tag ${TAG} already exists"
+    git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1 && die "tag ${TAG} already exists on origin"
+    gh release view "$TAG" >/dev/null 2>&1 && die "GitHub release ${TAG} already exists"
+    gh auth status >/dev/null 2>&1 || die "gh is not authenticated — run: gh auth login"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Build
+# 3. Version bump (kept uncommitted until the build succeeds)
 # ---------------------------------------------------------------------------
-DIST="dist"
+BUMPED=false
+revert_bump() {
+  if $BUMPED; then
+    echo "==> Reverting uncommitted version bump"
+    git checkout -q -- Cargo.toml Cargo.lock
+  fi
+}
+trap revert_bump EXIT
+
+if [[ -n "$NEW_VERSION" ]]; then
+  step "Bumping Cargo.toml to ${NEW_VERSION}"
+  BUMPED=true
+  perl -pi -e 'if (!$done && s/^version = "[^"]*"/version = "'"$NEW_VERSION"'"/) { $done = 1 }' Cargo.toml
+  [[ "$(current_version)" == "$NEW_VERSION" ]] || die "failed to bump version in Cargo.toml"
+  cargo update --workspace -q
+  CHANGED="$(git diff --name-only | sort | tr '\n' ' ')"
+  [[ "$CHANGED" == "Cargo.lock Cargo.toml " || "$CHANGED" == "Cargo.toml " ]] \
+    || die "bump touched unexpected files: ${CHANGED}"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Checks
+# ---------------------------------------------------------------------------
+if $SKIP_CHECKS; then
+  step "Skipping fmt/clippy/test (--skip-checks)"
+else
+  step "cargo fmt --check";  cargo fmt --all -- --check
+  step "cargo clippy";       cargo clippy --workspace --all-targets -- -D warnings
+  step "cargo test";         cargo test --workspace
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Build + package
+# ---------------------------------------------------------------------------
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
-echo "==> Building aarch64-apple-darwin (native)"
-cargo build --release --target aarch64-apple-darwin
-
-echo "==> Building x86_64-unknown-linux-gnu"
-cargo zigbuild --release --target x86_64-unknown-linux-gnu
-
-echo "==> Building aarch64-unknown-linux-gnu"
-cargo zigbuild --release --target aarch64-unknown-linux-gnu
-
-# ---------------------------------------------------------------------------
-# 5. Package .tar.gz archives
-#    Names MUST stay vix-<TAG>-<os>-<arch>.tar.gz — install.sh reconstructs
-#    them to build its download URL.
-# ---------------------------------------------------------------------------
-package() {
-  local target="$1"
-  local archive_name="$2"
-  local binary="target/${target}/release/vix"
-
-  if [[ ! -f "$binary" ]]; then
-    echo "ERROR: binary not found at ${binary}" >&2
-    exit 1
+for target in "${TARGETS[@]}"; do
+  if [[ "$target" == *apple-darwin ]]; then
+    step "Building ${target} (native)"
+    cargo build --release --target "$target"
+  else
+    step "Building ${target} (cargo zigbuild)"
+    cargo zigbuild --release --target "$target"
   fi
 
-  tar -czf "${DIST}/${archive_name}" -C "$(dirname "$binary")" "$(basename "$binary")"
-  echo "    created ${DIST}/${archive_name}"
-}
-
-echo "==> Packaging archives"
-package "aarch64-apple-darwin"       "vix-${TAG}-darwin-arm64.tar.gz"
-package "x86_64-unknown-linux-gnu"   "vix-${TAG}-linux-x86_64.tar.gz"
-package "aarch64-unknown-linux-gnu"  "vix-${TAG}-linux-arm64.tar.gz"
+  binary="target/${target}/release/${BINARY}"
+  [[ -f "$binary" ]] || die "binary not found at ${binary}"
+  archive="${BINARY}-${TAG}-$(archive_suffix "$target").tar.gz"
+  tar -czf "${DIST}/${archive}" -C "$(dirname "$binary")" "$(basename "$binary")"
+  echo "    packaged ${DIST}/${archive}"
+done
 
 if $DRY_RUN; then
-  echo "==> Dry-run complete. Archives in ${DIST}/:"
+  step "Dry run complete. Archives in ${DIST}/:"
   ls -lh "$DIST/"
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# 6. Publish
+# ---------------------------------------------------------------------------
 if $ASSETS_ONLY; then
-  # -------------------------------------------------------------------------
-  # 6. Upload archives to the existing release (no tag/push/create)
-  # -------------------------------------------------------------------------
-  echo "==> Uploading assets to existing release ${TAG}"
+  step "Uploading archives to existing release ${TAG}"
   gh release upload "$TAG" "${DIST}"/*.tar.gz --clobber
+else
+  step "Committing version bump"
+  git add Cargo.toml Cargo.lock
+  git commit -q -m "chore: bump version to ${NEW_VERSION}"
+  BUMPED=false   # committed; nothing to revert from here on
 
-  echo "==> Done! https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/${TAG}"
-  exit 0
+  step "Tagging ${TAG}"
+  git tag -a "$TAG" -m "${BINARY} ${TAG}"
+
+  step "Pushing ${DEFAULT_BRANCH} and ${TAG}"
+  git push origin "$DEFAULT_BRANCH" "$TAG"
+
+  step "Creating GitHub release ${TAG}"
+  gh release create "$TAG" \
+    --title "${BINARY} ${TAG}" \
+    --generate-notes \
+    "${DIST}"/*.tar.gz
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Tag and push
+# 7. Verify
 # ---------------------------------------------------------------------------
-echo "==> Tagging ${TAG}"
-git tag "$TAG"
-
-echo "==> Pushing tag"
-git push origin "$TAG"
-
-# ---------------------------------------------------------------------------
-# 7. Create GitHub Release with auto-generated notes and upload assets
-# ---------------------------------------------------------------------------
-echo "==> Creating GitHub Release ${TAG}"
-gh release create "$TAG" \
-  --title "vix ${TAG}" \
-  --generate-notes \
-  "${DIST}"/*.tar.gz
-
-echo "==> Done! https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/${TAG}"
+n="$(gh release view "$TAG" --json assets -q '.assets | length')"
+[[ "$n" == "${#TARGETS[@]}" ]] || die "release ${TAG} has ${n} assets, expected ${#TARGETS[@]}"
+step "Done: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/${TAG}"

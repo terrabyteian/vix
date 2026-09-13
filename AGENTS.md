@@ -13,46 +13,51 @@ vix is a modal (vim-flavored) terminal editor. Cargo workspace: `crates/core`
   placement, the `Harness` contract, error layering, visibility defaults,
   dependency policy. `/code-review` reviews against it.
 - Keep `README.md` in sync with user-visible behavior changes.
-- Before any release: `cargo test --workspace`,
-  `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo fmt --all -- --check`. The `vix-lsp` smoke test needs a working
-  rust-analyzer and skips itself (still green) when there isn't one — e.g.
-  when only the rustup shim is present without the component installed.
+- `scripts/release.sh` runs `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo test --workspace` before building; run them yourself before pushing
+  too. The `vix-lsp` smoke test needs a working rust-analyzer and skips
+  itself (still green) when there isn't one — e.g. when only the rustup shim
+  is present without the component installed.
 
 ## Release process
 
-Everything is driven by `scripts/release.sh`. Do not release by hand — the
-archive names are load-bearing: `install.sh` reconstructs
-`vix-<tag>-<os>-<arch>.tar.gz` (`darwin-arm64`, `linux-x86_64`,
-`linux-arm64`) to build its download URL, so a rename breaks
-`curl | sh` installs.
+`scripts/release.sh X.Y.Z` is the whole process; full mechanics are in
+`scripts/README.md`. Never release by hand. From a clean, up-to-date
+`main` checkout it bumps `Cargo.toml`/`Cargo.lock`, runs
+fmt/clippy/test, builds darwin-arm64 natively and both Linux targets via
+`cargo zigbuild`, packages `dist/*.tar.gz`, and only then commits the bump
+(`chore: bump version to X.Y.Z`), creates the annotated tag `vX.Y.Z`, pushes
+branch + tag, and creates the GitHub release with `--generate-notes` and the
+three archives attached. Release notes are generated from commit messages,
+so write them for a changelog reader.
 
-1. **Bump the version** in the workspace `Cargo.toml` (single `version`
-   field; crates inherit it), then `cargo update --workspace` so
-   `Cargo.lock` follows. Commit (e.g. `Bump to 0.8.0`), push `main`. The
-   release notes are generated from commit history by
-   `gh release --generate-notes`, so write commit messages accordingly.
-2. **Run `scripts/release.sh`**. It parses the version from `Cargo.toml`,
-   refuses to run off `main` or with a dirty tree, builds
-   aarch64-apple-darwin natively plus both Linux targets via
-   `cargo zigbuild`, packages `dist/*.tar.gz`, tags `v<version>`, pushes the
-   tag, and creates the GitHub release with `--generate-notes` and the three
-   archives attached.
-   - `--dry-run`: build + package only; no tag/push/release.
-   - `--assets-only v<X.Y.Z>`: rebuild and re-upload (`--clobber`) archives
-     to an existing release — the recovery path for wrong/missing assets.
+- `--dry-run [X.Y.Z]`: checks + build + package only; a bump is reverted on
+  exit.
+- `--assets-only vX.Y.Z`: rebuild and re-upload archives to an existing
+  release (recovery path for wrong/missing assets).
+- `--skip-checks`: bypass fmt/clippy/test.
+
+Archive names are load-bearing: `install.sh` reconstructs
+`vix-<tag>-<os>-<arch>.tar.gz` (`darwin-arm64`, `linux-x86_64`,
+`linux-arm64`) to build its download URL. `scripts/release.sh` and
+`install.sh` are shared verbatim with the `rug` repo apart from the
+config block at the top of each; copy fixes across rather than letting them
+drift.
 
 ### Toolchain (host: darwin-arm64)
 
-- `cargo-zigbuild` + `zig` do the Linux cross-builds; the tree-sitter C
-  grammars compile fine under zig cc (v0.7.0 and v0.8.0 shipped this way).
-  Do NOT reintroduce `cross`/Docker — this machine has neither.
-- Requires rustup targets `x86_64-unknown-linux-gnu`,
-  `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`.
+- `zig` (homebrew) + `cargo-zigbuild` do the Linux cross-builds; requires
+  rustup targets `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+  `aarch64-unknown-linux-gnu`. No cross/Docker on this machine — do not
+  reintroduce them.
+- The tree-sitter C grammars compile fine under zig cc (every release
+  since v0.7.0 shipped this way).
 - `cargo-zigbuild` lives in `~/.cargo/bin`, which non-interactive shells may
   not have on PATH; the script exports it itself.
-- Git identity is repo-local on this machine (global is unset); commits in
-  fresh clones will need `git config user.name/user.email` first.
+- Git identity is repo-local on this machine (global is unset); a fresh
+  clone needs `git config user.name "Ian Hall"` / `git config user.email
+  terrabytian@gmail.com` before committing.
 
 ## Agent skills
 
