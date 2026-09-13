@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo test *)",
+      "Bash(gh issue *)",
+      "Bash(gh label list *)",
+      "Bash(git *)",
+      "Bash(rust-analyzer --version)"
+    ]
+  }
+}

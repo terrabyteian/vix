@@ -5,3 +5,4 @@ Cargo.lock.bak
 .DS_Store
 .idea/
 .vscode/
+/.claude/settings.local.json
