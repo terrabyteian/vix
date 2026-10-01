@@ -173,3 +173,51 @@ fn count_yy_yanks_n_lines() {
     assert_eq!(text, "a\nb\n");
     assert!(linewise);
 }
+
+#[test]
+fn d0_deletes_to_line_start() {
+    let mut h = Harness::with_text("foo bar\n");
+    h.keys("wd0");
+    h.assert_text("bar\n");
+}
+
+#[test]
+fn dj_and_dk_are_linewise() {
+    let mut h = Harness::with_text("one\ntwo\nthree\nfour\n");
+    h.keys("jldj");
+    h.assert_text("one\nfour\n");
+    let (text, linewise) = h.register();
+    assert_eq!(text, "two\nthree\n");
+    assert!(linewise);
+    h.keys("dk");
+    h.assert_text("");
+}
+
+#[test]
+fn dj_on_the_last_line_is_a_no_op() {
+    let mut h = Harness::with_text("one\ntwo");
+    h.keys("jdj");
+    h.assert_text("one\ntwo");
+}
+
+#[test]
+fn linewise_paste_after_an_unterminated_last_line() {
+    let mut h = Harness::with_text("a\nb");
+    h.keys("jyyp");
+    h.assert_text("a\nb\nb");
+    h.assert_cursor(2, 0);
+}
+
+#[test]
+fn pair_object_past_the_last_line_does_not_panic() {
+    let mut h = Harness::with_text("f(x)\n");
+    h.keys("Gdi(");
+    h.assert_text("f(x)\n");
+}
+
+#[test]
+fn huge_count_saturates() {
+    let mut h = Harness::with_text("a\nb\nc\n");
+    h.keys("j18446744073709551615dd");
+    h.assert_text("a\n");
+}

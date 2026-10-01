@@ -26,10 +26,35 @@ const FORCED_REDRAW_MS: u64 = 500;
 /// iteration — poll() returns instantly while the queue is non-empty.
 const MAX_EVENTS_PER_FRAME: usize = 128;
 
+/// Put the terminal back the way the shell expects it. Best-effort: every
+/// step is attempted even if an earlier one fails.
+fn restore_terminal() {
+    let _ = terminal::disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
 pub fn run(buffer: Buffer, open_files_picker: bool) -> io::Result<()> {
+    // A panic must not strand the shell in raw mode on the alternate screen
+    // with mouse reporting on — and the message itself would be lost there.
+    // The hook runs even under `panic = "abort"`; restore first so the
+    // default hook prints the panic to a usable terminal.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture)?;
+    if let Err(e) = execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture) {
+        restore_terminal();
+        return Err(e);
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut term: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 

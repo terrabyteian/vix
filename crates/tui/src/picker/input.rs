@@ -715,9 +715,14 @@ impl Editor {
             };
             p.last_grep_query.as_deref() == Some(p.query.as_str())
         };
-        let need_content = self.picker.as_ref().is_some_and(|p| {
-            p.content_visible() && !warm && p.content_pattern_len() >= MIN_CONTENT_QUERY_LEN
-        });
+        // No length gate here: `start_grep_stream` applies it itself, and
+        // for a too-short query it still clears the hits cached for the
+        // previous query — which would otherwise be blended in as if they
+        // matched this one.
+        let need_content = self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.content_visible() && !warm);
         if need_content {
             // Starts the walk and rescores (clearing stale hits, resetting
             // selection) in one go.
@@ -942,9 +947,13 @@ impl Editor {
     /// Act on a picker selection: open a file or jump to a grep hit.
     pub(crate) fn pick_result(&mut self, value: PickerValue) {
         match value {
-            PickerValue::File(path) => self.open_path(&path),
-            PickerValue::GrepHit { path, line } => {
+            PickerValue::File(path) => {
                 self.open_path(&path);
+            }
+            PickerValue::GrepHit { path, line } => {
+                if !self.open_path(&path) {
+                    return;
+                }
                 // Jump to the hit line (1-based).
                 let target = line.saturating_sub(1) as usize;
                 let target = target.min(self.buffer.len_lines().saturating_sub(1));

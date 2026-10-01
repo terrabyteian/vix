@@ -226,3 +226,18 @@ fn tempdir() -> std::path::PathBuf {
     fs::create_dir_all(&p).unwrap();
     p
 }
+
+#[test]
+fn unknown_command_starting_with_s_is_not_a_substitute() {
+    let mut h = Harness::with_text("save me\n");
+    h.cmd("saveas x");
+    h.assert_text("save me\n");
+    assert!(h.msg().contains("not implemented"), "msg: {}", h.msg());
+}
+
+#[test]
+fn substitute_expands_captures_from_the_match_in_context() {
+    let mut h = Harness::with_text("foo bar\n");
+    h.cmd(r"s/\b(\w)ar/${1}az/");
+    h.assert_text("foo baz\n");
+}

@@ -6,9 +6,11 @@ use vix_core::Buffer;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<()> {
-    let mut args = env::args().skip(1);
+    // `args_os`: `env::args` panics on a non-UTF-8 argument, and a file
+    // name is allowed to be one.
+    let mut args = env::args_os().skip(1);
     let first = args.next();
-    match first.as_deref() {
+    match first.as_deref().and_then(|a| a.to_str()) {
         Some("--version" | "-V") => {
             println!("vix {VERSION}");
             return Ok(());
@@ -34,11 +36,13 @@ fn main() -> Result<()> {
         Some(p) => {
             let path = Path::new(&p);
             if path.is_dir() {
-                env::set_current_dir(path).with_context(|| format!("failed to chdir to {p}"))?;
+                env::set_current_dir(path)
+                    .with_context(|| format!("failed to chdir to {}", path.display()))?;
                 (Buffer::empty(), true)
             } else {
                 (
-                    Buffer::load(&p).with_context(|| format!("failed to load {p}"))?,
+                    Buffer::load(path)
+                        .with_context(|| format!("failed to load {}", path.display()))?,
                     false,
                 )
             }

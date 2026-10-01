@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use vix_core::{
-    apply_motion, text_object_range, Action, Buffer, Change, FindDirection, FindKind, InsertPos,
-    Mode, Motion, PendingOp, RepeatAction, SearchDirection, Selection, Transaction,
+    apply_motion, apply_move, text_object_range, Action, Buffer, Change, FindDirection, FindKind,
+    InsertPos, Mode, Motion, PendingOp, RepeatAction, SearchDirection, Selection, Transaction,
 };
 
 use crate::util::osc52_copy;
@@ -23,7 +23,7 @@ impl Editor {
                 if matches!(m, Motion::BufferStart | Motion::BufferEnd) {
                     self.push_jump();
                 }
-                let new_sel = apply_motion(&self.buffer, self.sel, m, n);
+                let new_sel = apply_move(&self.buffer, self.sel, m, n);
                 if self.mode == Mode::Visual || self.mode == Mode::VisualLine {
                     // Extend: keep anchor, move head only.
                     self.sel = Selection {
@@ -49,28 +49,30 @@ impl Editor {
                 self.enter_insert(pos);
             }
             Action::Operate(op, m, n) => {
-                // `G` and `gg` with an operator behave linewise (vim parity).
-                if matches!(m, Motion::BufferStart | Motion::BufferEnd) {
+                // `G`, `gg`, `j` and `k` with an operator behave linewise (vim
+                // parity): `dj` removes two whole lines, not the text between
+                // two cursor columns.
+                if matches!(
+                    m,
+                    Motion::BufferStart | Motion::BufferEnd | Motion::Up | Motion::Down
+                ) {
                     let cur_line = self.cursor_line();
+                    let last_line = self.buffer.len_lines().saturating_sub(1);
                     let target_line = match m {
-                        Motion::BufferStart => {
-                            if n == 0 {
-                                0
-                            } else {
-                                n.saturating_sub(1)
-                                    .min(self.buffer.len_lines().saturating_sub(1))
-                            }
+                        Motion::BufferStart if n == 0 => 0,
+                        Motion::BufferEnd if n == 0 => last_line,
+                        Motion::BufferStart | Motion::BufferEnd => {
+                            n.saturating_sub(1).min(last_line)
                         }
-                        Motion::BufferEnd => {
-                            if n == 0 {
-                                self.buffer.len_lines().saturating_sub(1)
-                            } else {
-                                n.saturating_sub(1)
-                                    .min(self.buffer.len_lines().saturating_sub(1))
-                            }
-                        }
+                        Motion::Up => cur_line.saturating_sub(n.max(1)),
+                        Motion::Down => cur_line.saturating_add(n.max(1)).min(last_line),
                         _ => unreachable!(),
                     };
+                    // `dj` on the last line / `dk` on the first: nowhere to
+                    // go, so nothing to operate on (vim errors out too).
+                    if matches!(m, Motion::Up | Motion::Down) && target_line == cur_line {
+                        return;
+                    }
                     // The trailing newline produces an extra "empty line"; clamp to
                     // the last line that actually has a newline terminator.
                     let last_real_line = if self.buffer.len_chars() > 0
@@ -116,24 +118,7 @@ impl Editor {
                 } else {
                     m
                 };
-                let target = apply_motion(&self.buffer, self.sel, m, n);
-                let inclusive = matches!(
-                    m,
-                    Motion::LineEnd
-                        | Motion::WordEnd
-                        | Motion::FindChar(_, _, FindKind::On)
-                        | Motion::MatchBracket
-                );
-                let range = if self.sel.head <= target.head {
-                    let end = if inclusive {
-                        (target.head + 1).min(self.buffer.len_chars())
-                    } else {
-                        target.head
-                    };
-                    self.sel.head..end
-                } else {
-                    target.head..self.sel.head
-                };
+                let range = self.motion_range(m, n);
                 let entered_insert = self.apply_operator(op, range);
                 if entered_insert {
                     // `c<motion>` — record origin so leave_insert can build a
@@ -178,7 +163,9 @@ impl Editor {
                 let line = self.cursor_line();
                 let start = self.buffer.line_to_char(line);
                 // `dd` = 1 line = [line, line]. `2dd` = 2 lines = [line, line+1].
-                let end_line = (line + n - 1).min(self.buffer.len_lines().saturating_sub(1));
+                let end_line = line
+                    .saturating_add(n - 1)
+                    .min(self.buffer.len_lines().saturating_sub(1));
                 let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
                 // For Change (cc): keep the trailing newline so we end up on a
                 // blank line in place. For everything else (dd / yy / >>):
@@ -243,7 +230,7 @@ impl Editor {
             Action::ToggleCase(n) => {
                 let start = self.sel.head;
                 let n = n.max(1);
-                let end = (start + n).min(self.buffer.len_chars());
+                let end = start.saturating_add(n).min(self.buffer.len_chars());
                 if start < end {
                     self.apply_operator(PendingOp::SwapCase, start..end);
                     // `~` advances the cursor by `n` (capped at end-of-line in
@@ -667,29 +654,36 @@ impl Editor {
         let cursor_after;
         if self.register.linewise {
             let (line, _) = self.buffer.char_to_line_col(self.sel.head);
-            insert_at = if after {
+            let line_end = self.buffer.line_to_char(line) + self.buffer.line_len_chars(line);
+            // `p` on a last line with no newline terminator: the break has
+            // to go *before* the pasted block, or it lands glued onto the
+            // end of the current line.
+            let unterminated_last = after && line_end == self.buffer.len_chars();
+            insert_at = if !after {
                 self.buffer.line_to_char(line)
-                    + self.buffer.line_len_chars(line)
-                    + if line + 1 < self.buffer.len_lines() {
-                        1
-                    } else {
-                        0
-                    }
+            } else if unterminated_last {
+                line_end
             } else {
-                self.buffer.line_to_char(line)
+                line_end + 1
             };
-            // Ensure the pasted block ends with a newline for clean line boundary.
-            let to_insert = if text.ends_with('\n') {
-                text.clone()
+            let body = text.strip_suffix('\n').unwrap_or(&text);
+            let to_insert = if unterminated_last {
+                format!("\n{body}")
             } else {
-                format!("{text}\n")
+                // Ensure the pasted block ends with a newline for a clean
+                // line boundary.
+                format!("{body}\n")
             };
             self.buffer.insert_str(insert_at, &to_insert);
             tx.push(Change::Insert {
                 at: insert_at,
                 text: to_insert.clone(),
             });
-            cursor_after = insert_at;
+            cursor_after = if unterminated_last {
+                insert_at + 1
+            } else {
+                insert_at
+            };
         } else {
             let (line, col) = self.buffer.char_to_line_col(self.sel.head);
             let line_len = self.buffer.line_len_chars(line);
@@ -720,19 +714,16 @@ impl Editor {
         };
         match last {
             RepeatAction::Operate { op, motion, count } => {
-                let target = apply_motion(&self.buffer, self.sel, motion, count);
-                let range = if self.sel.head <= target.head {
-                    self.sel.head..target.head
-                } else {
-                    target.head..self.sel.head
-                };
+                let range = self.motion_range(motion, count);
                 self.apply_operator(op, range);
             }
             RepeatAction::OperateLine { op, count } => {
                 let count = count.max(1);
                 let line = self.cursor_line();
                 let start = self.buffer.line_to_char(line);
-                let end_line = (line + count - 1).min(self.buffer.len_lines().saturating_sub(1));
+                let end_line = line
+                    .saturating_add(count - 1)
+                    .min(self.buffer.len_lines().saturating_sub(1));
                 let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
                 let end = if end < self.buffer.len_chars() {
                     end + 1
@@ -778,24 +769,7 @@ impl Editor {
                 } else {
                     motion
                 };
-                let target = apply_motion(&self.buffer, self.sel, m, count);
-                let inclusive = matches!(
-                    m,
-                    Motion::LineEnd
-                        | Motion::WordEnd
-                        | Motion::FindChar(_, _, FindKind::On)
-                        | Motion::MatchBracket
-                );
-                let range = if self.sel.head <= target.head {
-                    let end = if inclusive {
-                        (target.head + 1).min(self.buffer.len_chars())
-                    } else {
-                        target.head
-                    };
-                    self.sel.head..end
-                } else {
-                    target.head..self.sel.head
-                };
+                let range = self.motion_range(m, count);
                 self.apply_operator(PendingOp::Change, range);
                 for c in text.chars() {
                     self.insert_char_in_session(c);
@@ -815,7 +789,9 @@ impl Editor {
                 let count = count.max(1);
                 let line = self.cursor_line();
                 let start = self.buffer.line_to_char(line);
-                let end_line = (line + count - 1).min(self.buffer.len_lines().saturating_sub(1));
+                let end_line = line
+                    .saturating_add(count - 1)
+                    .min(self.buffer.len_lines().saturating_sub(1));
                 let end = self.buffer.line_to_char(end_line) + self.buffer.line_len_chars(end_line);
                 self.apply_operator_with_kind(PendingOp::Change, start..end, true);
                 for c in text.chars() {
@@ -831,6 +807,30 @@ impl Editor {
         }
     }
 
+    /// The char range an operator covers for `motion` from the cursor. One
+    /// place decides which motions are inclusive of their target char, so
+    /// the first application and its `.` replay can't disagree.
+    fn motion_range(&self, motion: Motion, count: usize) -> std::ops::Range<usize> {
+        let target = apply_motion(&self.buffer, self.sel, motion, count);
+        let inclusive = matches!(
+            motion,
+            Motion::LineEnd
+                | Motion::WordEnd
+                | Motion::FindChar(_, _, FindKind::On)
+                | Motion::MatchBracket
+        );
+        if self.sel.head <= target.head {
+            let end = if inclusive {
+                (target.head + 1).min(self.buffer.len_chars())
+            } else {
+                target.head
+            };
+            self.sel.head..end
+        } else {
+            target.head..self.sel.head
+        }
+    }
+
     /// Compute the char range for `x` / `X`: `count` chars forward or backward
     /// from the cursor, clamped to the current line (so x on the last char of
     /// a line deletes that char, and X at col 0 is a no-op).
@@ -841,7 +841,7 @@ impl Editor {
         let line_start = self.buffer.line_to_char(line);
         let line_end = line_start + self.buffer.line_len_chars(line);
         if forward {
-            head..(head + count).min(line_end)
+            head..head.saturating_add(count).min(line_end)
         } else {
             head.saturating_sub(count).max(line_start)..head
         }

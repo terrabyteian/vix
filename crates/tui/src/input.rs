@@ -227,6 +227,10 @@ impl Editor {
                             self.pending_leader = true;
                             return;
                         }
+                    } else {
+                        // An unbound Ctrl/Alt chord is not its bare letter:
+                        // `Ctrl-D Ctrl-D` must not run `dd`.
+                        return;
                     }
                     let action = handle_normal_char(&mut self.keys, c);
                     self.dispatch(action);
@@ -242,6 +246,11 @@ impl Editor {
                     self.mode = Mode::Normal;
                     self.sel.anchor = self.sel.head;
                 } else if let KeyCode::Char(c) = k.code {
+                    if k.modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    {
+                        return;
+                    }
                     // Text-object selection inside visual: `iw`, `a"`, etc.
                     // First key (`i` / `a`) sets the kind; second key picks
                     // the object and we extend the visual selection to cover
@@ -411,6 +420,10 @@ impl Editor {
                     KeyCode::Esc => {
                         self.leave_insert();
                     }
+                    // Unbound Ctrl chords insert nothing (`Ctrl-W` is not
+                    // "w"). Alt is left alone: some layouts compose
+                    // ordinary characters with it.
+                    KeyCode::Char(_) if ctrl => {}
                     KeyCode::Char(c) => {
                         self.insert_char_in_session(c);
                         if self.completion_popup.is_some() {
@@ -470,6 +483,7 @@ impl Editor {
                         self.cmdline_prompt = ':';
                     }
                 }
+                KeyCode::Char(_) if k.modifiers.contains(KeyModifiers::CONTROL) => {}
                 KeyCode::Char(c) => {
                     self.cmdline.push(c);
                 }
@@ -502,6 +516,9 @@ impl Editor {
         }
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.mode == Mode::Command {
+                    return;
+                }
                 if let Some(ch) = self.click_to_char(me.column, me.row) {
                     self.push_jump();
                     if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
@@ -511,6 +528,11 @@ impl Editor {
                         self.sel = self.sel.clamped(&self.buffer);
                     } else {
                         self.sel = Selection::at(ch).clamped(&self.buffer);
+                        // Like the arrow keys: a cursor move mid-insert
+                        // breaks the run that `.` would replay.
+                        if let Some(pi) = self.pending_insert.as_mut() {
+                            pi.typed.clear();
+                        }
                     }
                     self.hover_popup = None;
                 }
@@ -519,7 +541,17 @@ impl Editor {
                 // Drag enters/extends a charwise visual selection from the
                 // initial click point. The first Down already set anchor=head;
                 // here we move head only.
+                if self.mode == Mode::Command {
+                    return;
+                }
                 if let Some(ch) = self.click_to_char(me.column, me.row) {
+                    // Dragging out of Insert must commit the insert session
+                    // first; an orphaned one never reaches history, and the
+                    // next undo then replays against shifted offsets.
+                    if self.mode == Mode::Insert {
+                        self.leave_insert();
+                        self.sel.anchor = self.sel.head;
+                    }
                     if !matches!(self.mode, Mode::Visual | Mode::VisualLine) {
                         self.mode = Mode::Visual;
                     }
@@ -743,7 +775,23 @@ impl Editor {
             return None;
         }
         let line_len = self.buffer.line_len_chars(line_idx);
-        let col_clamped = in_text_col.min(line_len);
-        Some(self.buffer.line_to_char(line_idx) + col_clamped)
+        // Screen cells → char column: a tab is drawn several cells wide.
+        let mut cell = 0usize;
+        let mut col = line_len;
+        for (i, c) in self
+            .buffer
+            .rope()
+            .line(line_idx)
+            .chars()
+            .take(line_len)
+            .enumerate()
+        {
+            cell += crate::util::cell_width(c, cell);
+            if in_text_col < cell {
+                col = i;
+                break;
+            }
+        }
+        Some(self.buffer.line_to_char(line_idx) + col)
     }
 }

@@ -49,6 +49,13 @@ impl Editor {
             self.msg = "E37: No write since last change (add ! to override)".into();
             return;
         }
+        // `Buffer::load` turns a missing path into an empty new-file buffer.
+        // For a reload that would silently replace the only remaining copy
+        // of a file deleted on disk with nothing.
+        if !path.exists() {
+            self.msg = format!("E484: \"{}\" no longer exists on disk", path.display());
+            return;
+        }
         let new_buf = match Buffer::load(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -83,7 +90,10 @@ impl Editor {
         self.msg = format!("\"{}\" reloaded", path.display());
     }
 
-    pub(crate) fn open_path(&mut self, path: &std::path::Path) {
+    /// Returns false when the file couldn't be loaded (the error is in
+    /// `msg`) — the active buffer is then unchanged, so callers must not go
+    /// on to position the cursor as if the target were open.
+    pub(crate) fn open_path(&mut self, path: &std::path::Path) -> bool {
         // Picker rows and `:e` arguments are project-relative. Absolutize
         // against the project root up front so path-keyed buffer dedup, the
         // load, and the recents record all see the same absolute path —
@@ -99,7 +109,7 @@ impl Editor {
             self.switch_to_buffer(idx);
             self.msg = format!("switched to \"{}\"", path.display());
             self.record_recent(path);
-            return;
+            return true;
         }
         match Buffer::load(path) {
             Ok(buf) => {
@@ -112,8 +122,12 @@ impl Editor {
                         .unwrap_or_default()
                 );
                 self.record_recent(path);
+                true
             }
-            Err(e) => self.msg = format!("error: {e}"),
+            Err(e) => {
+                self.msg = format!("error: {e}");
+                false
+            }
         }
     }
 
@@ -265,10 +279,14 @@ impl Editor {
         let current = self.save_active();
         self.install_active(promoted);
         self.other_buffers.push(current);
-        // Buffers loaded via `load_into_park` have no syntax state and no
-        // `didOpen` yet — that work was deferred so a batch open didn't
-        // pay it N times. Run it now that this buffer is the active one;
-        // both calls are no-ops if the previous active already had them.
+        self.init_promoted_buffer();
+    }
+
+    /// Buffers loaded via `load_into_park` have no syntax state and no
+    /// `didOpen` yet — that work was deferred so a batch open didn't pay it
+    /// N times. Run it once such a buffer becomes the active one; both steps
+    /// are no-ops for a buffer that already had them.
+    fn init_promoted_buffer(&mut self) {
         if self.syntax.is_none() {
             self.syntax = self
                 .buffer
@@ -359,6 +377,7 @@ impl Editor {
         }
         if let Some(next) = self.other_buffers.pop() {
             self.install_active(next);
+            self.init_promoted_buffer();
         } else {
             self.quit = true;
         }

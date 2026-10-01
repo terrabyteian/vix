@@ -104,3 +104,26 @@ fn click_with_no_geometry_is_noop() {
     h.click(10, 0);
     assert_eq!(h.cursor(), before);
 }
+
+#[test]
+fn drag_out_of_insert_commits_the_insert_session() {
+    let mut h = Harness::with_text("hello world\n");
+    geom(&mut h);
+    h.keys("iabc");
+    h.drag(5 + 8, 0);
+    h.assert_mode(Mode::Visual);
+    h.keys("<Esc>u");
+    // The typed text was committed as its own undo unit, so `u` removes it.
+    h.assert_text("hello world\n");
+}
+
+#[test]
+fn click_maps_screen_cells_through_expanded_tabs() {
+    let mut h = Harness::with_text("\tab\n");
+    geom(&mut h);
+    // The tab fills cells 0..4; "a" is drawn at cell 4, "b" at cell 5.
+    h.click(5 + 2, 0);
+    assert_eq!(h.cursor(), (0, 0));
+    h.click(5 + 5, 0);
+    assert_eq!(h.cursor(), (0, 2));
+}

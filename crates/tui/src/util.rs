@@ -1,3 +1,29 @@
+/// Cells a tab advances to: the next multiple of this. Matches the four
+/// spaces the Tab key inserts.
+pub(crate) const TAB_WIDTH: usize = 4;
+
+/// Screen cells `c` takes when drawn at cell `col` of its line. Tabs are
+/// expanded by hand everywhere text is drawn — ratatui drops control
+/// characters, so a raw `\t` would simply vanish.
+pub(crate) fn cell_width(c: char, col: usize) -> usize {
+    if c == '\t' {
+        TAB_WIDTH - col % TAB_WIDTH
+    } else {
+        1
+    }
+}
+
+/// Append `c` to `out` as drawn at cell `col`, returning the cells used.
+pub(crate) fn push_expanded(out: &mut String, c: char, col: usize) -> usize {
+    let w = cell_width(c, col);
+    if c == '\t' {
+        out.extend(std::iter::repeat_n(' ', w));
+    } else {
+        out.push(c);
+    }
+    w
+}
+
 pub(crate) fn count_chars(s: &str) -> usize {
     s.chars().count()
 }

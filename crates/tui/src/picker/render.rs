@@ -1048,6 +1048,9 @@ pub(crate) fn render_picker_preview_pane(
         let mark = |s: Style| if focused { s.patch(theme.selection) } else { s };
         let line_text = &cache.lines[line_idx];
         let visible_chars: Vec<char> = line_text.chars().take(content_w).collect();
+        // Cells drawn for the text, which exceeds the char count once a tab
+        // is expanded.
+        let mut text_cells = visible_chars.len();
 
         let mut row_spans: Vec<Span> = Vec::new();
         let num_text = format!(" {:>w$} ", line_idx + 1, w = line_num_w);
@@ -1102,19 +1105,24 @@ pub(crate) fn render_picker_preview_pane(
             // instead of allocating a String + Span per character.
             let mut run = String::new();
             let mut run_style = Style::default();
+            let mut cell = 0usize;
             for (i, c) in visible_chars.iter().enumerate() {
+                if cell >= content_w {
+                    break;
+                }
                 if i > 0 && styles[i] != run_style {
                     row_spans.push(Span::styled(std::mem::take(&mut run), mark(run_style)));
                 }
                 run_style = styles[i];
-                run.push(*c);
+                cell += crate::util::push_expanded(&mut run, *c, cell);
             }
+            text_cells = cell;
             if !run.is_empty() {
                 row_spans.push(Span::styled(run, mark(run_style)));
             }
         }
 
-        let used = num_text_chars + visible_chars.len();
+        let used = num_text_chars + text_cells;
         let pad = w.saturating_sub(used);
         if pad > 0 {
             row_spans.push(Span::styled(" ".repeat(pad), mark(Style::default())));

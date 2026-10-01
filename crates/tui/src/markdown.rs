@@ -1294,6 +1294,12 @@ fn style_code_lines(
             };
         if ch == '\n' {
             lines.push(std::mem::take(&mut cur));
+        } else if ch == '\t' {
+            // Expanded here: ratatui drops control characters, so a raw tab
+            // would erase the indentation of tab-indented code.
+            for _ in 0..crate::util::cell_width(ch, cur.len()) {
+                cur.push((' ', style));
+            }
         } else {
             cur.push((ch, style));
         }

@@ -212,6 +212,10 @@ impl Editor {
                 Ok(None) => self.msg = "no hover info".into(),
                 Err(e) => self.msg = format!("lsp hover: {e}"),
             },
+            // The answer can arrive after the user has moved on to typing.
+            // Jumping then would swap buffers under a live insert session
+            // and strand its undo transaction, so a late answer is dropped.
+            PendingRequest::Definition if self.mode != Mode::Normal => {}
             PendingRequest::Definition => match parse_response::<GotoDefinitionResponse>(result) {
                 Ok(Some(resp)) => self.jump_to_definition(resp),
                 Ok(None) => self.msg = "no definition".into(),
@@ -280,13 +284,10 @@ impl Editor {
             self.push_jump();
         }
         // `open_path` already records departure when switching buffers.
-        self.open_path(&path);
-        let line = loc.range.start.line as usize;
-        let ch = loc.range.start.character as usize;
-        let line = line.min(self.buffer.len_lines().saturating_sub(1));
-        let line_start = self.buffer.line_to_char(line);
-        let line_len = self.buffer.line_len_chars(line);
-        let offset = line_start + ch.min(line_len);
+        if !self.open_path(&path) {
+            return;
+        }
+        let offset = from_lsp_position(&self.buffer, loc.range.start);
         self.sel = Selection::at(offset).clamped(&self.buffer);
     }
 
@@ -303,9 +304,9 @@ impl Editor {
             self.msg = "lsp: no server".into();
             return;
         };
-        let (line, col) = self.buffer.char_to_line_col(self.sel.head);
+        let pos = to_lsp_position(&self.buffer, self.sel.head);
         if let Some(client) = self.lsp_clients.get(&doc.server_cmd) {
-            let id = client.hover(doc.uri, line as u32, col as u32);
+            let id = client.hover(doc.uri, pos.line, pos.character);
             self.pending_requests
                 .insert((doc.server_cmd, id), PendingRequest::Hover);
         }
@@ -323,9 +324,9 @@ impl Editor {
             self.msg = "lsp: no server".into();
             return;
         };
-        let (line, col) = self.buffer.char_to_line_col(self.sel.head);
+        let pos = to_lsp_position(&self.buffer, self.sel.head);
         if let Some(client) = self.lsp_clients.get(&doc.server_cmd) {
-            let id = client.definition(doc.uri, line as u32, col as u32);
+            let id = client.definition(doc.uri, pos.line, pos.character);
             self.pending_requests
                 .insert((doc.server_cmd, id), PendingRequest::Definition);
         }
@@ -345,9 +346,9 @@ impl Editor {
             return;
         };
         let prefix_start = self.word_prefix_start(self.sel.head);
-        let (line, col) = self.buffer.char_to_line_col(self.sel.head);
+        let pos = to_lsp_position(&self.buffer, self.sel.head);
         if let Some(client) = self.lsp_clients.get(&doc.server_cmd) {
-            let id = client.completion(doc.uri, line as u32, col as u32);
+            let id = client.completion(doc.uri, pos.line, pos.character);
             self.pending_requests.insert(
                 (doc.server_cmd, id),
                 PendingRequest::Completion { prefix_start },
@@ -372,36 +373,25 @@ impl Editor {
         let Some(client) = self.lsp_clients.get(&doc.server_cmd) else {
             return;
         };
-        let (line, col) = self.buffer.char_to_line_col(self.sel.head);
+        let (line, _) = self.buffer.char_to_line_col(self.sel.head);
         // Range: if we're in a Visual selection, use it; otherwise a
         // zero-width range at the cursor. Diagnostics on the cursor's line
         // are passed as context so the server knows what to suggest.
         let range = match self.mode {
             Mode::Visual | Mode::VisualLine => {
                 let r = self.visual_range();
-                let (sl, sc) = self.buffer.char_to_line_col(r.start);
-                let (el, ec) = self.buffer.char_to_line_col(r.end);
                 vix_lsp::lsp_types::Range {
-                    start: vix_lsp::lsp_types::Position {
-                        line: sl as u32,
-                        character: sc as u32,
-                    },
-                    end: vix_lsp::lsp_types::Position {
-                        line: el as u32,
-                        character: ec as u32,
-                    },
+                    start: to_lsp_position(&self.buffer, r.start),
+                    end: to_lsp_position(&self.buffer, r.end),
                 }
             }
-            _ => vix_lsp::lsp_types::Range {
-                start: vix_lsp::lsp_types::Position {
-                    line: line as u32,
-                    character: col as u32,
-                },
-                end: vix_lsp::lsp_types::Position {
-                    line: line as u32,
-                    character: col as u32,
-                },
-            },
+            _ => {
+                let pos = to_lsp_position(&self.buffer, self.sel.head);
+                vix_lsp::lsp_types::Range {
+                    start: pos,
+                    end: pos,
+                }
+            }
         };
         let diags: Vec<_> = self
             .diagnostics
@@ -522,11 +512,11 @@ impl Editor {
         let Some(client) = self.lsp_clients.get(&doc.server_cmd) else {
             return;
         };
-        let (line, col) = self.buffer.char_to_line_col(self.sel.head);
+        let pos = to_lsp_position(&self.buffer, self.sel.head);
         let id = client.rename(
             doc.uri.clone(),
-            line as u32,
-            col as u32,
+            pos.line,
+            pos.character,
             new_name.to_string(),
         );
         let result = match client.wait_response(id, Duration::from_millis(5000)) {
@@ -739,8 +729,6 @@ impl Editor {
 
     /// Apply a slice of LSP `TextEdit`s to the active buffer. Edits are
     /// applied bottom-up (by start position) so earlier offsets stay valid.
-    /// Note: `character` is treated as a char index, not UTF-16 code units —
-    /// fine for the all-ASCII source files we typically format.
     ///
     /// The whole batch is recorded as a single `Transaction` committed to
     /// `self.history` — so `u` undoes the entire LSP edit in one step. We
@@ -816,7 +804,40 @@ pub(crate) fn hover_text(h: &Hover) -> String {
     }
 }
 
-/// Escape regex metacharacters for safe interpolation into a search pattern.
+/// A char offset as an LSP position. `character` counts UTF-16 code units —
+/// the protocol's default encoding, and the only one every server speaks —
+/// so it differs from the char column on any line holding an astral char
+/// (an emoji in a string literal is enough).
+pub(crate) fn to_lsp_position(buf: &Buffer, ch: usize) -> vix_lsp::lsp_types::Position {
+    let rope = buf.rope();
+    let ch = ch.min(rope.len_chars());
+    let line = rope.char_to_line(ch);
+    let line_start = rope.line_to_char(line);
+    let character = rope.char_to_utf16_cu(ch) - rope.char_to_utf16_cu(line_start);
+    vix_lsp::lsp_types::Position {
+        line: line as u32,
+        character: character as u32,
+    }
+}
+
+/// The char offset an LSP position names. Out-of-range input is clamped
+/// rather than trusted: a column past the line end means the line end, and
+/// a line past the last one means the end of the buffer (formatters address
+/// "the whole document" that way).
+pub(crate) fn from_lsp_position(buf: &Buffer, pos: vix_lsp::lsp_types::Position) -> usize {
+    let rope = buf.rope();
+    let line = pos.line as usize;
+    if line >= rope.len_lines() {
+        return rope.len_chars();
+    }
+    let line_start = rope.line_to_char(line);
+    let line_end = line_start + buf.line_len_chars(line);
+    let start_cu = rope.char_to_utf16_cu(line_start);
+    let end_cu = rope.char_to_utf16_cu(line_end);
+    let cu = start_cu.saturating_add(pos.character as usize).min(end_cu);
+    rope.utf16_cu_to_char(cu)
+}
+
 /// Apply a slice of LSP `TextEdit`s to an arbitrary buffer. Mirrors
 /// `Editor::apply_text_edits` but works on buffers not owned by `Editor`
 /// (used when applying rename edits to parked or on-disk buffers).
@@ -832,19 +853,15 @@ pub(crate) fn apply_text_edits_to_buffer_tx(
     if edits.is_empty() {
         return;
     }
+    // Stable ascending sort, applied back to front: offsets earlier in the
+    // buffer stay valid, and edits sharing a start position end up in array
+    // order in the text, as the spec requires (the later one is inserted
+    // first and then pushed right by the earlier one).
     let mut sorted: Vec<_> = edits.iter().collect();
-    sorted.sort_by(|a, b| {
-        let ak = (a.range.start.line, a.range.start.character);
-        let bk = (b.range.start.line, b.range.start.character);
-        bk.cmp(&ak)
-    });
-    for e in sorted {
-        let start_line = (e.range.start.line as usize).min(buf.len_lines());
-        let end_line = (e.range.end.line as usize).min(buf.len_lines());
-        let start_char = buf.line_to_char(start_line)
-            + (e.range.start.character as usize).min(buf.line_len_chars(start_line));
-        let end_char = buf.line_to_char(end_line)
-            + (e.range.end.character as usize).min(buf.line_len_chars(end_line));
+    sorted.sort_by_key(|e| (e.range.start.line, e.range.start.character));
+    for e in sorted.into_iter().rev() {
+        let start_char = from_lsp_position(buf, e.range.start);
+        let end_char = from_lsp_position(buf, e.range.end);
         if start_char <= end_char && end_char <= buf.len_chars() {
             if start_char < end_char {
                 let removed: String = buf.rope().slice(start_char..end_char).to_string();
@@ -885,6 +902,40 @@ mod tests {
             },
             new_text: text.into(),
         }
+    }
+
+    #[test]
+    fn lsp_positions_are_utf16_and_clamped() {
+        // "😀" is one char but two UTF-16 code units.
+        let buf = Buffer::from_text("a😀b\nxyz");
+        let pos = to_lsp_position(&buf, 2);
+        assert_eq!((pos.line, pos.character), (0, 3));
+        assert_eq!(from_lsp_position(&buf, pos), 2);
+        // Column past the line end clamps to the line end, not past the newline.
+        assert_eq!(from_lsp_position(&buf, Position::new(0, 99)), 3);
+        // A line past the last one is the end of the buffer.
+        assert_eq!(
+            from_lsp_position(&buf, Position::new(2, 0)),
+            buf.len_chars()
+        );
+        assert_eq!(
+            from_lsp_position(&buf, Position::new(u32::MAX, 0)),
+            buf.len_chars()
+        );
+    }
+
+    #[test]
+    fn whole_document_replace_reaches_the_end_of_an_unterminated_file() {
+        let mut ed = Editor::new(Buffer::from_text("a\nb"));
+        ed.apply_text_edits(&[edit(0, 0, 2, 0, "x\ny\n")]);
+        assert_eq!(ed.buffer.rope().to_string(), "x\ny\n");
+    }
+
+    #[test]
+    fn edits_at_the_same_position_keep_array_order() {
+        let mut ed = Editor::new(Buffer::from_text("z\n"));
+        ed.apply_text_edits(&[edit(0, 0, 0, 0, "A"), edit(0, 0, 0, 0, "B")]);
+        assert_eq!(ed.buffer.rope().to_string(), "ABz\n");
     }
 
     #[test]

@@ -447,7 +447,9 @@ const MAX_GREP_SNIPPET_CHARS: usize = 500;
 /// `value`.
 pub(crate) fn grep_hit_to_picker_item(cwd: &std::path::Path, g: GrepItem) -> PickerItem {
     let rel = g.path.strip_prefix(cwd).unwrap_or(&g.path);
-    let mut snippet = g.text.trim_start().to_string();
+    // Tabs become single spaces: ratatui drops control characters, which
+    // would fuse the words on either side of an interior tab.
+    let mut snippet = g.text.trim_start().replace('\t', " ");
     if snippet.chars().count() > MAX_GREP_SNIPPET_CHARS {
         snippet = snippet.chars().take(MAX_GREP_SNIPPET_CHARS).collect();
     }

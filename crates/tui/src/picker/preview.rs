@@ -269,6 +269,11 @@ pub(crate) fn build_preview_for_buffer_idx(ed: &mut Editor, idx: usize) -> Previ
             .path()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("[No Name]"));
+        // Gate on size before flattening and highlighting the rope —
+        // `build_preview_from_text` would reject it anyway, after the cost.
+        if buf.rope().len_bytes() > PREVIEW_MAX_BYTES {
+            return PreviewCache::placeholder(&path, "(buffer too large to preview)");
+        }
         (path, buf.rope().to_string())
     };
     let spans = preview_spans(ed, &path, &text);

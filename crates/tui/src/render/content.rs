@@ -255,6 +255,7 @@ pub(crate) fn render_content(
 
         // Build spans, merging consecutive equal styles.
         let mut i = 0;
+        let mut cell = 0usize;
         while i < chars.len() {
             let is_cursor = line_idx == cursor_line && i == cursor_col.min(chars.len());
             let base = styles[i];
@@ -276,7 +277,10 @@ pub(crate) fn render_content(
                     j += 1;
                 }
             }
-            let text: String = chars[i..j].iter().collect();
+            let mut text = String::with_capacity(j - i);
+            for &c in &chars[i..j] {
+                cell += crate::util::push_expanded(&mut text, c, cell);
+            }
             match style {
                 Some(s) => spans.push(Span::styled(text, s)),
                 None => spans.push(Span::raw(text)),
@@ -368,6 +372,23 @@ mod tests {
         p.push("tests/fixtures");
         p.push(name);
         p
+    }
+
+    /// ratatui drops control characters, so an unexpanded tab would erase
+    /// the indentation of every tab-indented file. The row must show the tab
+    /// as spaces out to the next tab stop.
+    #[test]
+    fn tabs_are_drawn_expanded() {
+        use ratatui::backend::TestBackend;
+        let mut ed = crate::Editor::new(vix_core::Buffer::from_text("\tx\ty\n"));
+        let mut term = ratatui::Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| crate::render::render(f, &mut ed)).unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            row.contains("    x   y"),
+            "tabs not expanded to 4-cell stops: {row:?}"
+        );
     }
 
     /// The windowed syntax-span path must produce byte-for-byte identical

@@ -128,3 +128,17 @@ fn ciw_at_buffer_end() {
     h.keys("ciwworld<Esc>");
     h.assert_text("world\n");
 }
+
+#[test]
+fn diw_on_an_empty_line_does_not_join_lines() {
+    let mut h = Harness::with_text("a\n\nb\n");
+    h.keys("jdiw");
+    h.assert_text("a\n\nb\n");
+}
+
+#[test]
+fn daw_on_punctuation_deletes_the_punctuation() {
+    let mut h = Harness::with_text("a -> b\n");
+    h.keys("wdaw");
+    h.assert_text("a b\n");
+}

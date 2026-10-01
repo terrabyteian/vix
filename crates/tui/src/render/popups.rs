@@ -33,7 +33,7 @@ pub(crate) fn render_hover(f: &mut ratatui::Frame, area: Rect, ed: &Editor) {
         .min(area.height.saturating_sub(2))
         .max(3);
     let w = max_w;
-    let x = area.x + area.width.saturating_sub(w) - 1;
+    let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
     let y = area.y + 1;
     let rect = Rect::new(x, y, w, h);
 
@@ -76,7 +76,15 @@ pub(crate) fn render_completion_popup(f: &mut ratatui::Frame, area: Rect, ed: &E
 
     // Screen position of the cursor char (top-left of its cell).
     let screen_row = cursor_line.saturating_sub(ed.view_top);
-    let screen_col = gutter_width + 2 + cursor_col;
+    // Cells, not chars: tabs before the cursor are drawn expanded.
+    let line_start = ed.buffer.line_to_char(cursor_line);
+    let cursor_cell = ed
+        .buffer
+        .rope()
+        .slice(line_start..line_start + cursor_col)
+        .chars()
+        .fold(0, |cell, c| cell + crate::util::cell_width(c, cell));
+    let screen_col = gutter_width + 2 + cursor_cell;
     let anchor_x = area.x + screen_col as u16;
     let anchor_y = area.y + screen_row as u16;
 

@@ -99,3 +99,14 @@ fn cursor_moves_left_on_leaving_insert() {
     h.keys("iabc<Esc>");
     h.assert_cursor(0, 2); // landed on 'c', not after it
 }
+
+#[test]
+fn unbound_ctrl_chords_are_not_their_bare_letter() {
+    let mut h = Harness::with_text("one\ntwo\n");
+    // Not `dd`, not `x`.
+    h.keys("<C-d><C-d><C-x>");
+    h.assert_text("one\ntwo\n");
+    // Not an inserted "w".
+    h.keys("i<C-w><Esc>");
+    h.assert_text("one\ntwo\n");
+}

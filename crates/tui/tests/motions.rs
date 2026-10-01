@@ -227,3 +227,14 @@ fn ex_substitute_global() {
     h.cmd("%s/foo/qux/g");
     h.assert_text("qux bar qux baz\n");
 }
+
+#[test]
+fn w_b_e_cross_line_boundaries() {
+    let mut h = Harness::with_text("foo\n  bar\n");
+    h.keys("w");
+    h.assert_cursor(1, 2);
+    h.keys("b");
+    h.assert_cursor(0, 0);
+    h.keys("ee");
+    h.assert_cursor(1, 4);
+}

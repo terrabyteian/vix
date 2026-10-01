@@ -113,7 +113,7 @@ impl Editor {
                     } else {
                         self.run_rename(new_name);
                     }
-                } else if cmd.starts_with("%s") || cmd.starts_with(".s") || cmd.starts_with('s') {
+                } else if is_substitute(cmd) {
                     self.run_substitute(cmd);
                 } else {
                     self.msg = format!("not implemented: :{cmd}");
@@ -193,21 +193,20 @@ impl Editor {
             let line_text: String = self.buffer.rope().line(line).chars().collect();
             let line_text = line_text.trim_end_matches('\n');
             let line_start = self.buffer.line_to_char(line);
-            let mut offset = 0usize; // byte offset within line_text
-            for m in re.find_iter(line_text) {
-                let start_byte = m.start();
-                let end_byte = m.end();
-                let matched = &line_text[start_byte..end_byte];
-                let rep = re.replace(matched, replacement).to_string();
-                let start_char = line_start + line_text[..start_byte].chars().count();
-                let end_char = line_start + line_text[..end_byte].chars().count();
-                replacements.push((start_char..end_char, matched.to_string(), rep));
-                offset = end_byte;
+            for caps in re.captures_iter(line_text) {
+                let m = caps.get(0).expect("group 0 is the whole match");
+                // Expand from the captures of the match in context. Re-running
+                // the regex on the isolated match text loses lookaround-ish
+                // context (`\b`, `^`) and can fail to match at all.
+                let mut rep = String::new();
+                caps.expand(replacement, &mut rep);
+                let start_char = line_start + line_text[..m.start()].chars().count();
+                let end_char = line_start + line_text[..m.end()].chars().count();
+                replacements.push((start_char..end_char, m.as_str().to_string(), rep));
                 if !global {
                     break;
                 }
             }
-            let _ = offset;
         }
 
         if replacements.is_empty() {
@@ -238,4 +237,20 @@ impl Editor {
         self.history.commit(tx);
         self.msg = format!("{count} substitutions");
     }
+}
+
+/// True for `:s…`, `:%s…`, `:.s…` followed by a real delimiter. Without the
+/// delimiter check any unknown command starting with `s` (`:saveas x`) ran
+/// as a substitute, using its second letter as the delimiter.
+fn is_substitute(cmd: &str) -> bool {
+    let rest = cmd
+        .strip_prefix("%s")
+        .or_else(|| cmd.strip_prefix(".s"))
+        .or_else(|| cmd.strip_prefix('s'));
+    // A bare `:s` still routes here, for its usage error.
+    rest.is_some_and(|r| {
+        r.chars()
+            .next()
+            .is_none_or(|d| !d.is_alphanumeric() && !d.is_whitespace())
+    })
 }

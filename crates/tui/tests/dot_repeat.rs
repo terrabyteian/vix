@@ -114,3 +114,10 @@ fn dot_after_yy_p_repeats_paste() {
     h.keys(".");
     h.assert_text("alpha\nalpha\nalpha\nbeta\n");
 }
+
+#[test]
+fn dot_repeats_an_inclusive_motion_inclusively() {
+    let mut h = Harness::with_text("foo bar baz\n");
+    h.keys("de.");
+    h.assert_text(" baz\n");
+}
