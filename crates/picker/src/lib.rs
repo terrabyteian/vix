@@ -3,11 +3,11 @@
 //! scanning and nucleo-backed scoring.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{sinks::UTF8, Searcher};
+use grep_searcher::{sinks::UTF8, BinaryDetection, Searcher, SearcherBuilder};
 use ignore::{WalkBuilder, WalkState};
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
@@ -159,6 +159,34 @@ pub fn grep(root: &Path, pattern: &str) -> anyhow::Result<Vec<GrepItem>> {
     )
 }
 
+/// Most hits one streaming grep delivers before the walk stops. A short
+/// pattern in a big tree matches millions of lines; nobody scrolls that
+/// far, and holding them all costs gigabytes.
+pub const GREP_HIT_CAP: usize = 50_000;
+
+/// Longest matched line kept per hit, in bytes. A minified bundle is one
+/// multi-megabyte line; the picker shows a window of it at most.
+const GREP_LINE_MAX_BYTES: usize = 2048;
+
+/// A searcher that gives up on a file at its first NUL byte, as ripgrep
+/// does — otherwise a binary blob is read as one enormous "line".
+fn new_searcher() -> Searcher {
+    SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(0))
+        .build()
+}
+
+/// A matched line as stored on a hit: line terminator stripped and length
+/// capped (on a char boundary).
+fn clip_line(text: &str) -> String {
+    let text = text.trim_end_matches(['\n', '\r']);
+    let mut end = text.len().min(GREP_LINE_MAX_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 /// Streaming variant of [`grep_cancellable`]: hits are delivered to
 /// `on_batch` in chunks (every `GREP_BATCH` hits or `GREP_FLUSH_MS` ms)
 /// while the parallel walk is still running, instead of one Vec at the
@@ -192,15 +220,22 @@ pub fn grep_streaming(
         let current_walk = Arc::clone(current);
         let matcher = Arc::clone(&matcher);
         let walk_root = Arc::clone(&root);
+        let walk_hits = Arc::new(AtomicUsize::new(0));
+        // Owned by this closure, so an early return below drops the receiver
+        // before the scope joins the walk thread.
+        let rx = rx;
         scope.spawn(move || {
             walker.run(|| {
                 let tx = tx.clone();
                 let matcher = Arc::clone(&matcher);
                 let root = Arc::clone(&walk_root);
                 let current = Arc::clone(&current_walk);
-                let mut searcher = Searcher::new();
+                let mut searcher = new_searcher();
+                let hits = Arc::clone(&walk_hits);
                 Box::new(move |result| {
-                    if current.load(Ordering::Relaxed) != target_gen {
+                    if current.load(Ordering::Relaxed) != target_gen
+                        || hits.load(Ordering::Relaxed) >= GREP_HIT_CAP
+                    {
                         return WalkState::Quit;
                     }
                     let entry = match result {
@@ -222,7 +257,10 @@ pub fn grep_streaming(
                             if current.load(Ordering::Relaxed) != target_gen {
                                 return Ok(false);
                             }
-                            let text = text.trim_end_matches('\n').to_string();
+                            if hits.fetch_add(1, Ordering::Relaxed) >= GREP_HIT_CAP {
+                                return Ok(false);
+                            }
+                            let text = clip_line(text);
                             let display = format!("{}:{}: {}", rel.display(), line_no, text);
                             if tx
                                 .send(GrepItem {
@@ -308,7 +346,7 @@ pub fn grep_cancellable(
         let matcher = Arc::clone(&matcher);
         let root = Arc::clone(&root);
         let current = Arc::clone(current);
-        let mut searcher = Searcher::new();
+        let mut searcher = new_searcher();
         Box::new(move |result| {
             // Cheapest cancel check: per-file. Per-line is also wired below
             // for files with thousands of matches, but most cancels land
@@ -335,7 +373,7 @@ pub fn grep_cancellable(
                     if current.load(Ordering::Relaxed) != target_gen {
                         return Ok(false);
                     }
-                    let text = text.trim_end_matches('\n').to_string();
+                    let text = clip_line(text);
                     let display = format!("{}:{}: {}", rel.display(), line_no, text);
                     // Receiver hung up = caller dropped the result. Nothing
                     // useful left to do; signal the searcher to stop this file.
@@ -458,6 +496,22 @@ impl Scorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grep_skips_binary_files_and_clips_long_lines() {
+        let dir = std::env::temp_dir().join(format!("vix-grep-binary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("blob.bin"), b"needle\0needle\0").unwrap();
+        let long = format!("needle {}\n", "é".repeat(GREP_LINE_MAX_BYTES));
+        std::fs::write(dir.join("long.txt"), long).unwrap();
+
+        let hits = grep(&dir, "needle").unwrap();
+        assert_eq!(hits.len(), 1, "the binary file is not searched");
+        assert!(hits[0].path.ends_with("long.txt"));
+        assert!(hits[0].text.len() <= GREP_LINE_MAX_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn scorer_rescore_indices_orders_by_quality() {
