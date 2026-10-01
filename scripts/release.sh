@@ -89,6 +89,11 @@ done
 if $ASSETS_ONLY; then
   git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null || die "tag ${TAG} does not exist locally"
   gh release view "$TAG" >/dev/null 2>&1 || die "no GitHub release found for ${TAG}"
+  # The archives replace that release's assets, so they must be built from
+  # the code the tag names — not from whatever happens to be checked out.
+  [[ "$(git rev-parse HEAD)" == "$(git rev-parse "${TAG}^{commit}")" ]] \
+    || die "HEAD is not ${TAG} — run 'git checkout ${TAG}' first so the rebuilt archives match the release"
+  [[ -z "$(git status --porcelain)" ]] || die "working tree is not clean — the rebuilt archives would not match ${TAG}"
 else
   BRANCH="$(git rev-parse --abbrev-ref HEAD)"
   [[ "$BRANCH" == "$DEFAULT_BRANCH" ]] || die "must be on ${DEFAULT_BRANCH} (currently on '${BRANCH}')"
@@ -116,7 +121,9 @@ BUMPED=false
 revert_bump() {
   if $BUMPED; then
     echo "==> Reverting uncommitted version bump"
-    git checkout -q -- Cargo.toml Cargo.lock
+    # From HEAD, not the index: if `git commit` fails after `git add`, the
+    # bump is staged and a plain checkout would restore the staged copy.
+    git checkout -q HEAD -- Cargo.toml Cargo.lock
   fi
 }
 trap revert_bump EXIT

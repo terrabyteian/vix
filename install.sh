@@ -46,12 +46,17 @@ case "$ARCH" in
     ;;
 esac
 
-# Only darwin-arm64 is shipped for macOS; x86_64 Macs can run it via Rosetta
-# but we don't ship a native darwin-x86_64 binary.
+# Only darwin-arm64 is shipped for macOS. An x86_64 shell running under
+# Rosetta on Apple Silicon reports x86_64 here but runs the arm64 build
+# natively; a real Intel Mac cannot run it at all (Rosetta only translates
+# the other way).
 if [ "$OS" = "darwin" ] && [ "$ARCH" = "x86_64" ]; then
-  echo "error: no native darwin-x86_64 build is available." >&2
-  echo "       Intel Macs can run the arm64 build via Rosetta 2." >&2
-  exit 1
+  if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+    ARCH="arm64"
+  else
+    echo "error: no darwin-x86_64 build is available (Apple Silicon only)." >&2
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------

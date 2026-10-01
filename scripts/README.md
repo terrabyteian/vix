@@ -53,7 +53,9 @@ scripts/release.sh --assets-only v0.9.0
 ```
 
 Rebuilds the three archives and uploads them with `--clobber`. Does not touch
-git. Combine with `--dry-run` to only rebuild into `dist/`.
+git. Run it from a clean checkout of the tag itself (`git checkout v0.9.0`):
+it refuses to build any other commit, since the archives would then not match
+the release they are attached to. Combine with `--dry-run` to only rebuild into `dist/`.
 
 ## Artifact naming
 
@@ -67,5 +69,5 @@ release assets by hand.
 | `<name>-vX.Y.Z-linux-x86_64.tar.gz` | `x86_64-unknown-linux-gnu` |
 | `<name>-vX.Y.Z-linux-arm64.tar.gz` | `aarch64-unknown-linux-gnu` |
 
-Each archive contains the single binary. No native darwin-x86_64 build is
-shipped; Intel Macs use Rosetta 2.
+Each archive contains the single binary. No darwin-x86_64 build is
+shipped, so Intel Macs are not supported.

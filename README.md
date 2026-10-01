@@ -216,7 +216,7 @@ Deliberate non-goals: multi-cursor, Windows support, a config file, a plugin sys
 | Linux | x86_64 |
 | Linux | arm64 |
 
-Intel Macs can run the arm64 binary via Rosetta 2.
+macOS builds are Apple Silicon only; there is no Intel Mac build.
 
 ## License
 
