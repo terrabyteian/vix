@@ -108,7 +108,7 @@ impl NormalKeyState {
     fn effective_count(&self) -> usize {
         let a = self.count().max(1);
         let b = self.op_count().max(1);
-        a * b
+        a.saturating_mul(b)
     }
     fn reset(&mut self) {
         self.count_buf.clear();
@@ -138,11 +138,15 @@ pub fn handle_normal_char(state: &mut NormalKeyState, c: char) -> Action {
 
     // Digit prefix accumulation (but leading 0 is `line-start` motion, not a count).
     if c.is_ascii_digit() {
-        let is_leading_zero = c == '0'
-            && state.op.is_none()
-            && state.count_buf.is_empty()
-            && state.op_count_buf.is_empty()
-            && state.prefix.is_none();
+        // `0` extends a count only when one is already being typed at this
+        // position (`10j`, `d10j`). After a bare operator it is the motion:
+        // `d0`, and `2d0` too.
+        let count_started = if state.op.is_some() {
+            !state.op_count_buf.is_empty()
+        } else {
+            !state.count_buf.is_empty()
+        };
+        let is_leading_zero = c == '0' && !count_started && state.prefix.is_none();
         if !is_leading_zero {
             if state.op.is_some() {
                 state.op_count_buf.push(c);
@@ -620,6 +624,25 @@ mod tests {
         assert_eq!(
             handle_normal_char(&mut s, 'd'),
             Action::OperateLine(PendingOp::Delete, 1)
+        );
+    }
+
+    #[test]
+    fn zero_after_operator_is_line_start() {
+        let mut s = NormalKeyState::default();
+        assert_eq!(handle_normal_char(&mut s, 'd'), Action::Pending);
+        assert_eq!(
+            handle_normal_char(&mut s, '0'),
+            Action::Operate(PendingOp::Delete, Motion::LineStart, 1)
+        );
+        // ...but still a count digit once an operator count has started.
+        let mut s = NormalKeyState::default();
+        for c in ['d', '1', '0'] {
+            assert_eq!(handle_normal_char(&mut s, c), Action::Pending);
+        }
+        assert_eq!(
+            handle_normal_char(&mut s, 'j'),
+            Action::Operate(PendingOp::Delete, Motion::Down, 10)
         );
     }
 

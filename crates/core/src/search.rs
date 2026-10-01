@@ -52,13 +52,13 @@ pub fn find_forward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, usi
         if search_from_bytes > line_text.len() {
             continue;
         }
-        if let Some(m) = re.find(&line_text[search_from_bytes..]) {
+        // `find_at` rather than slicing: anchors and `\b` need to see the
+        // text before the start offset, or `^foo` matches mid-line.
+        if let Some(m) = re.find_at(&line_text, search_from_bytes) {
             let line_start = buf.line_to_char(line);
-            let match_byte = search_from_bytes + m.start();
-            let match_end_byte = search_from_bytes + m.end();
             // Convert byte offsets within the line back to char offsets within the buffer.
-            let start_char = line_start + byte_to_char_in(&line_text, match_byte);
-            let end_char = line_start + byte_to_char_in(&line_text, match_end_byte);
+            let start_char = line_start + byte_to_char_in(&line_text, m.start());
+            let end_char = line_start + byte_to_char_in(&line_text, m.end());
             return Some((start_char, end_char));
         }
     }
@@ -86,12 +86,13 @@ pub fn find_backward(buf: &Buffer, re: &Regex, from: usize) -> Option<(usize, us
         if max_byte == 0 {
             continue;
         }
-        // Find the last match that ends <= max_byte.
-        let haystack = &line_text[..max_byte];
-        let mut last = None;
-        for m in re.find_iter(haystack) {
-            last = Some(m);
-        }
+        // Last match starting before `max_byte`. Matched against the whole
+        // line, not a slice cut at the cursor: a cut would let `$` and `\b`
+        // match at the cut point.
+        let last = re
+            .find_iter(&line_text)
+            .take_while(|m| m.start() < max_byte)
+            .last();
         if let Some(m) = last {
             let line_start = buf.line_to_char(line);
             let start_char = line_start + byte_to_char_in(&line_text, m.start());
@@ -177,6 +178,25 @@ mod tests {
         let re = compile("foo", Case::Smart).unwrap();
         assert_eq!(find_backward(&buf, &re, 14), Some((8, 11)));
         assert_eq!(find_backward(&buf, &re, 8), Some((0, 3)));
+    }
+
+    #[test]
+    fn forward_keeps_anchor_context_before_the_start_offset() {
+        let buf = Buffer::from_text("abar bar\nxfoo\nfoo\n");
+        let word = compile(r"\bbar\b", Case::Smart).unwrap();
+        // From inside "abar": the standalone "bar", not the tail of "abar".
+        assert_eq!(find_forward(&buf, &word, 1), Some((5, 8)));
+        let anchored = compile("^foo", Case::Smart).unwrap();
+        // From col 1 of "xfoo": the next line, not mid-line.
+        assert_eq!(find_forward(&buf, &anchored, 10), Some((14, 17)));
+    }
+
+    #[test]
+    fn backward_keeps_anchor_context_after_the_cursor() {
+        let buf = Buffer::from_text("foo foobar");
+        let word = compile(r"foo\b", Case::Smart).unwrap();
+        // Cursor right after the "foo" of "foobar": only the first is a word.
+        assert_eq!(find_backward(&buf, &word, 7), Some((0, 3)));
     }
 
     #[test]

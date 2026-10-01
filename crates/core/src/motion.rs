@@ -4,7 +4,27 @@ use crate::selection::Selection;
 /// Compute a new Selection given the current Selection, buffer, and motion.
 /// Motions only move the cursor — they do not mutate the buffer.
 pub fn apply(buf: &Buffer, sel: Selection, motion: Motion, count: usize) -> Selection {
-    let n = count.max(1);
+    apply_with(buf, sel, motion, count, false)
+}
+
+/// [`apply`] for a bare cursor move (no operator pending). The word motions
+/// differ: as a move, `w`/`b`/`e` cross line boundaries to the next word,
+/// while under an operator they stop at the line end so `dw` on a line's
+/// last word doesn't eat the newline.
+pub fn apply_move(buf: &Buffer, sel: Selection, motion: Motion, count: usize) -> Selection {
+    apply_with(buf, sel, motion, count, true)
+}
+
+fn apply_with(
+    buf: &Buffer,
+    sel: Selection,
+    motion: Motion,
+    count: usize,
+    cross_lines: bool,
+) -> Selection {
+    // Clamped so the signed line arithmetic in `vertical` can't overflow on
+    // an absurd typed count.
+    let n = count.clamp(1, isize::MAX as usize / 2);
     match motion {
         Motion::Left => left(buf, sel, n),
         Motion::Right => right(buf, sel, n),
@@ -16,6 +36,9 @@ pub fn apply(buf: &Buffer, sel: Selection, motion: Motion, count: usize) -> Sele
         // For BufferStart/End, raw count (0 = default, >0 = line number 1-indexed).
         Motion::BufferStart => goto_line(buf, sel, count, 0),
         Motion::BufferEnd => goto_line(buf, sel, count, buf.len_lines().saturating_sub(1)),
+        Motion::WordForward if cross_lines => word_forward_crossing(buf, sel, n),
+        Motion::WordBackward if cross_lines => word_backward_crossing(buf, sel, n),
+        Motion::WordEnd if cross_lines => word_end_crossing(buf, sel, n),
         Motion::WordForward => word_forward(buf, sel, n),
         Motion::WordBackward => word_backward(buf, sel, n),
         Motion::WordEnd => word_end(buf, sel, n),
@@ -168,7 +191,7 @@ fn right(buf: &Buffer, sel: Selection, n: usize) -> Selection {
     let (line, col) = buf.char_to_line_col(sel.head);
     let line_len = buf.line_len_chars(line);
     // Vim: cursor stops at the last char of the line in Normal mode, not past it.
-    let new_col = (col + n).min(line_len.saturating_sub(1));
+    let new_col = col.saturating_add(n).min(line_len.saturating_sub(1));
     let new_pos = buf.line_to_char(line) + new_col;
     sel.move_to(new_pos).with_virt_col(None)
 }
@@ -177,7 +200,9 @@ fn vertical(buf: &Buffer, sel: Selection, delta: isize) -> Selection {
     let (line, col) = buf.char_to_line_col(sel.head);
     let virt = sel.virt_col.unwrap_or(col);
     let last_line = buf.len_lines().saturating_sub(1);
-    let new_line = (line as isize + delta).clamp(0, last_line as isize) as usize;
+    let new_line = (line as isize)
+        .saturating_add(delta)
+        .clamp(0, last_line as isize) as usize;
     let line_len = buf.line_len_chars(new_line);
     let new_col = virt.min(line_len.saturating_sub(1));
     let new_pos = buf.line_to_char(new_line) + new_col;
@@ -224,15 +249,15 @@ fn line_end(buf: &Buffer, sel: Selection) -> Selection {
 //   - whitespace
 // `w` skips to the start of the next word (class-boundary transition).
 
-#[derive(PartialEq, Eq)]
-enum CharClass {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CharClass {
     Word,
     Punct,
     Space,
     Newline,
 }
 
-fn classify(c: char) -> CharClass {
+pub(crate) fn classify(c: char) -> CharClass {
     if c == '\n' {
         CharClass::Newline
     } else if c.is_whitespace() {
@@ -325,6 +350,100 @@ fn word_end(buf: &Buffer, sel: Selection, n: usize) -> Selection {
     }
     sel.move_to(pos.min(len.saturating_sub(1)))
         .with_virt_col(None)
+}
+
+/// True when `pos` holds the `\n` of an empty line — which vim counts as a
+/// word, so the crossing word motions stop on it.
+fn is_empty_line(buf: &Buffer, pos: usize) -> bool {
+    let rope = buf.rope();
+    rope.char(pos) == '\n' && (pos == 0 || rope.char(pos - 1) == '\n')
+}
+
+fn word_forward_crossing(buf: &Buffer, sel: Selection, n: usize) -> Selection {
+    let rope = buf.rope();
+    let len = buf.len_chars();
+    let mut pos = sel.head;
+    for _ in 0..n {
+        if pos >= len {
+            break;
+        }
+        let from = pos;
+        let start_class = classify(rope.char(pos));
+        if start_class == CharClass::Newline {
+            pos += 1;
+        } else {
+            while pos < len && classify(rope.char(pos)) == start_class {
+                pos += 1;
+            }
+        }
+        // Skip blanks and line ends up to the next word or empty line.
+        while pos < len {
+            let c = rope.char(pos);
+            if !c.is_whitespace() || is_empty_line(buf, pos) {
+                break;
+            }
+            pos += 1;
+        }
+        if pos >= len {
+            // No further word: rest on the last char of the buffer's text
+            // rather than its trailing newline.
+            pos = len - 1;
+            if pos > from && rope.char(pos) == '\n' && !is_empty_line(buf, pos) {
+                pos -= 1;
+            }
+            break;
+        }
+    }
+    sel.move_to(pos).with_virt_col(None)
+}
+
+fn word_backward_crossing(buf: &Buffer, sel: Selection, n: usize) -> Selection {
+    let rope = buf.rope();
+    let mut pos = sel.head.min(buf.len_chars());
+    for _ in 0..n {
+        if pos == 0 {
+            break;
+        }
+        pos -= 1;
+        while pos > 0 {
+            let c = rope.char(pos);
+            if !c.is_whitespace() || is_empty_line(buf, pos) {
+                break;
+            }
+            pos -= 1;
+        }
+        let class = classify(rope.char(pos));
+        if matches!(class, CharClass::Newline | CharClass::Space) {
+            // An empty line, or leading blanks at the top of the buffer.
+            continue;
+        }
+        while pos > 0 && classify(rope.char(pos - 1)) == class {
+            pos -= 1;
+        }
+    }
+    sel.move_to(pos).with_virt_col(None)
+}
+
+fn word_end_crossing(buf: &Buffer, sel: Selection, n: usize) -> Selection {
+    let rope = buf.rope();
+    let len = buf.len_chars();
+    let mut pos = sel.head;
+    for _ in 0..n {
+        let mut p = pos + 1;
+        // `e` skips empty lines too, unlike `w`/`b`.
+        while p < len && rope.char(p).is_whitespace() {
+            p += 1;
+        }
+        if p >= len {
+            break;
+        }
+        let class = classify(rope.char(p));
+        while p + 1 < len && classify(rope.char(p + 1)) == class {
+            p += 1;
+        }
+        pos = p;
+    }
+    sel.move_to(pos).with_virt_col(None)
 }
 
 fn find_char(
@@ -465,6 +584,46 @@ mod tests {
         assert_eq!(s.head, 2); // last char of "foo"
         let s = apply(&b, s, Motion::WordEnd, 1);
         assert_eq!(s.head, 6); // last char of "bar"
+    }
+
+    #[test]
+    fn word_moves_cross_line_boundaries() {
+        let (b, s) = setup("foo\n  bar\n\nbaz\n", 0);
+        let w = |s| apply_move(&b, s, Motion::WordForward, 1);
+        let s1 = w(s);
+        assert_eq!(s1.head, 6, "next line's word, past its indent");
+        let s2 = w(s1);
+        assert_eq!(s2.head, 10, "an empty line is a word");
+        let s3 = w(s2);
+        assert_eq!(s3.head, 11);
+        assert_eq!(w(s3).head, 13, "no next word: last char, not the newline");
+
+        let back = |s| apply_move(&b, s, Motion::WordBackward, 1);
+        let s = back(Selection::at(11));
+        assert_eq!(s.head, 10);
+        let s = back(s);
+        assert_eq!(s.head, 6);
+        assert_eq!(back(s).head, 0);
+
+        let end = |s| apply_move(&b, s, Motion::WordEnd, 1);
+        let s = end(Selection::at(2));
+        assert_eq!(s.head, 8, "end of `bar`");
+        let s = end(s);
+        assert_eq!(s.head, 13, "skips the empty line");
+        assert_eq!(end(s).head, 13);
+    }
+
+    #[test]
+    fn operator_word_motion_still_stops_at_the_line_end() {
+        let (b, s) = setup("foo\nbar", 0);
+        assert_eq!(apply(&b, s, Motion::WordForward, 1).head, 3);
+    }
+
+    #[test]
+    fn huge_counts_saturate_instead_of_overflowing() {
+        let (b, s) = setup("aa\nbb\ncc", 0);
+        assert_eq!(apply(&b, s, Motion::Down, usize::MAX).head, 6);
+        assert_eq!(apply(&b, s, Motion::Right, usize::MAX).head, 1);
     }
 
     #[test]

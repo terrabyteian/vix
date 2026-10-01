@@ -5,6 +5,7 @@
 //! includes them (and, for words, the trailing whitespace).
 
 use crate::buffer::Buffer;
+use crate::motion::{classify, CharClass};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextObjectKind {
@@ -34,42 +35,53 @@ pub fn range_of(
     }
 }
 
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
+/// Vim's `iw`/`aw`: the run of same-class chars under the cursor — a word,
+/// a punctuation cluster, or a stretch of blanks — never crossing a line
+/// boundary. `Around` adds the blanks after it (or, when there are none,
+/// the blanks before); on blanks it adds the following word instead.
 fn word_range(buf: &Buffer, pos: usize, kind: TextObjectKind) -> Option<std::ops::Range<usize>> {
     let len = buf.len_chars();
     if len == 0 {
         return None;
     }
     let rope = buf.rope();
-    let pos = pos.min(len.saturating_sub(1));
-    let c = rope.char(pos);
-    if !is_word_char(c) && kind == TextObjectKind::Inner {
-        // Inner on non-word = just that char (Vim's behavior for punctuation clusters).
-        return Some(pos..(pos + 1));
+    let pos = pos.min(len - 1);
+    let class = classify(rope.char(pos));
+    // On a line break there is no word; returning the `\n` itself would
+    // make `diw` on an empty line join it with the next.
+    if class == CharClass::Newline {
+        return None;
     }
-
-    // Extend left over word chars.
-    let mut start = pos;
-    while start > 0 && is_word_char(rope.char(start - 1)) {
-        start -= 1;
-    }
-    // Extend right over word chars.
-    let mut end = pos;
-    while end < len && is_word_char(rope.char(end)) {
-        end += 1;
-    }
+    let run_start = |mut i: usize, class: CharClass| {
+        while i > 0 && classify(rope.char(i - 1)) == class {
+            i -= 1;
+        }
+        i
+    };
+    let run_end = |mut i: usize, class: CharClass| {
+        while i < len && classify(rope.char(i)) == class {
+            i += 1;
+        }
+        i
+    };
+    let mut start = run_start(pos, class);
+    let mut end = run_end(pos, class);
 
     if kind == TextObjectKind::Around {
-        // Include trailing whitespace (but not past newline).
-        while end < len {
-            let ch = rope.char(end);
-            if ch == '\n' || !ch.is_whitespace() {
-                break;
+        if class == CharClass::Space {
+            if end < len {
+                let next = classify(rope.char(end));
+                if next != CharClass::Newline {
+                    end = run_end(end, next);
+                }
             }
-            end += 1;
+        } else {
+            let with_trailing = run_end(end, CharClass::Space);
+            if with_trailing > end {
+                end = with_trailing;
+            } else {
+                start = run_start(start, CharClass::Space);
+            }
         }
     }
     Some(start..end)
@@ -87,6 +99,9 @@ fn pair_range(
         return None;
     }
     let rope = buf.rope();
+    // The cursor can sit one past the last char (the empty line after a
+    // trailing newline, e.g. after `G`); `rope.char` panics there.
+    let pos = pos.min(len - 1);
     // Scan backward for matching `open`, counting nesting.
     let mut open_at: Option<usize> = None;
     {
@@ -206,6 +221,34 @@ mod tests {
         assert_eq!(
             range_of(&b, 5, TextObject::Word, TextObjectKind::Around),
             Some(4..8)
+        );
+    }
+
+    #[test]
+    fn word_objects_follow_char_classes() {
+        let b = Buffer::from_text("a->b  c\n\nd");
+        let word = |pos, kind| range_of(&b, pos, TextObject::Word, kind);
+        // A punctuation cluster is one word.
+        assert_eq!(word(1, TextObjectKind::Inner), Some(1..3));
+        // `aw` with no trailing blanks stays on the cursor's own run.
+        assert_eq!(word(1, TextObjectKind::Around), Some(1..3));
+        // On blanks: `iw` is the blanks, `aw` adds the next word.
+        assert_eq!(word(4, TextObjectKind::Inner), Some(4..6));
+        assert_eq!(word(4, TextObjectKind::Around), Some(4..7));
+        // Last word of a line: `aw` takes the blanks before it instead.
+        assert_eq!(word(6, TextObjectKind::Around), Some(4..7));
+        // Nothing to select on a line break — never the newline itself.
+        assert_eq!(word(7, TextObjectKind::Inner), None);
+        assert_eq!(word(8, TextObjectKind::Around), None);
+    }
+
+    #[test]
+    fn pair_at_end_of_buffer_does_not_panic() {
+        let b = Buffer::from_text("f(x)\n");
+        // Cursor on the phantom line past the trailing newline.
+        assert_eq!(
+            range_of(&b, 5, TextObject::Pair('(', ')'), TextObjectKind::Inner),
+            None
         );
     }
 

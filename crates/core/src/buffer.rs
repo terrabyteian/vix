@@ -1,6 +1,6 @@
 use ropey::Rope;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -59,10 +59,13 @@ impl Buffer {
                 .map(|cwd| cwd.join(raw))
                 .unwrap_or_else(|_| raw.to_path_buf())
         };
-        let rope = if p.exists() {
-            Rope::from_reader(BufReader::new(File::open(&p)?))?
-        } else {
-            Rope::new()
+        // Only a missing file means "new file". `Path::exists` also reports
+        // false for a file we can't stat (permissions), which would open an
+        // empty buffer over real content and let `:w` clobber it.
+        let rope = match File::open(&p) {
+            Ok(f) => Rope::from_reader(BufReader::new(f))?,
+            Err(e) if e.kind() == ErrorKind::NotFound => Rope::new(),
+            Err(e) => return Err(e.into()),
         };
         Ok(Self {
             rope,
@@ -83,8 +86,12 @@ impl Buffer {
 
     pub fn save_as<P: AsRef<Path>>(&mut self, path: P) -> Result<(), BufferError> {
         let p = path.as_ref().to_path_buf();
-        let file = File::create(&p)?;
-        self.rope.write_to(BufWriter::new(file))?;
+        let mut w = BufWriter::new(File::create(&p)?);
+        self.rope.write_to(&mut w)?;
+        // ropey never flushes, and a `BufWriter` dropped with bytes still
+        // buffered swallows the write error — which would report a full
+        // disk as a successful save and clear the dirty flag.
+        w.flush()?;
         self.path = Some(p);
         self.dirty = false;
         Ok(())
@@ -200,6 +207,27 @@ mod tests {
         assert_eq!(b.char_to_line_col(2), (0, 2));
         assert_eq!(b.char_to_line_col(3), (1, 0));
         assert_eq!(b.char_to_line_col(6), (2, 0));
+    }
+
+    #[test]
+    fn save_round_trips_and_clears_dirty() {
+        let path = std::env::temp_dir().join(format!("vix-buffer-save-{}", std::process::id()));
+        let mut b = Buffer::from_text("héllo\nworld\n");
+        b.insert_char(0, 'X');
+        b.save_as(&path).unwrap();
+        assert!(!b.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Xhéllo\nworld\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_missing_file_is_an_empty_buffer_but_other_errors_surface() {
+        let dir = std::env::temp_dir();
+        let missing = dir.join(format!("vix-buffer-missing-{}", std::process::id()));
+        let b = Buffer::load(&missing).unwrap();
+        assert_eq!(b.len_chars(), 0);
+        // A directory opens but can't be read as text.
+        assert!(Buffer::load(&dir).is_err());
     }
 
     #[test]
