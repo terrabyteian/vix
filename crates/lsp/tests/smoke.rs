@@ -1,6 +1,7 @@
-//! End-to-end smoke test: spawn rust-analyzer, open a broken file, and
-//! verify that `publishDiagnostics` reports an error. Gated on the binary
-//! being available so CI environments without it are a no-op.
+//! End-to-end smoke tests. One spawns rust-analyzer, opens a broken file,
+//! and verifies that `publishDiagnostics` reports an error; one drives the
+//! client against a scripted misbehaving server. Each is gated on its
+//! binary being available so environments without it are a no-op.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -65,6 +66,85 @@ edition = "2021"
         got,
         "rust-analyzer did not report a diagnostic within the deadline"
     );
+}
+
+/// A scripted stand-in for a language server: answers `initialize`, sends
+/// one frame of garbage, answers one hover, then exits without being asked.
+/// Covers what a real server only does on a bad day — a malformed message
+/// must be skipped rather than kill the reader, and a server that dies must
+/// surface as `Exited` so the editor can drop the client instead of timing
+/// out on every later request.
+const FAKE_SERVER: &str = r#"
+import json, sys
+
+def read():
+    length = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(length))
+
+def write_raw(body):
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+def write(msg):
+    write_raw(json.dumps(msg).encode())
+
+sys.stderr.buffer.write(b"not utf-8: \xff\xfe\n")
+sys.stderr.buffer.flush()
+while True:
+    msg = read()
+    if msg.get("method") == "initialize":
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+    elif msg.get("method") == "textDocument/hover":
+        write_raw(b"{ this is not json")
+        write({"jsonrpc": "2.0", "id": msg["id"], "result": {"contents": "hi"}})
+        sys.exit(0)
+"#;
+
+#[test]
+fn client_survives_a_bad_frame_and_reports_server_exit() {
+    let tmp = tempdir();
+    let script = tmp.join("fake_server.py");
+    std::fs::write(&script, FAKE_SERVER).unwrap();
+    let cfg = ServerConfig {
+        cmd: "python3".into(),
+        args: vec![script.to_string_lossy().into_owned()],
+        language_id: "plaintext".into(),
+        probe_args: vec!["--version".into()],
+    };
+    if !cfg.available() {
+        eprintln!("skipping: python3 not on PATH or not runnable");
+        return;
+    }
+
+    let client = LspClient::start(cfg, &tmp).expect("spawn fake server");
+    let uri = path_to_uri(&tmp.join("a.txt")).expect("uri");
+    let id = client.hover(uri, 0, 0);
+    let (result, error) = client
+        .wait_response(id, Duration::from_secs(10))
+        .expect("hover response arrives despite the malformed frame before it");
+    assert!(error.is_none());
+    assert_eq!(result.unwrap()["contents"], "hi");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while !exited && Instant::now() < deadline {
+        match client.try_recv() {
+            Some(ServerEvent::Exited) => exited = true,
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+    assert!(exited, "a server that exits on its own must be reported");
 }
 
 /// A scratch directory, unique per call: pid and timestamp separate runs,

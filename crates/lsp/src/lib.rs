@@ -530,6 +530,13 @@ pub fn parse_response<T: DeserializeOwned>(result: Option<Value>) -> Result<Opti
     }
 }
 
+/// How long the server gets to answer `initialize`.
+const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the server gets to exit after `shutdown` / `exit`.
+const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Largest JSON-RPC body accepted from a server.
+const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+
 async fn run_client(
     config: ServerConfig,
     root: Uri,
@@ -553,12 +560,22 @@ async fn run_client(
     // Stderr → Log events (server diagnostics about itself).
     let tx_stderr = tx_ev.clone();
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let _ = tx_stderr.send(ServerEvent::Log {
-                level: 2,
-                message: line,
-            });
+        // Raw bytes, decoded lossily: `lines()` errors on the first
+        // non-UTF-8 line, which would stop the drain — and a server blocks
+        // forever once its unread stderr pipe fills.
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let _ = tx_stderr.send(ServerEvent::Log {
+                        level: 2,
+                        message: String::from_utf8_lossy(&line).trim_end().to_string(),
+                    });
+                }
+            }
         }
     });
 
@@ -574,41 +591,56 @@ async fn run_client(
     // Reader task: framed JSON-RPC from stdout → ServerEvent.
     let tx_reader = tx_ev.clone();
     let (init_done_tx, mut init_done_rx) = ampsc::channel::<Result<()>>(1);
-    tokio::spawn(async move {
-        if let Err(e) = read_loop(stdout, tx_reader, init_id, init_done_tx).await {
-            eprintln!("lsp reader: {e:#}");
+    let mut reader = tokio::spawn(async move {
+        if let Err(e) = read_loop(stdout, tx_reader.clone(), init_id, init_done_tx).await {
+            // Never stderr: the TUI owns the terminal in raw mode.
+            let _ = tx_reader.send(ServerEvent::Log {
+                level: 1,
+                message: format!("lsp reader: {e:#}"),
+            });
         }
     });
 
-    match init_done_rx.recv().await {
-        Some(Ok(())) => {
-            let _ = init_tx.send(Ok(()));
-        }
-        Some(Err(e)) => {
-            let _ = init_tx.send(Err(e));
-            let _ = child.kill().await;
-            return Ok(());
-        }
-        None => {
-            let _ = init_tx.send(Err(anyhow!("server exited before initialize reply")));
-            let _ = child.kill().await;
-            return Ok(());
-        }
+    // `start` blocks the UI thread on this handshake, so a server that
+    // spawns but never answers must not hang the editor.
+    let init = tokio::time::timeout(INIT_TIMEOUT, init_done_rx.recv()).await;
+    let init_err = match init {
+        Ok(Some(Ok(()))) => None,
+        Ok(Some(Err(e))) => Some(e),
+        Ok(None) => Some(anyhow!("server exited before initialize reply")),
+        Err(_) => Some(anyhow!("server did not answer initialize")),
+    };
+    if let Some(e) = init_err {
+        let _ = init_tx.send(Err(e));
+        let _ = child.kill().await;
+        return Ok(());
     }
+    let _ = init_tx.send(Ok(()));
 
     // Send `initialized` notification.
     send_notification(&writer, "initialized", json!({})).await?;
 
-    // Main outbound loop: drain `rx_out`.
-    while let Some(msg) = rx_out.recv().await {
+    // Main outbound loop: drain `rx_out` until the client hangs up — or the
+    // reader ends, which means the server closed stdout (it crashed or
+    // exited). Returning then lets the caller report `Exited`, so the editor
+    // drops the dead client instead of timing out on every request to it.
+    loop {
+        let msg = tokio::select! {
+            msg = rx_out.recv() => msg,
+            _ = &mut reader => {
+                let _ = child.kill().await;
+                return Ok(());
+            }
+        };
         match msg {
-            OutMsg::Notify { method, params } => {
+            None => break,
+            Some(OutMsg::Notify { method, params }) => {
                 let _ = send_notification(&writer, method, params).await;
             }
-            OutMsg::Request { id, method, params } => {
+            Some(OutMsg::Request { id, method, params }) => {
                 let _ = send_request(&writer, id, method, params).await;
             }
-            OutMsg::Shutdown => {
+            Some(OutMsg::Shutdown) => {
                 let _ = send_request(&writer, -1, "shutdown", Value::Null).await;
                 let _ = send_notification(&writer, "exit", Value::Null).await;
                 break;
@@ -616,7 +648,13 @@ async fn run_client(
         }
     }
 
-    let _ = child.wait().await;
+    // A server that ignores `exit` must not keep this thread alive forever.
+    if tokio::time::timeout(EXIT_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
     Ok(())
 }
 
@@ -742,10 +780,19 @@ async fn read_loop(
             }
         }
         let len = content_length.ok_or_else(|| anyhow!("missing Content-Length"))?;
+        // The length is the server's claim; allocating it unchecked lets one
+        // bad header abort the whole editor on a failed allocation.
+        if len > MAX_MESSAGE_BYTES {
+            return Err(anyhow!("message of {len} bytes exceeds the size limit"));
+        }
         let mut body = vec![0u8; len];
         reader.read_exact(&mut body).await?;
 
-        let msg: Value = serde_json::from_slice(&body)?;
+        // One malformed body is skipped, not fatal: the framing is intact,
+        // so the next message can still be read.
+        let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
+            continue;
+        };
 
         // Dispatch: request from server (has id+method, needs response),
         // notification (no id), or response (has id, no method).
